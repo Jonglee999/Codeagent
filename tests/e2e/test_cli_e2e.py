@@ -50,6 +50,21 @@ def _build_tool_gateway(project_root: str) -> ToolGateway:
     return ToolGateway(registry)
 
 
+def _build_phase2_tool_gateway(project_root: str) -> ToolGateway:
+    """构建包含所有 Phase 2 工具（ReadFile, WriteFile, SearchCode, GetDiagnostics）的 Gateway。"""
+    from codeagent.tools.file.read_file import ReadFileTool
+    from codeagent.tools.file.write_file import WriteFileTool
+    from codeagent.tools.search.search_code import SearchCodeTool
+    from codeagent.tools.lsp.get_diagnostics import GetDiagnosticsTool
+
+    registry = ToolRegistry()
+    registry.register(ReadFileTool(project_root=project_root))
+    registry.register(WriteFileTool(project_root=project_root))
+    registry.register(SearchCodeTool(project_root=project_root))
+    registry.register(GetDiagnosticsTool(project_root=project_root))
+    return ToolGateway(registry)
+
+
 def _build_validation_gateway() -> IValidationGateway:
     """构建 IValidationGateway 适配器（基于 SyntaxValidator）。"""
     from codeagent.gateway.validation_gateway import ValidationResult
@@ -549,8 +564,11 @@ class TestE2EOrchestratorFlow:
                     },
                 )
 
-            async def query_context(
-                self, project_root: str, query: str, top_k: int = 5
+            async def update_index(self, project_root: str) -> None:
+                pass
+
+            async def search_semantic(
+                self, query: str, top_k: int = 5
             ) -> list:
                 return []
 
@@ -601,3 +619,234 @@ class TestE2EOrchestratorFlow:
 
         checkpoints = orchestrator.get_checkpoints()
         assert len(checkpoints) >= 1, "Should have at least one checkpoint"
+
+
+# ── Scene D/E/F: Cross-file modification (Phase 2) ────────────────────────────
+
+
+@pytest.mark.e2e
+@requires_api_key
+class TestE2ECrossFileModification:
+    """验证 Agent 在 sample_python_project 中跨文件添加新 API 端点。"""
+
+    async def _copy_sample_project(self, tmp_path: Path) -> Path:
+        """将 sample_python_project 复制到临时目录。"""
+        import shutil
+
+        sample_src = (
+            Path(__file__).resolve().parent.parent.parent
+            / "tests" / "fixtures" / "sample_python_project"
+        )
+        dest = tmp_path / "sample_project"
+        shutil.copytree(str(sample_src), str(dest))
+        return dest
+
+    # ── Scene D: Add new API endpoint ────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_add_new_api_endpoint(self, tmp_path: Path) -> None:
+        """测试场景：Agent 读取现有项目结构，跨文件添加新端点。
+
+        1. Agent 读取 api/routes.py 了解现有路由模式
+        2. Agent 读取 services/user_service.py 了解服务层 API
+        3. Agent 修改 api/routes.py 添加 get_user 路由
+        4. 验证文件修改正确
+        """
+        project_dir = await self._copy_sample_project(tmp_path)
+        project_root = str(project_dir)
+
+        tool_gateway = _build_phase2_tool_gateway(project_root)
+        validation_gateway = _build_validation_gateway()
+        llm = _build_llm(os.environ.get("LLM_MODEL", "openai/deepseek-v4-flash"))
+
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=tool_gateway,
+            validation_gateway=validation_gateway,
+            max_retries=3,
+        )
+
+        state = AgentState(
+            user_request=(
+                f"In the Python project at {project_root}, add a new API endpoint "
+                "for getting a user by name. "
+                "Look at api/routes.py to see existing routes (login, health). "
+                "Look at services/user_service.py to see UserService.get_user(). "
+                "Follow the same pattern to add a 'get_user' route that accepts a "
+                "name parameter and returns the user data. "
+                "After modifying, read the file to verify correctness."
+            ),
+            project_root=project_root,
+        )
+
+        result = await node(state)
+
+        errors = result.get("errors", [])
+        if errors:
+            pytest.fail(f"Execution had errors: {errors}")
+
+        # 验证 routes 文件被修改
+        routes_file = project_dir / "api" / "routes.py"
+        assert routes_file.exists(), "routes.py should exist"
+        content = routes_file.read_text(encoding="utf-8")
+        assert "get_user" in content, "Routes should contain get_user"
+        assert "svc.get_user" in content or "service.get_user" in content, (
+            "Should call get_user on the service"
+        )
+
+        # 验证 Python 语法正确
+        import ast
+        try:
+            ast.parse(content)
+        except SyntaxError as e:
+            pytest.fail(f"Modified routes.py has syntax error: {e}")
+
+        # 验证工具调用日志包含 read_file 和 write_file
+        execution_log = result.get("execution_log", [])
+        tool_calls = [
+            e for e in execution_log
+            if e.get("type") == "tool_call"
+        ]
+        tool_names = {e.get("tool_name") for e in tool_calls}
+        assert "read_file" in tool_names, "Should have used read_file"
+        assert "write_file" in tool_names, "Should have used write_file"
+
+    # ── Scene E: Semantic search and modify ─────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_semantic_search_and_modify(self, tmp_path: Path) -> None:
+        """测试场景：使用搜索定位认证相关代码并修改。
+
+        1. Agent 通过 search_code（regex 模式）找到认证相关代码
+        2. 读取定位到的文件理解代码逻辑
+        3. 添加认证成功后的日志记录
+        """
+        project_dir = await self._copy_sample_project(tmp_path)
+        project_root = str(project_dir)
+
+        tool_gateway = _build_phase2_tool_gateway(project_root)
+        validation_gateway = _build_validation_gateway()
+        llm = _build_llm(os.environ.get("LLM_MODEL", "openai/deepseek-v4-flash"))
+
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=tool_gateway,
+            validation_gateway=validation_gateway,
+            max_retries=3,
+        )
+
+        state = AgentState(
+            user_request=(
+                f"In the Python project at {project_root}, use search_code "
+                "with a regex pattern to find authentication-related code "
+                "(search for 'authenticate' or 'auth'). Read the found files, "
+                "then add a print/log statement in the authenticate_user function "
+                "in services/auth.py that prints a message when authentication succeeds. "
+                "After modifying, read the file to verify."
+            ),
+            project_root=project_root,
+        )
+
+        result = await node(state)
+
+        errors = result.get("errors", [])
+        if errors:
+            pytest.fail(f"Execution had errors: {errors}")
+
+        # 验证 auth 文件被修改
+        auth_file = project_dir / "services" / "auth.py"
+        assert auth_file.exists(), "auth.py should exist"
+        content = auth_file.read_text(encoding="utf-8")
+
+        # 验证添加了 print/logging 语句（在原有 pass 语句之前）
+        assert "print" in content or "logging" in content or "log" in content, (
+            "Should have added print or logging statement"
+        )
+
+        # 验证 Python 语法正确
+        import ast
+        try:
+            ast.parse(content)
+        except SyntaxError as e:
+            pytest.fail(f"Modified auth.py has syntax error: {e}")
+
+        # 验证工具调用日志包含 search_code
+        execution_log = result.get("execution_log", [])
+        tool_calls = [
+            e for e in execution_log
+            if e.get("type") == "tool_call"
+        ]
+        tool_names = {e.get("tool_name") for e in tool_calls}
+        assert "search_code" in tool_names, "Should have used search_code"
+
+    # ── Scene F: Code diagnostics and fix ───────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_code_diagnostics_and_fix(self, tmp_path: Path) -> None:
+        """测试场景：使用 LSP 诊断修复有语法错误的文件。
+
+        1. 创建一个包含语法错误的 Python 文件
+        2. Agent 使用 get_diagnostics 定位错误
+        3. Agent 使用 write_file 修复错误
+        4. 验证修复后的文件语法正确
+        """
+        project_root = str(tmp_path)
+
+        # 创建有语法错误的文件
+        broken_code = (
+            "def add(a, b\n"
+            "    return a + b\n"
+            "\n"
+            "def broken_function(:\n"
+            "    pass\n"
+        )
+        (tmp_path / "broken.py").write_text(broken_code, encoding="utf-8")
+
+        tool_gateway = _build_phase2_tool_gateway(project_root)
+        validation_gateway = _build_validation_gateway()
+        llm = _build_llm(os.environ.get("LLM_MODEL", "openai/deepseek-v4-flash"))
+
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=tool_gateway,
+            validation_gateway=validation_gateway,
+            max_retries=3,
+        )
+
+        state = AgentState(
+            user_request=(
+                f"The file {project_root}/broken.py has syntax errors. "
+                "Use get_diagnostics to find the errors (look for line-level diagnostics), "
+                "then fix them using write_file. "
+                "After fixing, read the file to verify the syntax is correct."
+            ),
+            project_root=project_root,
+        )
+
+        result = await node(state)
+
+        errors = result.get("errors", [])
+        if errors:
+            pytest.fail(f"Execution had errors: {errors}")
+
+        # 验证文件被修复且语法正确
+        fixed_file = tmp_path / "broken.py"
+        assert fixed_file.exists(), "broken.py should exist"
+        fixed_content = fixed_file.read_text(encoding="utf-8")
+
+        import ast
+        try:
+            ast.parse(fixed_content)
+        except SyntaxError as e:
+            pytest.fail(f"File still has syntax error after fix: {e}")
+
+        # 验证工具调用日志包含 get_diagnostics
+        execution_log = result.get("execution_log", [])
+        tool_calls = [
+            e for e in execution_log
+            if e.get("type") == "tool_call"
+        ]
+        tool_names = {e.get("tool_name") for e in tool_calls}
+        assert "get_diagnostics" in tool_names, (
+            "Should have used get_diagnostics"
+        )

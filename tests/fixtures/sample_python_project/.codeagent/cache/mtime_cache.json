@@ -1,0 +1,20 @@
+{
+  "project_root": "E:\\codagent\\tests\\fixtures\\sample_python_project",
+  "files": {
+    "main.py": "2026-05-14T03:28:45",
+    "__init__.py": "2026-05-14T03:28:44",
+    "api/routes.py": "2026-05-14T03:28:56",
+    "api/__init__.py": "2026-05-14T03:28:55",
+    "config/settings.py": "2026-05-14T03:28:54",
+    "config/__init__.py": "2026-05-14T03:28:53",
+    "models/role.py": "2026-05-14T03:28:48",
+    "models/user.py": "2026-05-14T03:28:47",
+    "models/__init__.py": "2026-05-14T03:28:46",
+    "services/auth.py": "2026-05-14T04:32:02",
+    "services/user_service.py": "2026-05-14T03:28:52",
+    "services/__init__.py": "2026-05-14T03:28:49",
+    "utils/helpers.py": "2026-05-14T03:28:58",
+    "utils/__init__.py": "2026-05-14T03:28:57"
+  },
+  "last_build": "2026-05-14T04:57:26"
+}

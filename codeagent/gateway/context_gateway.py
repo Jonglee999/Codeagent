@@ -32,11 +32,13 @@ class ContextPackage:
         file_tree: 项目文件树结构
         related_code: 与查询相关的代码片段列表
         dependency_info: 依赖信息
+        symbol_table: 符号表摘要列表（Phase 2 新增）
     """
 
     file_tree: Any = None
     related_code: list[CodeSnippet] = field(default_factory=list)
     dependency_info: dict = field(default_factory=dict)
+    symbol_table: list[dict] = field(default_factory=list)
 
 
 class IContextGateway(ABC):
