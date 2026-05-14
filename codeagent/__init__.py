@@ -1,0 +1,1 @@
+"""CodeAgent — AI-powered coding assistant."""

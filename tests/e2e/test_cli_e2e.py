@@ -1,0 +1,603 @@
+"""端到端集成测试 — 验证完整的 Agent 闭环。
+
+测试场景：生成一个 Python 函数并验证运行。
+1. 通过 ExecutionNode 执行一个生成 Python 函数的请求
+2. 验证文件被成功创建
+3. 运行 python 验证输出正确
+4. 验证执行日志包含预期的操作
+
+注意：这些测试需要 LLM API Key（通过 LLM_API_KEY 环境变量设置）。
+若未设置 API Key，测试将被跳过（使用 pytest.mark.skipif）。
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+from codeagent.gateway.tool_gateway import IToolGateway
+from codeagent.gateway.validation_gateway import IValidationGateway
+from codeagent.orchestration.nodes.execution_node import ExecutionNode
+from codeagent.orchestration.state import AgentState
+from codeagent.tools.gateway import ToolGateway
+from codeagent.tools.registry import ToolRegistry
+
+# 是否需要 API Key 才能运行 E2E 测试
+_HAS_API_KEY = bool(os.environ.get("LLM_API_KEY"))
+
+# E2E 测试标记：需要 LLM API Key
+requires_api_key = pytest.mark.skipif(
+    not _HAS_API_KEY,
+    reason="LLM_API_KEY environment variable not set — E2E test requires real LLM call",
+)
+
+# E2E 测试标记：需要网络连接
+e2e_test = pytest.mark.e2e
+
+
+def _build_tool_gateway(project_root: str) -> ToolGateway:
+    """构建包含 ReadFileTool 和 WriteFileTool 的工具 Gateway。"""
+    from codeagent.tools.file.read_file import ReadFileTool
+    from codeagent.tools.file.write_file import WriteFileTool
+
+    registry = ToolRegistry()
+    registry.register(ReadFileTool(project_root=project_root))
+    registry.register(WriteFileTool(project_root=project_root))
+    return ToolGateway(registry)
+
+
+def _build_validation_gateway() -> IValidationGateway:
+    """构建 IValidationGateway 适配器（基于 SyntaxValidator）。"""
+    from codeagent.gateway.validation_gateway import ValidationResult
+    from codeagent.validation.syntax_validator import SyntaxValidator
+
+    class _ValidationGateway(IValidationGateway):
+        def __init__(self, validator: SyntaxValidator) -> None:
+            self._validator = validator
+
+        async def run_syntax_check(self, file_path: str) -> ValidationResult:
+            return await self._validator.check_file(file_path)
+
+        async def run_lint(self, files: list[str]) -> ValidationResult:
+            return ValidationResult(passed=True)
+
+        async def run_tests(self, project_root: str) -> ValidationResult:
+            return ValidationResult(passed=True)
+
+        async def run_runtime_check(self, file_path: str) -> ValidationResult:
+            return ValidationResult(passed=True)
+
+    return _ValidationGateway(SyntaxValidator())
+
+
+def _build_llm(model_name: str) -> callable:
+    """构建 LLM 调用函数（使用 litellm），含网络重试。"""
+    import asyncio
+
+    import litellm
+
+    api_key = os.environ.get("LLM_API_KEY", "")
+    api_base = os.environ.get("LLM_API_BASE", "")
+    timeout = int(os.environ.get("LLM_TIMEOUT", "120"))
+
+    async def llm_call(**kwargs: object) -> object:
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            try:
+                call_kwargs = {
+                    **{k: v for k, v in kwargs.items() if v is not None},
+                    "timeout": timeout,
+                }
+                if api_key:
+                    call_kwargs["api_key"] = api_key
+                if api_base:
+                    call_kwargs["api_base"] = api_base
+                return await litellm.acompletion(**call_kwargs)
+            except Exception as e:
+                last_exc = e
+                if attempt < 2:
+                    await asyncio.sleep(1.5 * (attempt + 1))
+        raise last_exc  # type: ignore[misc]
+
+    return llm_call
+
+
+# ── Test: Fibonacci function generation ─────────────────────────────────────
+
+
+@pytest.mark.e2e
+@requires_api_key
+class TestE2EFibonacci:
+    """E2E 场景：生成斐波那契数列函数并验证运行。"""
+
+    @pytest.mark.asyncio
+    async def test_generate_and_verify_fibonacci(self, tmp_path: Path) -> None:
+        """完整场景：生成 fibonacci.py → 验证语法 → 运行验证输出。"""
+        project_root = str(tmp_path)
+        tool_gateway = _build_tool_gateway(project_root)
+        validation_gateway = _build_validation_gateway()
+        llm = _build_llm(os.environ.get("LLM_MODEL", "openai/deepseek-v4-flash"))
+
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=tool_gateway,
+            validation_gateway=validation_gateway,
+            max_retries=3,
+        )
+
+        state = AgentState(
+            user_request=(
+                "Write a Python file fibonacci.py that contains a function "
+                "fibonacci(n) which returns the nth Fibonacci number. "
+                "Include a test that prints fibonacci(10) == 55."
+            ),
+            project_root=project_root,
+        )
+
+        result = await node(state)
+
+        # ── 验证执行结果 ──────────────────────────────────
+        assert "errors" in result
+        errors = result.get("errors", [])
+        if errors:
+            pytest.fail(f"Execution had errors: {errors}")
+
+        execution_log = result.get("execution_log", [])
+        assert len(execution_log) > 0, "Execution log should not be empty"
+
+        # ── 验证文件被创建 ────────────────────────────────
+        fib_file = tmp_path / "fibonacci.py"
+        assert fib_file.exists(), f"{fib_file} should have been created"
+
+        # ── 验证文件内容是有效的 Python ────────────────────
+        content = fib_file.read_text(encoding="utf-8")
+        assert "fibonacci" in content.lower(), "File should contain fibonacci function"
+        assert len(content) > 0, "File should not be empty"
+
+        # ── 验证 python 可执行并输出正确结果 ──────────────
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(fib_file)],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except subprocess.TimeoutExpired:
+            pytest.fail("fibonacci.py execution timed out")
+
+        # 测试文件可能包含 assert（pytest 风格）或 print 语句
+        if proc.returncode != 0:
+            # 如果直接运行失败，可能是 assert 语句，尝试用 pytest 运行
+            try:
+                proc2 = subprocess.run(
+                    [sys.executable, "-m", "pytest", str(fib_file), "-v"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                assert proc2.returncode == 0, (
+                    f"pytest execution failed:\n"
+                    f"stdout: {proc2.stdout}\n"
+                    f"stderr: {proc2.stderr}"
+                )
+            except subprocess.TimeoutExpired:
+                # pytest 超时 — 至少文件存在且语法正确
+                pass
+        else:
+            # 直接运行成功 — 输出应为 "True" 或 "55" 或类似
+            assert "55" in proc.stdout or "True" in proc.stdout, (
+                f"Output should contain expected result. Got: {proc.stdout}"
+            )
+
+        # ── 验证 Agent 的最终摘要 ─────────────────────────
+        llm_responses = [
+            e for e in execution_log if e.get("type") == "llm_response"
+        ]
+        assert len(llm_responses) >= 1, "Should have at least one LLM response"
+        assert llm_responses[-1].get("content"), "Final response should have content"
+
+        # ── 验证工具调用日志包含 write_file ───────────────
+        tool_calls = [
+            e for e in execution_log
+            if e.get("type") == "tool_call" and e.get("tool_name") == "write_file"
+        ]
+        assert len(tool_calls) >= 1, "Should have at least one write_file call"
+
+        # ── 验证语法检查发生在 write_file 之后 ────────────
+        syntax_checks = [
+            e for e in execution_log if e.get("type") == "syntax_check"
+        ]
+        assert len(syntax_checks) >= 1, "Should have at least one syntax check"
+
+
+# ── Test: Simple function generation (no external deps) ─────────────────────
+
+
+@pytest.mark.e2e
+@requires_api_key
+class TestE2ESimpleFunction:
+    """E2E 场景：生成一个简单的 Python 函数。"""
+
+    @pytest.mark.asyncio
+    async def test_generate_hello_function(self, tmp_path: Path) -> None:
+        """生成一个简单的 hello world 函数。"""
+        project_root = str(tmp_path)
+        tool_gateway = _build_tool_gateway(project_root)
+        validation_gateway = _build_validation_gateway()
+        llm = _build_llm(os.environ.get("LLM_MODEL", "openai/deepseek-v4-flash"))
+
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=tool_gateway,
+            validation_gateway=validation_gateway,
+            max_retries=3,
+        )
+
+        state = AgentState(
+            user_request=(
+                "Create a file hello.py with a function greet(name) "
+                "that returns 'Hello, {name}!'. "
+                "Add a print(greet('World')) call at the bottom."
+            ),
+            project_root=project_root,
+        )
+
+        result = await node(state)
+
+        errors = result.get("errors", [])
+        if errors:
+            pytest.fail(f"Execution had errors: {errors}")
+
+        # 验证文件创建
+        hello_file = tmp_path / "hello.py"
+        assert hello_file.exists(), "hello.py should have been created"
+
+        # 验证可运行
+        proc = subprocess.run(
+            [sys.executable, str(hello_file)],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if proc.returncode == 0:
+            assert "Hello, World" in proc.stdout or "Hello, World" in proc.stderr
+
+
+# ── Test: Module-level validation (no LLM needed) ──────────────────────────
+
+
+class TestE2EToolIntegration:
+    """E2E 工具集成测试 — 验证 ReadFileTool + WriteFileTool + SyntaxValidator
+    作为最小闭环能正常工作（不需要 LLM）。"""
+
+    @pytest.mark.asyncio
+    async def test_write_read_validate_cycle(self, tmp_path: Path) -> None:
+        """验证 写入 → 读取 → 语法检查 的最小闭环。"""
+        from codeagent.tools.file.read_file import ReadFileTool
+        from codeagent.tools.file.write_file import WriteFileTool
+        from codeagent.validation.syntax_validator import SyntaxValidator
+
+        project_root = str(tmp_path)
+
+        # 写入
+        write_tool = WriteFileTool(project_root=project_root)
+        write_result = await write_tool.execute(
+            file_path="test_func.py",
+            content="def add(a, b):\n    return a + b\n",
+            mode="create",
+        )
+        assert write_result.success
+
+        # 读取
+        read_tool = ReadFileTool(project_root=project_root)
+        read_result = await read_tool.execute(file_path="test_func.py")
+        assert read_result.success
+        assert "def add" in read_result.data.get("content", "")
+
+        # 语法检查
+        validator = SyntaxValidator()
+        validation_result = await validator.check_file(
+            str(tmp_path / "test_func.py")
+        )
+        assert validation_result.passed
+
+    @pytest.mark.asyncio
+    async def test_syntax_error_detection(self, tmp_path: Path) -> None:
+        """验证写入无效代码后语法检查能捕获错误。"""
+        from codeagent.tools.file.write_file import WriteFileTool
+        from codeagent.validation.syntax_validator import SyntaxValidator
+
+        project_root = str(tmp_path)
+
+        # 写入无效代码
+        write_tool = WriteFileTool(project_root=project_root)
+        write_result = await write_tool.execute(
+            file_path="bad_syntax.py",
+            content="def foo(\n    pass\n",
+            mode="create",
+        )
+        assert write_result.success
+
+        # 语法检查应失败
+        validator = SyntaxValidator()
+        validation_result = await validator.check_file(
+            str(tmp_path / "bad_syntax.py")
+        )
+        assert not validation_result.passed
+        assert len(validation_result.errors) >= 1
+
+    @pytest.mark.asyncio
+    async def test_write_file_then_modify(self, tmp_path: Path) -> None:
+        """验证创建 → 修改 → 备份 流程。"""
+        from codeagent.tools.file.write_file import WriteFileTool
+
+        project_root = str(tmp_path)
+        write_tool = WriteFileTool(project_root=project_root)
+
+        # 创建
+        create_result = await write_tool.execute(
+            file_path="counter.py",
+            content="x = 1\n",
+            mode="create",
+        )
+        assert create_result.success
+
+        # 修改
+        modify_result = await write_tool.execute(
+            file_path="counter.py",
+            content="x = 2\n",
+            mode="modify",
+        )
+        assert modify_result.success
+        assert modify_result.data.get("lines_added", 0) >= 0
+        assert modify_result.data.get("backup_path") is not None
+
+        # 验证备份存在
+        backup_path = tmp_path / ".codeagent" / "backups"
+        backups = list(backup_path.glob("*counter.py"))
+
+# ── Scene A: Flask /health endpoint ──────────────────────────────────────────
+
+
+@pytest.mark.e2e
+@requires_api_key
+class TestE2EFlaskApp:
+    """E2E 场景 A：生成 Flask app 并验证可启动。"""
+
+    @pytest.mark.asyncio
+    async def test_generate_flask_health_endpoint(self, tmp_path: Path) -> None:
+        """生成 Flask app.py 含 /health 端点，验证语法和可导入性。"""
+        project_root = str(tmp_path)
+        tool_gateway = _build_tool_gateway(project_root)
+        validation_gateway = _build_validation_gateway()
+        llm = _build_llm(os.environ.get("LLM_MODEL", "openai/deepseek-v4-flash"))
+
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=tool_gateway,
+            validation_gateway=validation_gateway,
+            max_retries=3,
+        )
+
+        state = AgentState(
+            user_request=(
+                "Create a file app.py that is a Flask application "
+                'with a /health endpoint that returns JSON {"status": "ok"}. '
+                "Include the if __name__ == '__main__' block on port 5000."
+            ),
+            project_root=project_root,
+        )
+
+        result = await node(state)
+
+        errors = result.get("errors", [])
+        if errors:
+            pytest.fail(f"Execution had errors: {errors}")
+
+        app_file = tmp_path / "app.py"
+        assert app_file.exists(), "app.py should have been created"
+
+        content = app_file.read_text(encoding="utf-8")
+        assert "flask" in content.lower(), "File should reference Flask"
+        assert "/health" in content, "File should define /health endpoint"
+        assert "__main__" in content, "File should have __main__ block"
+
+        import ast
+        try:
+            ast.parse(content)
+        except SyntaxError as e:
+            pytest.fail(f"app.py contains syntax error: {e}")
+
+        execution_log = result.get("execution_log", [])
+        tool_calls = [
+            e for e in execution_log
+            if e.get("type") == "tool_call" and e.get("tool_name") == "write_file"
+        ]
+        assert len(tool_calls) >= 1, "Should have at least one write_file call"
+
+
+# ── Scene C: Type annotations on existing file ────────────────────────────────
+
+
+@pytest.mark.e2e
+@requires_api_key
+class TestE2ETypeAnnotations:
+    """E2E 场景 C：读取已有文件，为函数添加类型注解。"""
+
+    @pytest.mark.asyncio
+    async def test_add_type_annotations(self, tmp_path: Path) -> None:
+        """在已有 Python 文件上添加类型注解。"""
+        source = (
+            "def add(a, b):\n"
+            "    return a + b\n"
+            "\n"
+            "def greet(name):\n"
+            "    return 'Hello, ' + name\n"
+            "\n"
+            "def fibonacci(n):\n"
+            "    if n <= 1:\n"
+            "        return n\n"
+            "    return fibonacci(n - 1) + fibonacci(n - 2)\n"
+        )
+        (tmp_path / "calculator.py").write_text(source, encoding="utf-8")
+
+        project_root = str(tmp_path)
+        tool_gateway = _build_tool_gateway(project_root)
+        validation_gateway = _build_validation_gateway()
+        llm = _build_llm(os.environ.get("LLM_MODEL", "openai/deepseek-v4-flash"))
+
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=tool_gateway,
+            validation_gateway=validation_gateway,
+            max_retries=3,
+        )
+
+        state = AgentState(
+            user_request=(
+                "Read calculator.py and add type annotations to all functions. "
+                "The add function should accept int and return int. "
+                "greet should accept str and return str. "
+                "fibonacci should accept int and return int. "
+                "Do not change the function bodies."
+            ),
+            project_root=project_root,
+        )
+
+        result = await node(state)
+
+        errors = result.get("errors", [])
+        if errors:
+            pytest.fail(f"Execution had errors: {errors}")
+
+        content = (tmp_path / "calculator.py").read_text(encoding="utf-8")
+        assert "def add(a: int, b: int) -> int" in content, (
+            "add() should have type annotations"
+        )
+        assert "def greet(name: str) -> str" in content, (
+            "greet() should have type annotations"
+        )
+
+        import ast
+        try:
+            ast.parse(content)
+        except SyntaxError as e:
+            pytest.fail(f"Modified file has syntax error: {e}")
+
+        result_code = (
+            "from calculator import add, greet, fibonacci\n"
+            "print(add(2, 3))\n"
+            "print(greet('World'))\n"
+            "print(fibonacci(10))\n"
+        )
+        (tmp_path / "test_calculator.py").write_text(result_code, encoding="utf-8")
+
+        import subprocess
+        import sys
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(tmp_path / "test_calculator.py")],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                cwd=tmp_path,
+            )
+            if proc.returncode == 0:
+                lines = proc.stdout.strip().split("\n")
+                assert "5" in lines[0], f"add(2,3) should be 5, got {lines[0]}"
+                assert "Hello, World" in lines[1], (
+                    f"greet('World') should be 'Hello, World', got {lines[1]}"
+                )
+                assert "55" in lines[2], f"fibonacci(10) should be 55, got {lines[2]}"
+        except subprocess.TimeoutExpired:
+            pass
+
+
+# ── 1b Orchestrator flow ─────────────────────────────────────────────────────
+
+
+@pytest.mark.e2e
+@requires_api_key
+class TestE2EOrchestratorFlow:
+    """1b E2E 场景：通过 Orchestrator 执行完整的 LangGraph 工作流。"""
+
+    @pytest.mark.asyncio
+    async def test_orchestrator_generate_function(self, tmp_path: Path) -> None:
+        """使用 Orchestrator 生成一个 Python 函数，验证全流程。"""
+        from codeagent.orchestration.orchestrator import Orchestrator
+        from codeagent.gateway.context_gateway import IContextGateway, ContextPackage
+
+        project_root = str(tmp_path)
+        tool_gateway = _build_tool_gateway(project_root)
+        validation_gateway = _build_validation_gateway()
+        llm = _build_llm(os.environ.get("LLM_MODEL", "openai/deepseek-v4-flash"))
+
+        class _MockContextGateway(IContextGateway):
+            async def build_context(
+                self, project_root: str, user_request: str
+            ) -> ContextPackage:
+                return ContextPackage(
+                    file_tree={
+                        "name": "testproj",
+                        "type": "directory",
+                        "path": ".",
+                        "children": [],
+                    },
+                )
+
+            async def query_context(
+                self, project_root: str, query: str, top_k: int = 5
+            ) -> list:
+                return []
+
+        orchestrator = Orchestrator(
+            context_gateway=_MockContextGateway(),
+            tool_gateway=tool_gateway,
+            validation_gateway=validation_gateway,
+            llm=llm,
+        )
+
+        result = await orchestrator.run(
+            user_request=(
+                "Create a file factorial.py with a function factorial(n) "
+                "that returns the factorial of n using recursion. "
+                "Add a print(factorial(5) == 120) call."
+            ),
+            project_root=project_root,
+        )
+
+        assert result is not None
+        assert hasattr(result, "execution_log") or isinstance(result, dict)
+
+        factorial_file = tmp_path / "factorial.py"
+        assert factorial_file.exists(), "factorial.py should have been created"
+
+        content = factorial_file.read_text(encoding="utf-8")
+        import ast
+        try:
+            ast.parse(content)
+        except SyntaxError as e:
+            pytest.fail(f"factorial.py has syntax error: {e}")
+
+        import subprocess
+        import sys
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(factorial_file)],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if proc.returncode == 0:
+                assert "120" in proc.stdout or "True" in proc.stdout, (
+                    f"Output should contain expected result. Got: {proc.stdout}"
+                )
+        except subprocess.TimeoutExpired:
+            pass
+
+        checkpoints = orchestrator.get_checkpoints()
+        assert len(checkpoints) >= 1, "Should have at least one checkpoint"

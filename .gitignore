@@ -1,0 +1,50 @@
+# ─── Python ────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+venv/
+*.so
+
+# ─── Node / JavaScript ─────────────────────────────────
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ─── Docker ────────────────────────────────────────────
+.docker/
+*.container
+docker-compose.override.yml
+
+# ─── IDE / Editor ──────────────────────────────────────
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ─── Environment ───────────────────────────────────────
+.env
+.env.local
+*.key
+*.pem
+
+# ─── Project-specific ──────────────────────────────────
+.codeagent/cache/
+.codeagent/backups/
+dist/
+devdoc/
+
+# ─── Coverage / Reports ───────────────────────────────
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
