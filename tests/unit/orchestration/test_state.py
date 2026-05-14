@@ -185,6 +185,19 @@ class TestAgentStateBackwardCompat:
         assert state.project_root == "/test/project"
         assert state.auto_mode is True
 
+    def test_phase35_fields_defaults(self) -> None:
+        """Phase 3.5 TaskFocus 字段应有正确的默认值。"""
+        state = AgentState(user_request="req", project_root="/root")
+        assert state.original_goal_summary == ""
+        assert state.completed_steps_summary == ""
+        assert state.tasks_remaining == []
+        assert state.deviation_detected is False
+        assert state.deviation_count == 0
+        assert state.conversation_history == []
+        assert state.human_review_required is False
+        assert state.review_request is None
+        assert state.review_type is None
+
     def test_execution_log_still_works(self) -> None:
         """execution_log 仍可正常使用。"""
         state = AgentState(user_request="req", project_root="/root")
@@ -210,6 +223,53 @@ class TestAgentStateBackwardCompat:
         assert state.file_tree["type"] == "directory"
 
 
+class TestAgentStatePhase35Fields:
+    """Phase 3.5 TaskFocus 字段赋值测试。"""
+
+    def test_original_goal_summary(self) -> None:
+        state = AgentState(user_request="req", project_root="/root")
+        state.original_goal_summary = "Create a Flask app"
+        assert state.original_goal_summary == "Create a Flask app"
+
+    def test_completed_steps_summary(self) -> None:
+        state = AgentState(user_request="req", project_root="/root")
+        state.completed_steps_summary = "Read config; Write app"
+        assert state.completed_steps_summary == "Read config; Write app"
+
+    def test_tasks_remaining(self) -> None:
+        state = AgentState(user_request="req", project_root="/root")
+        state.tasks_remaining = ["[2] Modify main.py", "[3] Run tests"]
+        assert len(state.tasks_remaining) == 2
+        assert "[2] Modify main.py" in state.tasks_remaining
+
+    def test_deviation_fields(self) -> None:
+        state = AgentState(user_request="req", project_root="/root")
+        assert state.deviation_detected is False
+        assert state.deviation_count == 0
+        state.deviation_detected = True
+        state.deviation_count += 1
+        assert state.deviation_detected is True
+        assert state.deviation_count == 1
+
+    def test_human_review_fields(self) -> None:
+        state = AgentState(user_request="req", project_root="/root")
+        assert state.human_review_required is False
+        assert state.review_request is None
+        assert state.review_type is None
+        state.human_review_required = True
+        state.review_request = {"review_type": "deviation_detected", "title": "test"}
+        state.review_type = "deviation_detected"
+        assert state.human_review_required is True
+        assert state.review_request["review_type"] == "deviation_detected"
+        assert state.review_type == "deviation_detected"
+
+    def test_conversation_history(self) -> None:
+        state = AgentState(user_request="req", project_root="/root")
+        state.conversation_history.append({"role": "user", "content": "hello"})
+        state.conversation_history.append({"role": "assistant", "content": "hi"})
+        assert len(state.conversation_history) == 2
+
+
 class TestAgentStateFullConstruction:
     """完整构造测试。"""
 
@@ -229,9 +289,28 @@ class TestAgentStateFullConstruction:
             accumulated_changes=[{"file": "a.py"}],
             degraded_mode=True,
             retry_count=2,
+            original_goal_summary="Goal summary",
+            completed_steps_summary="Step 1 done",
+            tasks_remaining=["[2] Step 2"],
+            deviation_detected=True,
+            deviation_count=2,
+            conversation_history=[{"role": "user", "content": "hi"}],
+            human_review_required=True,
+            review_request={"review_type": "deviation"},
+            review_type="deviation_detected",
         )
         assert state.user_request == "full test"
         assert state.semantic_context == "semantic"
         assert state.current_step_index == 1
         assert state.degraded_mode is True
         assert state.retry_count == 2
+        # Phase 3.5 assertions
+        assert state.original_goal_summary == "Goal summary"
+        assert state.completed_steps_summary == "Step 1 done"
+        assert state.tasks_remaining == ["[2] Step 2"]
+        assert state.deviation_detected is True
+        assert state.deviation_count == 2
+        assert state.conversation_history == [{"role": "user", "content": "hi"}]
+        assert state.human_review_required is True
+        assert state.review_request == {"review_type": "deviation"}
+        assert state.review_type == "deviation_detected"

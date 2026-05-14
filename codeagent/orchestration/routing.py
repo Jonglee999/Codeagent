@@ -12,7 +12,7 @@ from codeagent.orchestration.state import AgentState
 
 # 路由目标类型
 AfterPlanning = Literal["context", "execution", "human_review", "end"]
-AfterExecution = Literal["validation", "execution", "end"]
+AfterExecution = Literal["validation", "execution", "end", "human_review"]
 AfterValidation = Literal["execution", "planning", "human_review", "end"]
 AfterHumanReview = Literal["execution", "planning", "end"]
 
@@ -79,6 +79,10 @@ def route_after_execution(state: AgentState) -> AfterExecution:
     # 用户明确放弃
     if state.human_decision == "abort":
         return "end"
+
+    # Phase 3.5: 偏离检测触发人工审核
+    if state.human_review_required:
+        return "human_review"
 
     # 有 plan 时检查步骤执行状态
     if state.plan is not None and len(state.plan) > 0:

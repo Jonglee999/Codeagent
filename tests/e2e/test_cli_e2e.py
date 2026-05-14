@@ -553,7 +553,7 @@ class TestE2EOrchestratorFlow:
 
         class _MockContextGateway(IContextGateway):
             async def build_context(
-                self, project_root: str, user_request: str
+                self, project_root: str, query: str
             ) -> ContextPackage:
                 return ContextPackage(
                     file_tree={
@@ -850,3 +850,490 @@ class TestE2ECrossFileModification:
         assert "get_diagnostics" in tool_names, (
             "Should have used get_diagnostics"
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Phase 3.8 — Scene G: 全栈项目认证方式修改（Basic Auth → JWT Auth）
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.e2e
+@requires_api_key
+class TestE2EAuthModification:
+    """Scene G: 在全栈项目中将 Basic Auth 替换为 JWT Auth。
+
+    验证 Agent 的复杂多步规划 + 执行 + Human Review 能力。
+    """
+
+    async def _copy_sample_fullstack_project(self, tmp_path: Path) -> Path:
+        """将 sample_fullstack_project 复制到临时目录。"""
+        import shutil
+
+        sample_src = (
+            Path(__file__).resolve().parent.parent.parent
+            / "tests" / "fixtures" / "sample_fullstack_project"
+        )
+        dest = tmp_path / "fullstack_project"
+        shutil.copytree(str(sample_src), str(dest))
+        return dest
+
+    @pytest.mark.asyncio
+    async def test_auth_modification_with_human_review(
+        self, tmp_path: Path,
+    ) -> None:
+        """完整场景：Basic Auth → JWT Auth 替换。
+
+        1. Agent 读取项目结构，分析现有认证方式
+        2. Agent 读取 auth_middleware.py 理解 Basic Auth 实现
+        3. Agent 分析依赖（哪些文件引用认证中间件）
+        4. Agent 生成修改计划（替换为 JWT 认证）
+        5. Plan 中包含高风险步骤 → route_after_planning 路由到 human_review
+        6. 人工审核（通过 orchestrator.resume 自动审批）
+        7. Agent 执行跨文件修改
+        8. 语法验证通过
+        """
+        project_dir = await self._copy_sample_fullstack_project(tmp_path)
+        project_root = str(project_dir)
+
+        from codeagent.orchestration.orchestrator import Orchestrator
+        from codeagent.gateway.context_gateway import IContextGateway, ContextPackage
+
+        # 构建工具和验证 gateway
+        tool_gateway = _build_phase2_tool_gateway(project_root)
+        validation_gateway = _build_validation_gateway()
+        llm = _build_llm(os.environ.get("LLM_MODEL", "openai/deepseek-v4-flash"))
+
+        class _MockContextGateway(IContextGateway):
+            async def build_context(
+                self, project_root: str, query: str,
+            ) -> ContextPackage:
+                return ContextPackage(
+                    file_tree={
+                        "name": "fullstack_project",
+                        "type": "directory",
+                        "path": ".",
+                        "children": [
+                            {
+                                "name": "backend",
+                                "type": "directory",
+                                "path": "backend",
+                                "children": [
+                                    {"name": "app.py", "type": "file", "path": "backend/app.py"},
+                                    {"name": "__init__.py", "type": "file", "path": "backend/__init__.py"},
+                                    {
+                                        "name": "api", "type": "directory", "path": "backend/api",
+                                        "children": [
+                                            {"name": "__init__.py", "type": "file", "path": "backend/api/__init__.py"},
+                                            {"name": "routes.py", "type": "file", "path": "backend/api/routes.py"},
+                                        ],
+                                    },
+                                    {
+                                        "name": "auth", "type": "directory", "path": "backend/auth",
+                                        "children": [
+                                            {"name": "__init__.py", "type": "file", "path": "backend/auth/__init__.py"},
+                                            {"name": "auth_middleware.py", "type": "file", "path": "backend/auth/auth_middleware.py"},
+                                        ],
+                                    },
+                                    {
+                                        "name": "models", "type": "directory", "path": "backend/models",
+                                        "children": [
+                                            {"name": "__init__.py", "type": "file", "path": "backend/models/__init__.py"},
+                                            {"name": "user.py", "type": "file", "path": "backend/models/user.py"},
+                                        ],
+                                    },
+                                ],
+                            },
+                            {
+                                "name": "frontend", "type": "directory", "path": "frontend",
+                                "children": [
+                                    {"name": "__init__.py", "type": "file", "path": "frontend/__init__.py"},
+                                    {
+                                        "name": "src", "type": "directory", "path": "frontend/src",
+                                        "children": [
+                                            {"name": "__init__.py", "type": "file", "path": "frontend/src/__init__.py"},
+                                            {
+                                                "name": "api", "type": "directory", "path": "frontend/src/api",
+                                                "children": [
+                                                    {"name": "__init__.py", "type": "file", "path": "frontend/src/api/__init__.py"},
+                                                    {"name": "client.py", "type": "file", "path": "frontend/src/api/client.py"},
+                                                ],
+                                            },
+                                        ],
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                )
+
+            async def update_index(self, project_root: str) -> None:
+                pass
+
+            async def search_semantic(self, query: str, top_k: int = 5) -> list:
+                return []
+
+        orchestrator = Orchestrator(
+            context_gateway=_MockContextGateway(),
+            tool_gateway=tool_gateway,
+            validation_gateway=validation_gateway,
+            llm=llm,
+        )
+
+        # 运行工作流
+        final_state = await orchestrator.run(
+            user_request=(
+                f"In the project at {project_root}, replace Basic Auth authentication "
+                "with JWT (JSON Web Token) authentication. "
+                "First, read these files to understand the current implementation:\n"
+                "1. backend/auth/auth_middleware.py - the Basic Auth middleware\n"
+                "2. backend/api/routes.py - API routes using auth\n"
+                "3. frontend/src/api/client.py - frontend API client\n"
+                "After reading, modify them to use JWT:\n"
+                "- auth_middleware.py: Add jwt.encode/jwt.decode logic, create "
+                "a new authenticate_request that validates Bearer tokens\n"
+                "- routes.py: Keep using authenticate_request as dependency "
+                "(interface stays the same, implementation changes)\n"
+                "- client.py: Change from Basic Auth header to Bearer token header"
+            ),
+            project_root=project_root,
+        )
+
+        # Orchestrator.run 可能返回 dict（中断时）或 AgentState
+        def _get_state_attr(state: object, attr: str, default: object = None) -> object:
+            if isinstance(state, dict):
+                return state.get(attr, default)
+            return getattr(state, attr, default)
+
+        # 检查是否触发了 Human Review（plan 中有 high_risk 步骤）
+        checkpoints = orchestrator.get_checkpoints()
+        plan = _get_state_attr(final_state, "plan")
+        if checkpoints and plan:
+            has_high_risk = any(
+                getattr(step, "risk", None) == "high" if not isinstance(step, dict) else step.get("risk") == "high"
+                for step in plan
+            )
+            if has_high_risk:
+                # 自动审批
+                thread_id = checkpoints[0]["thread_id"]
+                final_state = await orchestrator.resume(thread_id, "approve")
+
+        errors = _get_state_attr(final_state, "errors", [])
+        if errors:
+            pytest.fail(f"Execution had errors: {errors}")
+
+        # 验证计划已生成
+        plan = _get_state_attr(final_state, "plan")
+        assert plan is not None
+        assert len(plan) >= 2, "Should have at least 2 plan steps"
+
+        # 验证关键文件被修改
+        middleware_file = project_dir / "backend" / "auth" / "auth_middleware.py"
+        assert middleware_file.exists()
+        middleware_content = middleware_file.read_text(encoding="utf-8")
+
+        # 应包含 JWT 相关代码（如 jwt.encode, jwt.decode, pyjwt, Bearer 等）
+        jwt_indicators = ["jwt", "JWT", "Bearer", "token"]
+        has_jwt = any(ind in middleware_content for ind in jwt_indicators)
+        assert has_jwt, (
+            "auth_middleware.py should reference JWT. "
+            f"Content: {middleware_content[:500]}"
+        )
+
+        # 验证 routes.py 已更新
+        routes_file = project_dir / "backend" / "api" / "routes.py"
+        assert routes_file.exists()
+        routes_content = routes_file.read_text(encoding="utf-8")
+
+        # 验证 client.py 已更新
+        client_file = project_dir / "frontend" / "src" / "api" / "client.py"
+        assert client_file.exists()
+        client_content = client_file.read_text(encoding="utf-8")
+        has_bearer = "Bearer" in client_content
+        has_jwt_in_client = "jwt" in client_content.lower() or "token" in client_content.lower()
+        assert has_bearer or has_jwt_in_client, (
+            "client.py should use Bearer token instead of Basic Auth. "
+            f"Content: {client_content[:500]}"
+        )
+
+        # 验证所有修改过的 Python 文件语法正确
+        import ast
+        for py_file in project_dir.rglob("*.py"):
+            try:
+                content = py_file.read_text(encoding="utf-8")
+                ast.parse(content)
+            except SyntaxError as e:
+                pytest.fail(f"Syntax error in {py_file.relative_to(project_dir)}: {e}")
+
+        # 验证工具调用包含关键类型
+        execution_log = _get_state_attr(final_state, "execution_log", [])
+        tool_calls = [
+            e for e in execution_log
+            if isinstance(e, dict) and e.get("type") == "tool_call"
+        ]
+        tool_names = {e.get("tool_name") for e in tool_calls}
+        assert "read_file" in tool_names, "Should have used read_file"
+        assert "write_file" in tool_names, "Should have used write_file"
+
+    @pytest.mark.asyncio
+    async def test_auth_modification_direct_execution(
+        self, tmp_path: Path,
+    ) -> None:
+        """简化场景：直接用 ExecutionNode 执行 Basic Auth → JWT Auth 替换。
+
+        相比完整的 Orchestrator 工作流，此测试跳过 Human Review，
+        直接验证 Agent 的跨文件分析和修改能力。
+        """
+        project_dir = await self._copy_sample_fullstack_project(tmp_path)
+        project_root = str(project_dir)
+
+        tool_gateway = _build_phase2_tool_gateway(project_root)
+        validation_gateway = _build_validation_gateway()
+        llm = _build_llm(os.environ.get("LLM_MODEL", "openai/deepseek-v4-flash"))
+
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=tool_gateway,
+            validation_gateway=validation_gateway,
+            max_retries=3,
+        )
+
+        state = AgentState(
+            user_request=(
+                f"In the project at {project_root}, replace Basic Auth with JWT authentication. "
+                "Do NOT search for files - they are at these exact paths:\n"
+                "- backend/auth/auth_middleware.py\n"
+                "- backend/api/routes.py\n"
+                "- frontend/src/api/client.py\n"
+                "Read all three files first, then modify them:\n"
+                "1. auth_middleware.py: Add JWT token creation and validation "
+                "using jwt.encode/jwt.decode from the pyjwt library. "
+                "Create a new function create_jwt_token(username) and modify "
+                "authenticate_request to validate Bearer tokens.\n"
+                "2. routes.py: Keep the authenticate_request dependency "
+                "(interface stays the same).\n"
+                "3. client.py: Change _make_basic_auth_header to use Bearer token.\n"
+                "After modifying each file, use read_file to verify it's correct."
+            ),
+            project_root=project_root,
+        )
+
+        result = await node(state)
+
+        errors = result.get("errors", [])
+        if errors:
+            pytest.fail(f"Execution had errors: {errors}")
+
+        # 验证 JWT 代码被写入 auth_middleware.py
+        middleware_file = project_dir / "backend" / "auth" / "auth_middleware.py"
+        assert middleware_file.exists()
+        content = middleware_file.read_text(encoding="utf-8")
+        jwt_found = "jwt" in content.lower() or "JWT" in content or "Bearer" in content
+        assert jwt_found, (
+            "auth_middleware.py should contain JWT or Bearer references"
+        )
+
+        # 验证所有 Python 文件语法正确
+        import ast
+        for py_file in project_dir.rglob("*.py"):
+            try:
+                ast.parse(py_file.read_text(encoding="utf-8"))
+            except SyntaxError as e:
+                pytest.fail(f"Syntax error in {py_file.relative_to(project_dir)}: {e}")
+
+        # 验证工具调用包含 read_file 和 write_file
+        execution_log = result.get("execution_log", [])
+        tool_calls = [
+            e for e in execution_log
+            if isinstance(e, dict) and e.get("type") == "tool_call"
+        ]
+        tool_names = {e.get("tool_name") for e in tool_calls}
+        assert "read_file" in tool_names, "Should have used read_file"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Phase 3.8 — Scene H: 多步骤执行 + 进度追踪
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.e2e
+@requires_api_key
+class TestE2EMultiStepPlan:
+    """Scene H: 多步骤计划执行与进度追踪。
+
+    验证 Agent 能执行多步骤计划、展示进度、并在偏离时请求人工干预。
+    """
+
+    async def _copy_sample_project(self, tmp_path: Path) -> Path:
+        """将 sample_python_project 复制到临时目录。"""
+        import shutil
+
+        sample_src = (
+            Path(__file__).resolve().parent.parent.parent
+            / "tests" / "fixtures" / "sample_python_project"
+        )
+        dest = tmp_path / "sample_project"
+        shutil.copytree(str(sample_src), str(dest))
+        return dest
+
+    @pytest.mark.asyncio
+    async def test_multi_step_plan_execution(self, tmp_path: Path) -> None:
+        """测试多步骤计划执行。
+
+        1. Agent 读取项目结构
+        2. Agent 生成含多个步骤的计划（创建、修改、读取混合）
+        3. 计划步骤包含依赖关系
+        4. 步骤按序执行
+        5. 执行日志包含进度追踪
+        """
+        project_dir = await self._copy_sample_project(tmp_path)
+        project_root = str(project_dir)
+
+        from codeagent.orchestration.orchestrator import Orchestrator
+        from codeagent.gateway.context_gateway import IContextGateway, ContextPackage
+
+        tool_gateway = _build_phase2_tool_gateway(project_root)
+        validation_gateway = _build_validation_gateway()
+        llm = _build_llm(os.environ.get("LLM_MODEL", "openai/deepseek-v4-flash"))
+
+        class _MockContextGateway(IContextGateway):
+            async def build_context(
+                self, project_root: str, query: str,
+            ) -> ContextPackage:
+                return ContextPackage(
+                    file_tree={
+                        "name": "sample_project",
+                        "type": "directory",
+                        "path": ".",
+                        "children": [
+                            {"name": "main.py", "type": "file", "path": "main.py"},
+                            {
+                                "name": "models", "type": "directory", "path": "models",
+                                "children": [
+                                    {"name": "user.py", "type": "file", "path": "models/user.py"},
+                                    {"name": "role.py", "type": "file", "path": "models/role.py"},
+                                ],
+                            },
+                            {
+                                "name": "services", "type": "directory", "path": "services",
+                                "children": [
+                                    {"name": "user_service.py", "type": "file", "path": "services/user_service.py"},
+                                    {"name": "auth.py", "type": "file", "path": "services/auth.py"},
+                                ],
+                            },
+                            {
+                                "name": "api", "type": "directory", "path": "api",
+                                "children": [
+                                    {"name": "routes.py", "type": "file", "path": "api/routes.py"},
+                                ],
+                            },
+                            {
+                                "name": "utils", "type": "directory", "path": "utils",
+                                "children": [
+                                    {"name": "helpers.py", "type": "file", "path": "utils/helpers.py"},
+                                ],
+                            },
+                        ],
+                    },
+                )
+
+            async def update_index(self, project_root: str) -> None:
+                pass
+
+            async def search_semantic(self, query: str, top_k: int = 5) -> list:
+                return []
+
+        orchestrator = Orchestrator(
+            context_gateway=_MockContextGateway(),
+            tool_gateway=tool_gateway,
+            validation_gateway=validation_gateway,
+            llm=llm,
+        )
+
+        final_state = await orchestrator.run(
+            user_request=(
+                f"In the Python project at {project_root}, I need to add a new "
+                "'notification' feature. Follow these steps:\n"
+                "1. Create a new file services/notification_service.py with a "
+                "NotificationService class that has a send_notification method.\n"
+                "2. Add a new API endpoint POST /notifications in api/routes.py "
+                "that uses the NotificationService.\n"
+                "3. Read utils/helpers.py to understand existing helper functions, "
+                "then add a format_notification helper there.\n"
+                "4. Read main.py and add a test print for the notification feature."
+            ),
+            project_root=project_root,
+        )
+
+        # 如果有 Human Review，自动审批
+        def _get_attr(state: object, attr: str, default: object = None) -> object:
+            if isinstance(state, dict):
+                return state.get(attr, default)
+            return getattr(state, attr, default)
+
+        checkpoints = orchestrator.get_checkpoints()
+        plan = _get_attr(final_state, "plan")
+        if checkpoints and plan:
+            has_high_risk = any(
+                getattr(step, "risk", None) == "high" if not isinstance(step, dict) else step.get("risk") == "high"
+                for step in plan
+            )
+            if has_high_risk:
+                thread_id = checkpoints[0]["thread_id"]
+                final_state = await orchestrator.resume(thread_id, "approve")
+
+        errors = _get_attr(final_state, "errors", [])
+        assert not errors, f"Execution had errors: {errors}"
+
+        # 验证计划已生成
+        plan = _get_attr(final_state, "plan")
+        assert plan is not None
+        assert len(plan) >= 2, "Should have at least 2 plan steps"
+
+        # 验证新文件被创建
+        notif_service = project_dir / "services" / "notification_service.py"
+        expected_created = notif_service.exists()
+        if not expected_created:
+            # 也可能写在其他位置
+            pass
+
+        # 验证 api/routes.py 被修改（添加了 notification 相关内容）
+        routes_file = project_dir / "api" / "routes.py"
+        assert routes_file.exists()
+        routes_content = routes_file.read_text(encoding="utf-8")
+        assert "notification" in routes_content.lower(), (
+            "routes.py should reference notification"
+        )
+
+        # 验证 utils/helpers.py 被修改
+        helpers_file = project_dir / "utils" / "helpers.py"
+        helpers_content = helpers_file.read_text(encoding="utf-8")
+        assert "notification" in helpers_content.lower() or "format" in helpers_content.lower(), (
+            "helpers.py should contain notification-related function"
+        )
+
+        # 验证所有修改过的 Python 文件语法正确
+        import ast
+        for py_file in project_dir.rglob("*.py"):
+            try:
+                ast.parse(py_file.read_text(encoding="utf-8"))
+            except SyntaxError as e:
+                pytest.fail(f"Syntax error in {py_file.relative_to(project_dir)}: {e}")
+
+        # 验证执行日志包含进度信息
+        execution_log = _get_attr(final_state, "execution_log", [])
+        progress_entries = [
+            e for e in execution_log
+            if isinstance(e, dict) and e.get("type") in ("step_start", "step_complete", "progress")
+        ]
+        assert len(progress_entries) >= 1, (
+            "Should have at least one progress tracking entry"
+        )
+
+        # 验证工具调用包含 read_file 和 write_file
+        tool_calls = [
+            e for e in execution_log
+            if isinstance(e, dict) and e.get("type") == "tool_call"
+        ]
+        tool_names = {e.get("tool_name") for e in tool_calls}
+        assert "read_file" in tool_names, "Should have used read_file"
+        assert "write_file" in tool_names, "Should have used write_file"

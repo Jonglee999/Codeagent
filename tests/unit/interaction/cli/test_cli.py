@@ -511,3 +511,266 @@ class TestBuildValidationGateway:
         from codeagent.gateway.validation_gateway import IValidationGateway
 
         assert isinstance(gateway, IValidationGateway)
+
+
+# =============================================================================
+# 测试：_save_session_history 持久化
+# =============================================================================
+
+
+class TestSaveSessionHistory:
+    """验证 _save_session_history 函数的读写行为。"""
+
+    def test_save_new_file(self, tmp_path: Path) -> None:
+        """新文件写入 — 应创建 history.json。"""
+        from codeagent.interaction.cli.main import _save_session_history
+
+        session = {"request": "test", "success": True, "timestamp": "2026-05-14T12:00:00"}
+        _save_session_history(str(tmp_path), session)
+
+        history_path = tmp_path / ".codeagent" / "history.json"
+        assert history_path.exists()
+        data = json.loads(history_path.read_text(encoding="utf-8"))
+        assert len(data) == 1
+        assert data[0]["request"] == "test"
+        assert data[0]["success"] is True
+
+    def test_save_append_to_existing(self, tmp_path: Path) -> None:
+        """追加到已有文件 — 应保留历史记录。"""
+        from codeagent.interaction.cli.main import _save_session_history
+
+        s1 = {"request": "first", "timestamp": "2026-05-14T12:00:00"}
+        s2 = {"request": "second", "timestamp": "2026-05-14T12:01:00"}
+
+        _save_session_history(str(tmp_path), s1)
+        _save_session_history(str(tmp_path), s2)
+
+        history_path = tmp_path / ".codeagent" / "history.json"
+        data = json.loads(history_path.read_text(encoding="utf-8"))
+        assert len(data) == 2
+        assert data[0]["request"] == "first"
+        assert data[1]["request"] == "second"
+
+    def test_read_with_data(self, tmp_path: Path) -> None:
+        """有历史数据时应能追加。"""
+        from codeagent.interaction.cli.main import _save_session_history
+
+        sessions = [{"request": f"session_{i}", "timestamp": "2026-05-14T12:00:00"} for i in range(3)]
+        for s in sessions:
+            _save_session_history(str(tmp_path), s)
+
+        history_path = tmp_path / ".codeagent" / "history.json"
+        data = json.loads(history_path.read_text(encoding="utf-8"))
+        assert len(data) == 3
+
+    def test_save_read_with_empty_data(self, tmp_path: Path) -> None:
+        """损坏的文件应优雅处理视为空。"""
+        from codeagent.interaction.cli.main import _save_session_history
+
+        history_path = tmp_path / ".codeagent" / "history.json"
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        history_path.write_text("invalid json content", encoding="utf-8")
+
+        session = {"request": "after corruption", "success": True, "timestamp": "2026-05-14T12:00:00"}
+        _save_session_history(str(tmp_path), session)
+
+        data = json.loads(history_path.read_text(encoding="utf-8"))
+        assert len(data) == 1
+        assert data[0]["request"] == "after corruption"
+
+    def test_truncate_at_100(self, tmp_path: Path) -> None:
+        """超过 100 条时应自动裁剪。"""
+        from codeagent.interaction.cli.main import _save_session_history
+
+        for i in range(105):
+            _save_session_history(str(tmp_path), {
+                "request": f"session_{i}",
+                "timestamp": f"2026-05-14T12:{i:02d}:00",
+            })
+
+        history_path = tmp_path / ".codeagent" / "history.json"
+        data = json.loads(history_path.read_text(encoding="utf-8"))
+        assert len(data) == 100
+        assert data[0]["request"] == "session_5"
+        assert data[99]["request"] == "session_104"
+
+    def test_empty_sessions_read(self, tmp_path: Path) -> None:
+        """空的 JSON 文件应正确读取。"""
+        from codeagent.interaction.cli.main import _save_session_history
+
+        history_path = tmp_path / ".codeagent" / "history.json"
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        history_path.write_text("[]", encoding="utf-8")
+
+        session = {"request": "after empty", "success": True, "timestamp": "2026-05-14T12:00:00"}
+        _save_session_history(str(tmp_path), session)
+
+        data = json.loads(history_path.read_text(encoding="utf-8"))
+        assert len(data) == 1
+
+
+# =============================================================================
+# 测试：CLI 集成 — ask 写入历史 + history 读取
+# =============================================================================
+
+
+class TestAskHistoryIntegration:
+    """验证 ask 命令执行后自动写入历史记录。"""
+
+    @patch("codeagent.interaction.cli.main._save_session_history")
+    @patch("codeagent.interaction.cli.main._build_tool_gateway")
+    @patch("codeagent.interaction.cli.main._build_validation_gateway")
+    @patch("codeagent.interaction.cli.main._build_llm")
+    def test_ask_calls_save_session_history(
+        self,
+        mock_build_llm: MagicMock,
+        mock_build_vg: MagicMock,
+        mock_build_tg: MagicMock,
+        mock_save: MagicMock,
+        runner: CliRunner,
+        temp_project: Path,
+    ) -> None:
+        """ask 命令应调用 _save_session_history。"""
+        mock_build_llm.return_value = AsyncMock()
+        mock_build_tg.return_value = MagicMock()
+        mock_build_vg.return_value = MagicMock()
+
+        with patch("codeagent.interaction.cli.main.asyncio.run") as mock_run:
+            mock_run.side_effect = _mock_run({"execution_log": [], "errors": []})
+            result = runner.invoke(
+                cli,
+                ["ask", "write a test", "--project", str(temp_project)],
+            )
+
+        assert result.exit_code == 0
+        mock_save.assert_called_once()
+        call_args = mock_save.call_args[0]
+        assert call_args[0] == str(temp_project)
+        session_data = call_args[1]
+        assert session_data["request"] == "write a test"
+        assert session_data["success"] is True
+        assert "timestamp" in session_data
+        assert "duration_ms" in session_data
+
+    @patch("codeagent.interaction.cli.main._build_tool_gateway")
+    @patch("codeagent.interaction.cli.main._build_validation_gateway")
+    @patch("codeagent.interaction.cli.main._build_llm")
+    def test_ask_saves_history_on_success(
+        self,
+        mock_build_llm: MagicMock,
+        mock_build_vg: MagicMock,
+        mock_build_tg: MagicMock,
+        runner: CliRunner,
+        temp_project: Path,
+    ) -> None:
+        """ask 成功后应保存 history.json。"""
+        mock_build_llm.return_value = AsyncMock()
+        mock_build_tg.return_value = MagicMock()
+        mock_build_vg.return_value = MagicMock()
+
+        with patch("codeagent.interaction.cli.main.asyncio.run") as mock_run:
+            mock_run.side_effect = _mock_run({"execution_log": [], "errors": []})
+            runner.invoke(
+                cli,
+                ["ask", "hello", "--project", str(temp_project)],
+            )
+
+        history_path = Path(temp_project) / ".codeagent" / "history.json"
+        assert history_path.exists()
+        data = json.loads(history_path.read_text(encoding="utf-8"))
+        assert len(data) == 1
+        assert data[0]["request"] == "hello"
+        assert data[0]["success"] is True
+
+    @patch("codeagent.interaction.cli.main._build_tool_gateway")
+    @patch("codeagent.interaction.cli.main._build_validation_gateway")
+    @patch("codeagent.interaction.cli.main._build_llm")
+    def test_ask_saves_history_on_failure(
+        self,
+        mock_build_llm: MagicMock,
+        mock_build_vg: MagicMock,
+        mock_build_tg: MagicMock,
+        runner: CliRunner,
+        temp_project: Path,
+    ) -> None:
+        """ask 失败（有 errors）也应保存 history.json。"""
+        mock_build_llm.return_value = AsyncMock()
+        mock_build_tg.return_value = MagicMock()
+        mock_build_vg.return_value = MagicMock()
+
+        with patch("codeagent.interaction.cli.main.asyncio.run") as mock_run:
+            mock_run.side_effect = _mock_run({
+                "execution_log": [],
+                "errors": ["Something went wrong"],
+            })
+            runner.invoke(
+                cli,
+                ["ask", "hello", "--project", str(temp_project)],
+            )
+
+        history_path = Path(temp_project) / ".codeagent" / "history.json"
+        assert history_path.exists()
+        data = json.loads(history_path.read_text(encoding="utf-8"))
+        assert data[0]["success"] is False
+        assert data[0]["error_count"] == 1
+
+    @patch("codeagent.interaction.cli.main._build_tool_gateway")
+    @patch("codeagent.interaction.cli.main._build_validation_gateway")
+    @patch("codeagent.interaction.cli.main._build_llm")
+    def test_history_command_shows_saved_data(
+        self,
+        mock_build_llm: MagicMock,
+        mock_build_vg: MagicMock,
+        mock_build_tg: MagicMock,
+        runner: CliRunner,
+        temp_project: Path,
+    ) -> None:
+        """history 命令应显示 ask 保存的数据。"""
+        mock_build_llm.return_value = AsyncMock()
+        mock_build_tg.return_value = MagicMock()
+        mock_build_vg.return_value = MagicMock()
+
+        # history 命令使用 Path.cwd()，因此用 isolated_filesystem
+        with runner.isolated_filesystem(temp_dir=temp_project) as td:
+            (Path(td) / "test_file.py").write_text("x = 1\n")
+            with patch("codeagent.interaction.cli.main.asyncio.run") as mock_run:
+                mock_run.side_effect = _mock_run({"execution_log": [], "errors": []})
+                runner.invoke(
+                    cli,
+                    ["ask", "integration test", "--project", td],
+                )
+
+            result = runner.invoke(cli, ["history"])
+            assert result.exit_code == 0
+            assert "integration test" in result.output
+
+    @patch("codeagent.interaction.cli.main._build_tool_gateway")
+    @patch("codeagent.interaction.cli.main._build_validation_gateway")
+    @patch("codeagent.interaction.cli.main._build_llm")
+    def test_history_limit_filter(
+        self,
+        mock_build_llm: MagicMock,
+        mock_build_vg: MagicMock,
+        mock_build_tg: MagicMock,
+        runner: CliRunner,
+        temp_project: Path,
+    ) -> None:
+        """history --limit 应限制显示条数。"""
+        mock_build_llm.return_value = AsyncMock()
+        mock_build_tg.return_value = MagicMock()
+        mock_build_vg.return_value = MagicMock()
+
+        with runner.isolated_filesystem(temp_dir=temp_project) as td:
+            (Path(td) / "test_file.py").write_text("x = 1\n")
+            with patch("codeagent.interaction.cli.main.asyncio.run") as mock_run:
+                mock_run.side_effect = _mock_run({"execution_log": [], "errors": []})
+                for i in range(3):
+                    runner.invoke(
+                        cli,
+                        ["ask", f"request {i}", "--project", td],
+                    )
+
+            result = runner.invoke(cli, ["history", "--limit", "1"])
+            assert result.exit_code == 0
+            lines = [l for l in result.output.split("\n") if "request 2" in l.strip()]
+            assert len(lines) == 1

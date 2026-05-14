@@ -41,70 +41,80 @@ User request: "Create a hello world Flask app"
 Context: empty project
 
 Output:
-[
-  {{
-    "step_id": 1,
-    "description": "Create requirements.txt with Flask dependency",
-    "action": "create",
-    "target_file": "requirements.txt",
-    "risk": "low",
-    "dependencies": []
-  }},
-  {{
-    "step_id": 2,
-    "description": "Create app.py with Flask hello world",
-    "action": "create",
-    "target_file": "app.py",
-    "risk": "low",
-    "dependencies": []
-  }}
-]
+{{
+  "plan": [
+    {{
+      "step_id": 1,
+      "description": "Create requirements.txt with Flask dependency",
+      "action": "create",
+      "target_file": "requirements.txt",
+      "risk": "low",
+      "dependencies": []
+    }},
+    {{
+      "step_id": 2,
+      "description": "Create app.py with Flask hello world",
+      "action": "create",
+      "target_file": "app.py",
+      "risk": "low",
+      "dependencies": []
+    }}
+  ],
+  "original_goal_summary": "Create a hello world Flask application"
+}}
 
 ### Example 2: Refactor a module
 User request: "Rename main.py to app.py and update imports"
 Context: existing project with main.py and utils.py
 
 Output:
-[
-  {{
-    "step_id": 1,
-    "description": "Read main.py to understand current exports",
-    "action": "read",
-    "target_file": "main.py",
-    "risk": "low",
-    "dependencies": []
-  }},
-  {{
-    "step_id": 2,
-    "description": "Create app.py with main.py content",
-    "action": "create",
-    "target_file": "app.py",
-    "risk": "low",
-    "dependencies": [1]
-  }},
-  {{
-    "step_id": 3,
-    "description": "Update utils.py imports to reference app instead of main",
-    "action": "modify",
-    "target_file": "utils.py",
-    "risk": "low",
-    "dependencies": [2]
-  }},
-  {{
-    "step_id": 4,
-    "description": "Delete old main.py",
-    "action": "delete",
-    "target_file": "main.py",
-    "risk": "high",
-    "dependencies": [2]
-  }}
-]
+{{
+  "plan": [
+    {{
+      "step_id": 1,
+      "description": "Read main.py to understand current exports",
+      "action": "read",
+      "target_file": "main.py",
+      "risk": "low",
+      "dependencies": []
+    }},
+    {{
+      "step_id": 2,
+      "description": "Create app.py with main.py content",
+      "action": "create",
+      "target_file": "app.py",
+      "risk": "low",
+      "dependencies": [1]
+    }},
+    {{
+      "step_id": 3,
+      "description": "Update utils.py imports to reference app instead of main",
+      "action": "modify",
+      "target_file": "utils.py",
+      "risk": "low",
+      "dependencies": [2]
+    }},
+    {{
+      "step_id": 4,
+      "description": "Delete old main.py",
+      "action": "delete",
+      "target_file": "main.py",
+      "risk": "high",
+      "dependencies": [2]
+    }}
+  ],
+  "original_goal_summary": "Rename main.py to app.py and update all related imports"
+}}
 
 ## Current Request
 User: {user_request}
 
 {context_section}
-Generate a plan as a JSON array of steps. Respond with ONLY the JSON array, no markdown or explanation."""
+Respond with a JSON object containing two fields:
+1. "plan": a JSON array of steps (following the schema above)
+2. "original_goal_summary": a brief 1-2 sentence summary of the user's original goal, used to keep the Agent focused during execution
+
+Respond with ONLY the JSON object, no markdown or explanation."""
 
 
 class PlanningNode:
@@ -162,13 +172,28 @@ class PlanningNode:
                             f"Plan generation failed: LLM call error: {exc}"
                         ],
                         "plan": None,
+                        "original_goal_summary": "",
                     }
 
                 content = response.choices[0].message.content or ""
 
                 # 清理可能存在的 markdown 包装
                 plan_json = self._clean_json(content)
-                plan_data = json.loads(plan_json)
+                parsed = json.loads(plan_json)
+
+                # 支持两种格式：新格式 {"plan": [...], "original_goal_summary": "..."}
+                # 和向后兼容的纯数组格式
+                original_goal_summary = ""
+                if isinstance(parsed, dict):
+                    plan_data = parsed.get("plan", parsed)
+                    original_goal_summary = parsed.get("original_goal_summary", "")
+                    if isinstance(plan_data, dict):
+                        plan_data = list(plan_data.values()) if not isinstance(plan_data, list) else []
+                elif isinstance(parsed, list):
+                    plan_data = parsed
+                else:
+                    raise ValueError(f"Expected JSON array or object, got {type(parsed).__name__}")
+
                 steps = self._parse_steps(plan_data)
 
                 # Schema 校验
@@ -186,10 +211,12 @@ class PlanningNode:
 
                 return {
                     "plan": steps,
+                    "original_goal_summary": original_goal_summary,
                     "execution_log": [{
                         "type": "plan_generated",
                         "steps": len(steps),
                         "conflicts": conflicts or None,
+                        "original_goal_summary": original_goal_summary or None,
                     }],
                 }
 
@@ -216,6 +243,7 @@ class PlanningNode:
                 f"attempts: {last_error}"
             ],
             "plan": None,
+            "original_goal_summary": "",
         }
 
     def _build_prompt(self, state: AgentState) -> str:

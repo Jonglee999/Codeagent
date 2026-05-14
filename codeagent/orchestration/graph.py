@@ -89,6 +89,7 @@ def build_workflow(
         {
             "execution": "execution",
             "validation": "validation",
+            "human_review": "human_review",
             "end": END,
         },
     )

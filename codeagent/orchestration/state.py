@@ -87,3 +87,14 @@ class AgentState:
     human_decision: str | None = None
     retry_count: int = 0
     degraded_mode: bool = False
+
+    # ── Phase 3.5 TaskFocus + Human Review 字段 ──────────────
+    original_goal_summary: str = ""               # 原始目标摘要（Planning Node 写入）
+    completed_steps_summary: str = ""              # 已完成步骤摘要
+    tasks_remaining: list[str] = field(default_factory=list)  # 剩余步骤清单
+    deviation_detected: bool = False              # 偏离标记
+    deviation_count: int = 0                      # 连续偏离计数
+    conversation_history: list[dict] = field(default_factory=list)  # 多轮对话历史
+    human_review_required: bool = False           # 是否需要人工审核
+    review_request: dict | None = None            # 当前审核请求详情
+    review_type: str | None = None                # 审核触发类型

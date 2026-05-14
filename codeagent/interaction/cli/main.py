@@ -48,6 +48,7 @@ from codeagent.tools.file.read_file import ReadFileTool
 from codeagent.tools.file.write_file import WriteFileTool
 from codeagent.tools.gateway import ToolGateway
 from codeagent.tools.registry import ToolRegistry
+from codeagent.tools.terminal.run_terminal import RunTerminalTool
 from codeagent.validation.syntax_validator import SyntaxValidator
 
 logger = logging.getLogger(__name__)
@@ -144,10 +145,14 @@ def _build_llm(model_name: str) -> Any:
 
 
 def _build_tool_gateway(project_root: str) -> ToolGateway:
-    """构建工具 Gateway，注册 ReadFileTool 和 WriteFileTool。"""
+    """构建工具 Gateway，注册 ReadFileTool、WriteFileTool 和 RunTerminalTool。"""
     registry = ToolRegistry()
     registry.register(ReadFileTool(project_root=project_root))
     registry.register(WriteFileTool(project_root=project_root))
+    try:
+        registry.register(RunTerminalTool(project_root=project_root))
+    except Exception:
+        logger.warning("RunTerminalTool not available (Docker may not be installed)")
     return ToolGateway(registry)
 
 
@@ -325,6 +330,16 @@ def ask(
 
     success = len(errors) == 0
 
+    # ── 持久化历史记录 ──────────────────────────────────────
+    _save_session_history(project_root, {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "request": request,
+        "success": success,
+        "duration_ms": total_duration,
+        "execution_log_count": len(execution_log),
+        "error_count": len(errors),
+    })
+
     # ── 输出 ──────────────────────────────────────────────
     if json_output:
         click.echo(
@@ -376,6 +391,42 @@ def _display_entry(entry: dict[str, Any], project_root: str) -> None:
         content = entry.get("content", "")
         if content:
             console.print(format_llm_response(content))
+
+
+# ── 历史记录持久化 ────────────────────────────────────────────────────────────
+
+
+def _save_session_history(project_root: str, session: dict) -> None:
+    """将会话记录追加到 .codeagent/history.json。
+
+    Args:
+        project_root: 项目根目录路径
+        session: 会话记录字典（timestamp, request, success, duration_ms 等）
+    """
+    from pathlib import Path
+    import json
+
+    history_path = Path(project_root) / ".codeagent" / "history.json"
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if history_path.exists():
+        try:
+            sessions: list[dict] = json.loads(
+                history_path.read_text(encoding="utf-8")
+            )
+        except (json.JSONDecodeError, OSError):
+            sessions = []
+    else:
+        sessions = []
+
+    sessions.append(session)
+
+    # 只保留最近 100 条记录
+    sessions = sessions[-100:]
+
+    history_path.write_text(
+        json.dumps(sessions, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
 
 
 @cli.command()

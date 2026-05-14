@@ -582,3 +582,53 @@ class TestPlanningNodeEdgeCases:
         result = await node(state)
         assert result["plan"] is not None
         assert result["plan"][0].action == "command"
+
+
+# ── Phase 3.5: Planning Node Goal Summary Tests ──────────────
+
+
+class TestPlanningNodeGoalSummary:
+    """Planning Node 目标摘要测试。"""
+
+    @pytest.mark.asyncio
+    async def test_new_format_with_goal_summary(self, state: AgentState) -> None:
+        """新格式 JSON 对象包含 plan + original_goal_summary。"""
+        response_data = {
+            "plan": [
+                {"step_id": 1, "description": "Create app", "action": "create",
+                 "target_file": "app.py", "risk": "low", "dependencies": []},
+            ],
+            "original_goal_summary": "Create a Flask application with user login",
+        }
+        llm = make_llm(response=json.dumps(response_data))
+        node = PlanningNode(llm=llm)
+        result = await node(state)
+        assert result["plan"] is not None
+        assert len(result["plan"]) == 1
+        assert result["original_goal_summary"] == "Create a Flask application with user login"
+
+    @pytest.mark.asyncio
+    async def test_backward_compat_plain_array(self, state: AgentState) -> None:
+        """纯数组格式（向后兼容）也应工作，返回空的 original_goal_summary。"""
+        llm = make_llm()
+        node = PlanningNode(llm=llm)
+        result = await node(state)
+        assert result["plan"] is not None
+        # 纯数组应返回空字符串
+        assert result.get("original_goal_summary") == ""
+
+    @pytest.mark.asyncio
+    async def test_goal_summary_in_execution_log(self, state: AgentState) -> None:
+        """execution_log 应包含 original_goal_summary。"""
+        response_data = {
+            "plan": [
+                {"step_id": 1, "description": "Read config", "action": "read",
+                 "target_file": "config.py", "risk": "low", "dependencies": []},
+            ],
+            "original_goal_summary": "Read and analyze config",
+        }
+        llm = make_llm(response=json.dumps(response_data))
+        node = PlanningNode(llm=llm)
+        result = await node(state)
+        log = result["execution_log"][0]
+        assert log["original_goal_summary"] == "Read and analyze config"

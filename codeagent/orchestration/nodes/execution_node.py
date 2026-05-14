@@ -1,4 +1,4 @@
-"""ExecutionNode — 执行节点（Phase 1b 升级版：支持按计划逐步执行）。
+"""ExecutionNode — 执行节点（Phase 3.5 升级版：偏离检测 + 目标追踪）。
 
 核心功能：
 1. Plan-aware: 按 PlanStep 逐步执行（state.plan 存在时）
@@ -7,6 +7,7 @@
 4. 语法错误 → 反馈 LLM 重新生成修复代码（最多 3 次）
 5. 单步骤超过 10 次 tool_calls → 强制结束
 6. 进度上报：通过 callback 实时报告执行进度
+7. TaskFocus: 偏离检测 + 目标追踪 + System Prompt 注入
 """
 
 from __future__ import annotations
@@ -27,6 +28,20 @@ _MAX_TOOL_CALLS = 10
 
 # 单步最大重试次数
 _MAX_RETRIES = 3
+
+# 每个 action 类型的合理工具列表
+_ALLOWED_TOOLS_BY_ACTION: dict[str, set[str]] = {
+    "create": {"write_file", "read_file"},
+    "modify": {"read_file", "write_file", "search_code"},
+    "delete": {"read_file", "delete_file"},
+    "read": {"read_file", "search_code", "glob"},
+    "command": {"run_terminal", "read_file"},
+}
+
+# 偏离检测阈值
+_DEVIATION_WARN_LIMIT = 1   # 首次偏离 → 警告
+_DEVIATION_UPGRADE_LIMIT = 2  # 连续 2 次 → 升级警告
+_DEVIATION_HUMAN_LIMIT = 3    # 连续 3 次 → 请求人工审核
 
 
 class ExecutionNode:
@@ -85,25 +100,40 @@ class ExecutionNode:
     # ── Plan-aware 执行 ──────────────────────────────────────
 
     async def _execute_with_plan(self, state: AgentState) -> dict[str, Any]:
-        """按计划逐步执行。
+        """按计划逐步执行（含 TaskFocus 进度追踪）。
 
         遍历 state.plan[state.current_step_index:]，对每个步骤：
         1. 构建步骤提示词 → 调用 LLM
-        2. 执行工具调用循环
+        2. 执行工具调用循环（含偏离检测）
         3. 语法检查
         4. 记录变更
         5. 上报进度
+        6. 更新完成/剩余步骤摘要
         """
         start_time = time.monotonic()
         execution_log: list[dict] = []
         errors: list[str] = list(state.errors)
         accumulated_changes: list[dict] = list(state.accumulated_changes)
         current_step_index = state.current_step_index
+        deviation_count = state.deviation_count
+        deviation_detected = state.deviation_detected
+        human_review_required = state.human_review_required
+        review_request = state.review_request
 
         tool_definitions = self._tool_gateway.list_tools()
         remaining_steps = state.plan[current_step_index:]
 
-        for step in remaining_steps:
+        # 构建完成/剩余步骤摘要
+        completed_descriptions = [
+            s.description for s in state.plan[:current_step_index]
+        ]
+        completed_steps_summary = "; ".join(completed_descriptions) if completed_descriptions else ""
+
+        for i, step in enumerate(remaining_steps):
+            # 如果偏离触发 Human Review，停止执行
+            if human_review_required:
+                break
+
             self._report_progress({
                 "step_id": step.step_id,
                 "status": "running",
@@ -112,26 +142,44 @@ class ExecutionNode:
                 "message": step.description,
             })
 
+            # 计算剩余步骤描述（不含当前步骤）
+            remaining_descriptions = [
+                f"[{s.step_id}] {s.description}" for s in remaining_steps[i + 1:]
+            ]
+
             # 构建步骤提示词
             step_prompt = self._build_step_prompt(state, step, tool_definitions)
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": step_prompt},
             ]
 
-            # 执行该步骤的工具调用循环
-            step_result = await self._execute_step_tool_loop(
-                step=step,
-                messages=messages,
-                tool_definitions=tool_definitions,
-                execution_log=execution_log,
-                errors=errors,
-                accumulated_changes=accumulated_changes,
+            # 执行该步骤的工具调用循环（含偏离检测）
+            step_result, step_deviation_count, step_human_review, step_review_request = (
+                await self._execute_step_tool_loop(
+                    step=step,
+                    messages=messages,
+                    tool_definitions=tool_definitions,
+                    execution_log=execution_log,
+                    errors=errors,
+                    accumulated_changes=accumulated_changes,
+                    deviation_count=deviation_count,
+                    remaining_descriptions=remaining_descriptions,
+                )
             )
 
-            if step_result:
+            if step_result is not None:
                 accumulated_changes = step_result
 
+            deviation_count = step_deviation_count
+            if step_human_review:
+                human_review_required = True
+                review_request = step_review_request
+
             current_step_index += 1
+
+            # 更新完成摘要
+            completed_descriptions.append(step.description)
+            completed_steps_summary = "; ".join(completed_descriptions)
 
             self._report_progress({
                 "step_id": step.step_id,
@@ -140,6 +188,16 @@ class ExecutionNode:
                 "operation": step.action,
                 "message": f"Step {step.step_id} completed",
             })
+
+            # 如果偏离触发 Human Review，停止执行
+            if human_review_required:
+                break
+
+        # 计算剩余任务描述
+        remaining_descriptions = [
+            f"[{s.step_id}] {s.description}"
+            for s in (state.plan or [])[current_step_index:]
+        ]
 
         total_duration = (time.monotonic() - start_time) * 1000
         logger.info(
@@ -152,6 +210,12 @@ class ExecutionNode:
             "errors": errors,
             "current_step_index": current_step_index,
             "accumulated_changes": accumulated_changes,
+            "completed_steps_summary": completed_steps_summary,
+            "tasks_remaining": remaining_descriptions,
+            "deviation_detected": deviation_detected,
+            "deviation_count": deviation_count,
+            "human_review_required": human_review_required,
+            "review_request": review_request,
         }
 
     def _build_step_prompt(
@@ -160,16 +224,36 @@ class ExecutionNode:
         step: PlanStep,
         tool_definitions: list[Any],
     ) -> str:
-        """为单个 PlanStep 构建提示词。"""
+        """为单个 PlanStep 构建提示词（含 TaskFocus 上下文注入）。"""
+        total_steps = len(state.plan or [])
         parts: list[str] = [
             "You are a coding agent executing a specific step of a plan.",
             "",
-            f"## Current Step ({step.step_id}/{len(state.plan or [])})",
+            f"## Current Step ({step.step_id}/{total_steps})",
             f"Description: {step.description}",
             f"Action: {step.action}",
             f"Target: {step.target_file or 'N/A'}",
             "",
         ]
+
+        # ── Phase 3.5 TaskFocus: 注入当前任务状态 ──────────────
+        if state.original_goal_summary:
+            parts.append(
+                "## 当前任务状态\n"
+                f"原始目标: {state.original_goal_summary}\n"
+            )
+        if state.completed_steps_summary:
+            parts.append(f"进度: {state.completed_steps_summary}")
+        if state.tasks_remaining:
+            parts.append(
+                "剩余步骤:\n" + "\n".join(
+                    f"- {t}" for t in state.tasks_remaining
+                )
+            )
+        if state.original_goal_summary or state.completed_steps_summary or state.tasks_remaining:
+            parts.append(
+                "请严格围绕上述目标执行，不要偏离到未规划的方向。\n"
+            )
 
         if state.context:
             parts.append(f"## Project Context\n{state.context}\n")
@@ -198,12 +282,20 @@ class ExecutionNode:
         execution_log: list[dict],
         errors: list[str],
         accumulated_changes: list[dict],
-    ) -> list[dict] | None:
-        """执行单个步骤的 tool calling 循环。"""
+        deviation_count: int = 0,
+        remaining_descriptions: list[str] | None = None,
+    ) -> tuple[list[dict] | None, int, bool, dict | None]:
+        """执行单个步骤的 tool calling 循环（含偏离检测）。
+
+        Returns:
+            tuple[accumulated_changes, deviation_count, human_review_required, review_request]
+        """
         tool_call_count = 0
         syntax_retries = 0
         pending_syntax_check: str | None = None
         openai_tools = self._to_openai_tools(tool_definitions)
+        human_review_required = False
+        review_request: dict | None = None
 
         while tool_call_count < self._max_tool_calls:
             try:
@@ -243,14 +335,19 @@ class ExecutionNode:
                 }
                 for tc in msg.tool_calls
             ]
+            # DeepSeek requires explicit null content (not None) in assistant tool_call messages
             assistant_msg: dict[str, object] = {
                 "role": "assistant",
-                "content": msg.content,
+                "content": msg.content if msg.content is not None else None,
                 "tool_calls": assistant_tool_calls,
             }
+            # DeepSeek v4 Flash thinking mode requires reasoning_content to be preserved
             if hasattr(msg, "reasoning_content") and msg.reasoning_content:
                 assistant_msg["reasoning_content"] = msg.reasoning_content
             messages.append(assistant_msg)
+
+            executed_tool_ids: list[str] = []
+            pending_deviation_warnings: list[dict] = []
 
             for tool_call in msg.tool_calls:
                 if tool_call_count >= self._max_tool_calls:
@@ -262,6 +359,88 @@ class ExecutionNode:
                 tool_call_count += 1
                 tool_name = tool_call.function.name
                 tool_args = self._parse_tool_args(tool_call.function.arguments)
+
+                # ── Phase 3.5 偏离检测 ──────────────────────────
+                is_deviation = self._check_deviation(step, tool_name, tool_args)
+                if is_deviation:
+                    deviation_count += 1
+                    deviation_detected = True
+
+                    execution_log.append({
+                        "type": "deviation_detected",
+                        "step_id": step.step_id,
+                        "tool_name": tool_name,
+                        "arguments": tool_args,
+                        "deviation_count": deviation_count,
+                        "timestamp": time.time(),
+                    })
+
+                    if deviation_count >= _DEVIATION_HUMAN_LIMIT:
+                        # 连续 3 次 → 请求人工审核
+                        human_review_required = True
+                        review_request = {
+                            "review_type": "deviation_detected",
+                            "title": "执行偏离检测 — 需要人工审核",
+                            "details": {
+                                "step_id": step.step_id,
+                                "step_description": step.description,
+                                "tool_name": tool_name,
+                                "tool_args": tool_args,
+                                "consecutive_deviations": deviation_count,
+                            },
+                            "options": ["approve", "reject", "modify", "abort"],
+                        }
+                        execution_log.append({
+                            "type": "human_review_required",
+                            "reason": "repeated_deviation",
+                            "deviation_count": deviation_count,
+                            "timestamp": time.time(),
+                        })
+                        # DeepSeek 要求所有 tool_call_id 都有对应结果
+                        for tc in msg.tool_calls:
+                            if tc.id not in executed_tool_ids:
+                                messages.append({
+                                    "role": "tool",
+                                    "tool_call_id": tc.id,
+                                    "content": "Tool execution skipped due to deviation limit requiring human review.",
+                                })
+
+                        # 先 flush 已收集的偏离警告，再添加最终警告
+                        for w in pending_deviation_warnings:
+                            messages.append(w)
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                f"警告：检测到连续 {deviation_count} 次偏离计划的行为。"
+                                f"执行已暂停，需要人工审核。"
+                            ),
+                        })
+                        return accumulated_changes, deviation_count, human_review_required, review_request
+                    elif deviation_count >= _DEVIATION_UPGRADE_LIMIT:
+                        # 连续 2 次 → 升级警告（收集，在 tool 结果后追加）
+                        pending_deviation_warnings.append({
+                            "role": "user",
+                            "content": (
+                                f"警告（{deviation_count}/{_DEVIATION_HUMAN_LIMIT}）："
+                                f"你正在偏离当前步骤的规划范围。"
+                                f"当前步骤目标: {step.description}。"
+                                f"请严格围绕当前步骤执行。"
+                            ),
+                        })
+                        continue
+                    else:
+                        # 首次偏离 → 警告（收集，在 tool 结果后追加）
+                        pending_deviation_warnings.append({
+                            "role": "user",
+                            "content": (
+                                f"注意：工具 '{tool_name}' 的调用似乎偏离了当前步骤的规划。"
+                                f"当前步骤目标: {step.description}。"
+                                f"请确保工具调用在步骤范围内。"
+                            ),
+                        })
+                        continue
+                else:
+                    deviation_detected = False
 
                 logger.info(
                     "Step %d tool #%d: %s(%s)",
@@ -305,6 +484,7 @@ class ExecutionNode:
                     "tool_call_id": tool_call.id,
                     "content": result_content,
                 })
+                executed_tool_ids.append(tool_call.id)
 
                 # write_file → track change + syntax check
                 if tool_name == "write_file" and tool_result.success:
@@ -328,10 +508,63 @@ class ExecutionNode:
                 if tool_call_count >= self._max_tool_calls:
                     break
 
+            # DeepSeek 要求所有 tool_call_id 都有对应结果（必须紧跟在 assistant msg 之后）
+            for tc in msg.tool_calls:
+                if tc.id not in executed_tool_ids:
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": "Tool execution skipped (deviation or limit reached).",
+                    })
+
+            # 在 tool 结果之后追加偏离警告（确保 assistant→tool→user 的顺序）
+            for w in pending_deviation_warnings:
+                messages.append(w)
+
             if tool_call_count >= self._max_tool_calls:
                 break
 
-        return accumulated_changes
+        return accumulated_changes, deviation_count, human_review_required, review_request
+
+    # ── Phase 3.5 偏离检测 ────────────────────────────────────
+
+    def _check_deviation(
+        self, step: PlanStep, tool_name: str, tool_args: dict
+    ) -> bool:
+        """检测当前工具调用是否偏离当前步骤的规划范围。
+
+        检测规则：
+        1. 如果 tool_name 为 write_file，检查 file_path 是否在当前步骤的
+           target_file 范围内
+        2. 如果 tool_name 不在当前步骤的合理工具列表中
+        3. 如果 LLM 尝试修改计划外的文件（write_file 写入非目标文件）
+
+        Args:
+            step: 当前执行步骤
+            tool_name: 工具名称
+            tool_args: 工具参数字典
+
+        Returns:
+            True 表示检测到偏离
+        """
+        # 步骤 1: write_file 的 file_path 一致性检查
+        if tool_name == "write_file":
+            file_path = tool_args.get("file_path", "")
+            if file_path and step.target_file:
+                # 检查是否是命令行操作步骤（command 类型不检查文件路径）
+                if step.action != "command":
+                    # 文件路径应匹配步骤目标文件
+                    norm_file = file_path.replace("\\", "/")
+                    norm_target = step.target_file.replace("\\", "/")
+                    if not (norm_file == norm_target or norm_file.endswith("/" + norm_target)):
+                        return True
+
+        # 步骤 2: 工具名称合理性检查
+        allowed = _ALLOWED_TOOLS_BY_ACTION.get(step.action, set())
+        if allowed and tool_name not in allowed:
+            return True
+
+        return False
 
     # ── Phase 1a 直连模式 ────────────────────────────────────
 
@@ -405,6 +638,8 @@ class ExecutionNode:
                 assistant_msg["reasoning_content"] = msg.reasoning_content
             messages.append(assistant_msg)
 
+            executed_tool_ids: list[str] = []
+
             for tool_call in msg.tool_calls:
                 if tool_call_count >= self._max_tool_calls:
                     errors.append(
@@ -460,6 +695,7 @@ class ExecutionNode:
                     "tool_call_id": tool_call.id,
                     "content": result_content,
                 })
+                executed_tool_ids.append(tool_call.id)
 
                 if tool_name == "write_file" and tool_result.success:
                     file_path = tool_args.get("file_path", "")
@@ -475,6 +711,15 @@ class ExecutionNode:
 
                 if tool_call_count >= self._max_tool_calls:
                     break
+
+            # DeepSeek 要求所有 tool_call_id 都有对应结果
+            for tc in msg.tool_calls:
+                if tc.id not in executed_tool_ids:
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": "Tool execution skipped (limit reached).",
+                    })
 
             if tool_call_count >= self._max_tool_calls:
                 break

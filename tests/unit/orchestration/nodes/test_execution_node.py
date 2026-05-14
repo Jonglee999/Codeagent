@@ -898,3 +898,600 @@ class TestAccumulatedChanges:
         result = await node(state)
         assert len(result["accumulated_changes"]) == 2
         assert result["accumulated_changes"][0]["file_path"] == "existing.py"
+
+
+# ── Phase 3.5: TaskFocus — Deviation Detection ─────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestDeviationDetection:
+    """偏离检测测试。"""
+
+    def _make_plan_state(self, step: PlanStep | None = None) -> AgentState:
+        if step is None:
+            step = PlanStep(
+                step_id=1, description="Modify main.py", action="modify",
+                target_file="main.py",
+            )
+        return AgentState(
+            user_request="Modify main.py",
+            project_root="/test/project",
+            plan=[step],
+            current_step_index=0,
+        )
+
+    async def test_write_to_planned_file_no_deviation(self) -> None:
+        """写入计划内的文件不应触发偏离。"""
+        step = PlanStep(
+            step_id=1, description="Create hello.py", action="create",
+            target_file="hello.py",
+        )
+        state = self._make_plan_state(step)
+        responses = [
+            MockLLMResponse(choices=[MockChoice(
+                message=MockChoiceMessage(
+                    content="Writing",
+                    tool_calls=[MockToolCall(
+                        id="call_1",
+                        function=MockToolCall.Function(
+                            name="write_file",
+                            arguments='{"file_path": "hello.py", "content": "print(1)", "mode": "create"}',
+                        ),
+                    )],
+                )
+            )]),
+            MockLLMResponse(choices=[MockChoice(
+                message=MockChoiceMessage(content="Done")
+            )]),
+        ]
+        llm = AsyncMock(side_effect=responses)
+        gateway = make_gateway(tool_results=[
+            ToolResult(success=True, data={"file_path": "hello.py", "lines_added": 1}),
+        ])
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=gateway,
+            validation_gateway=make_validation_gateway(),
+        )
+        result = await node(state)
+        # 不应有偏离检测标记
+        deviations = [e for e in result["execution_log"] if e["type"] == "deviation_detected"]
+        assert len(deviations) == 0
+
+    async def test_write_outside_plan_triggers_deviation(self) -> None:
+        """写入计划外的文件应触发偏离。"""
+        step = PlanStep(
+            step_id=1, description="Modify main.py", action="modify",
+            target_file="main.py",
+        )
+        state = self._make_plan_state(step)
+        # LLM 尝试写入非目标文件 (other.py vs main.py)
+        responses = [
+            MockLLMResponse(choices=[MockChoice(
+                message=MockChoiceMessage(
+                    content="Writing",
+                    tool_calls=[MockToolCall(
+                        id="call_1",
+                        function=MockToolCall.Function(
+                            name="write_file",
+                            arguments='{"file_path": "other.py", "content": "x=1", "mode": "create"}',
+                        ),
+                    )],
+                )
+            )]),
+            MockLLMResponse(choices=[MockChoice(
+                message=MockChoiceMessage(content="Corrected")
+            )]),
+        ]
+        llm = AsyncMock(side_effect=responses)
+        gateway = make_gateway(tool_results=[
+            ToolResult(success=True, data={"file_path": "other.py", "lines_added": 1}),
+        ])
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=gateway,
+            validation_gateway=make_validation_gateway(),
+        )
+        result = await node(state)
+        deviations = [e for e in result["execution_log"] if e["type"] == "deviation_detected"]
+        assert len(deviations) >= 1
+        assert deviations[0]["tool_name"] == "write_file"
+
+    async def test_disallowed_tool_triggers_deviation(self) -> None:
+        """使用当前步骤不允许的工具应触发偏离。"""
+        step = PlanStep(
+            step_id=1, description="Read config", action="read",
+            target_file="config.py",
+        )
+        state = self._make_plan_state(step)
+        # read 步骤不应该调用 write_file
+        responses = [
+            MockLLMResponse(choices=[MockChoice(
+                message=MockChoiceMessage(
+                    content="Writing unexpectedly",
+                    tool_calls=[MockToolCall(
+                        id="call_1",
+                        function=MockToolCall.Function(
+                            name="write_file",
+                            arguments='{"file_path": "config.py", "content": "x=1", "mode": "modify"}',
+                        ),
+                    )],
+                )
+            )]),
+            MockLLMResponse(choices=[MockChoice(
+                message=MockChoiceMessage(content="Done")
+            )]),
+        ]
+        llm = AsyncMock(side_effect=responses)
+        gateway = make_gateway(tool_results=[
+            ToolResult(success=True, data={"file_path": "config.py", "lines_added": 1}),
+        ])
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=gateway,
+            validation_gateway=make_validation_gateway(),
+        )
+        result = await node(state)
+        deviations = [e for e in result["execution_log"] if e["type"] == "deviation_detected"]
+        assert len(deviations) >= 1
+
+    async def test_command_step_no_file_check(self) -> None:
+        """command 类型步骤不检查文件路径偏离。"""
+        step = PlanStep(
+            step_id=1, description="Run tests", action="command",
+            target_file=None,
+        )
+        state = self._make_plan_state(step)
+        responses = [
+            MockLLMResponse(choices=[MockChoice(
+                message=MockChoiceMessage(
+                    content="Running tests",
+                    tool_calls=[MockToolCall(
+                        id="call_1",
+                        function=MockToolCall.Function(
+                            name="write_file",
+                            arguments='{"file_path": "test_output.log", "content": "results", "mode": "create"}',
+                        ),
+                    )],
+                )
+            )]),
+            MockLLMResponse(choices=[MockChoice(
+                message=MockChoiceMessage(content="Done")
+            )]),
+        ]
+        llm = AsyncMock(side_effect=responses)
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=make_gateway(),
+            validation_gateway=make_validation_gateway(),
+        )
+        result = await node(state)
+        # command 步骤的 target_file 为 None，写入文件不触发偏离（除非工具名不在允许列表）
+        deviations = [e for e in result["execution_log"] if e["type"] == "deviation_detected"]
+        # write_file 不在 command 的允许工具列表中，所以应触发
+        assert len(deviations) >= 1
+
+    async def test_same_file_via_different_path_no_deviation(self) -> None:
+        """使用不同但等效的路径写入目标文件不触发偏离。"""
+        step = PlanStep(
+            step_id=1, description="Modify app/main.py", action="modify",
+            target_file="app/main.py",
+        )
+        state = self._make_plan_state(step)
+        responses = [
+            MockLLMResponse(choices=[MockChoice(
+                message=MockChoiceMessage(
+                    content="Writing",
+                    tool_calls=[MockToolCall(
+                        id="call_1",
+                        function=MockToolCall.Function(
+                            name="write_file",
+                            arguments='{"file_path": "/root/app/main.py", "content": "x=1", "mode": "modify"}',
+                        ),
+                    )],
+                )
+            )]),
+            MockLLMResponse(choices=[MockChoice(
+                message=MockChoiceMessage(content="Done")
+            )]),
+        ]
+        llm = AsyncMock(side_effect=responses)
+        gateway = make_gateway(tool_results=[
+            ToolResult(success=True, data={"file_path": "/root/app/main.py", "lines_added": 1}),
+        ])
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=gateway,
+            validation_gateway=make_validation_gateway(),
+        )
+        result = await node(state)
+        deviations = [e for e in result["execution_log"] if e["type"] == "deviation_detected"]
+        assert len(deviations) == 0
+
+
+# ── Phase 3.5: TaskFocus — Deviation Escalation ────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestDeviationEscalation:
+    """偏离计数升级测试。"""
+
+    async def test_first_deviation_triggers_warning(self) -> None:
+        """首次偏离应触发警告级别。"""
+        step = PlanStep(
+            step_id=1, description="Modify main.py", action="modify",
+            target_file="main.py",
+        )
+        plan = [step]
+        state = AgentState(
+            user_request="Modify main.py",
+            project_root="/test/project",
+            plan=plan,
+            current_step_index=0,
+            original_goal_summary="Modify main.py to add logging",
+        )
+        # LLM 每次连续偏离，先写 plan2.py（偏离），第二次才写 main.py（纠正）
+        responses = [
+            MockLLMResponse(choices=[MockChoice(
+                message=MockChoiceMessage(
+                    content="Writing to wrong file",
+                    tool_calls=[MockToolCall(
+                        id="call_1",
+                        function=MockToolCall.Function(
+                            name="write_file",
+                            arguments='{"file_path": "plan2.py", "content": "x=1", "mode": "create"}',
+                        ),
+                    )],
+                )
+            )]),
+            MockLLMResponse(choices=[MockChoice(
+                message=MockChoiceMessage(
+                    content="Now writing correct file",
+                    tool_calls=[MockToolCall(
+                        id="call_2",
+                        function=MockToolCall.Function(
+                            name="write_file",
+                            arguments='{"file_path": "main.py", "content": "x=1", "mode": "modify"}',
+                        ),
+                    )],
+                )
+            )]),
+            MockLLMResponse(choices=[MockChoice(
+                message=MockChoiceMessage(content="Done")
+            )]),
+        ]
+        llm = AsyncMock(side_effect=responses)
+        gateway = make_gateway(tool_results=[
+            ToolResult(success=True, data={}),
+            ToolResult(success=True, data={}),
+        ])
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=gateway,
+            validation_gateway=make_validation_gateway(),
+        )
+        result = await node(state)
+        deviations = [e for e in result["execution_log"] if e["type"] == "deviation_detected"]
+        assert len(deviations) == 1
+        assert deviations[0]["deviation_count"] == 1
+
+    async def test_two_deviations_escalates_warning(self) -> None:
+        """连续2次偏离应升级警告。"""
+        step = PlanStep(
+            step_id=1, description="Modify main.py", action="modify",
+            target_file="main.py",
+        )
+        plan = [step]
+        state = AgentState(
+            user_request="Modify main.py",
+            project_root="/test/project",
+            plan=plan,
+            current_step_index=0,
+            original_goal_summary="Modify main.py",
+        )
+        # LLM 两次都写 wrong.py（连续偏离）
+        responses = [
+            MockLLMResponse(choices=[MockChoice(
+                message=MockChoiceMessage(
+                    content="Writing",
+                    tool_calls=[MockToolCall(
+                        id="call_1",
+                        function=MockToolCall.Function(
+                            name="write_file",
+                            arguments='{"file_path": "wrong.py", "content": "x=1", "mode": "create"}',
+                        ),
+                    )],
+                )
+            )]),
+            MockLLMResponse(choices=[MockChoice(
+                message=MockChoiceMessage(
+                    content="Still writing wrong",
+                    tool_calls=[MockToolCall(
+                        id="call_2",
+                        function=MockToolCall.Function(
+                            name="write_file",
+                            arguments='{"file_path": "wrong.py", "content": "y=2", "mode": "create"}',
+                        ),
+                    )],
+                )
+            )]),
+            MockLLMResponse(choices=[MockChoice(
+                message=MockChoiceMessage(content="Corrected")
+            )]),
+        ]
+        llm = AsyncMock(side_effect=responses)
+        gateway = make_gateway(tool_results=[
+            ToolResult(success=True, data={}),
+            ToolResult(success=True, data={}),
+        ])
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=gateway,
+            validation_gateway=make_validation_gateway(),
+        )
+        result = await node(state)
+        deviations = [e for e in result["execution_log"] if e["type"] == "deviation_detected"]
+        assert len(deviations) == 2
+        # deviation_count 应递增
+        assert deviations[0]["deviation_count"] == 1
+        assert deviations[1]["deviation_count"] == 2
+
+    async def test_three_deviations_triggers_human_review(self) -> None:
+        """连续3次偏离应触发 Human Review。"""
+        step = PlanStep(
+            step_id=1, description="Modify main.py", action="modify",
+            target_file="main.py",
+        )
+        plan = [step]
+        state = AgentState(
+            user_request="Modify main.py",
+            project_root="/test/project",
+            plan=plan,
+            current_step_index=0,
+            original_goal_summary="Modify main.py",
+        )
+        # LLM 三次都写 wrong.py（连续偏离 → Human Review）
+        responses = [
+            MockLLMResponse(choices=[MockChoice(
+                message=MockChoiceMessage(
+                    content="Writing 1",
+                    tool_calls=[MockToolCall(
+                        id="call_1",
+                        function=MockToolCall.Function(
+                            name="write_file",
+                            arguments='{"file_path": "wrong.py", "content": "a", "mode": "create"}',
+                        ),
+                    )],
+                )
+            )]),
+            MockLLMResponse(choices=[MockChoice(
+                message=MockChoiceMessage(
+                    content="Writing 2",
+                    tool_calls=[MockToolCall(
+                        id="call_2",
+                        function=MockToolCall.Function(
+                            name="write_file",
+                            arguments='{"file_path": "wrong.py", "content": "b", "mode": "create"}',
+                        ),
+                    )],
+                )
+            )]),
+            MockLLMResponse(choices=[MockChoice(
+                message=MockChoiceMessage(
+                    content="Writing 3",
+                    tool_calls=[MockToolCall(
+                        id="call_3",
+                        function=MockToolCall.Function(
+                            name="write_file",
+                            arguments='{"file_path": "wrong.py", "content": "c", "mode": "create"}',
+                        ),
+                    )],
+                )
+            )]),
+        ]
+        llm = AsyncMock(side_effect=responses)
+        gateway = make_gateway(tool_results=[
+            ToolResult(success=True, data={}),
+            ToolResult(success=True, data={}),
+            ToolResult(success=True, data={}),
+        ])
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=gateway,
+            validation_gateway=make_validation_gateway(),
+        )
+        result = await node(state)
+        # 应设置 human_review_required
+        assert result["human_review_required"] is True
+        # 应包含 human_review_required 日志
+        hr_events = [e for e in result["execution_log"] if e["type"] == "human_review_required"]
+        assert len(hr_events) >= 1
+        # review_request 应包含详细信息
+        assert result["review_request"] is not None
+        assert result["review_request"]["review_type"] == "deviation_detected"
+        assert result["review_request"]["details"]["consecutive_deviations"] == 3
+
+
+# ── Phase 3.5: TaskFocus — Goal Summary ────────────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestGoalSummary:
+    """目标摘要测试。"""
+
+    async def test_goal_summary_injected_in_prompt(self) -> None:
+        """original_goal_summary 应注入到步骤提示词中。"""
+        plan = [PlanStep(step_id=1, description="Step 1", action="read",
+                         target_file="f.py")]
+        state = AgentState(
+            user_request="test",
+            project_root="/root",
+            plan=plan,
+            original_goal_summary="Create a Flask app with login",
+        )
+        llm = AsyncMock(return_value=MockLLMResponse(choices=[MockChoice(
+            message=MockChoiceMessage(content="Done")
+        )]))
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=make_gateway(),
+            validation_gateway=make_validation_gateway(),
+        )
+        await node(state)
+        # LLM 的 system prompt 应包含 goal summary
+        call_kwargs = llm.call_args[1]
+        system_msg = call_kwargs["messages"][0]["content"]
+        assert "Create a Flask app with login" in system_msg
+        assert "原始目标" in system_msg
+
+    async def test_empty_goal_summary_omits_section(self) -> None:
+        """空的目标摘要不应添加 TaskFocus 节。"""
+        plan = [PlanStep(step_id=1, description="Read", action="read",
+                         target_file="f.py")]
+        state = AgentState(
+            user_request="test",
+            project_root="/root",
+            plan=plan,
+            original_goal_summary="",
+        )
+        llm = AsyncMock(return_value=MockLLMResponse(choices=[MockChoice(
+            message=MockChoiceMessage(content="Done")
+        )]))
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=make_gateway(),
+            validation_gateway=make_validation_gateway(),
+        )
+        await node(state)
+        call_kwargs = llm.call_args[1]
+        system_msg = call_kwargs["messages"][0]["content"]
+        # 不应包含 TaskFocus 相关节
+        assert "原始目标" not in system_msg
+
+    async def test_completed_steps_injected_in_prompt(self) -> None:
+        """已完成步骤摘要应注入到提示词。"""
+        plan = [
+            PlanStep(step_id=1, description="Read config", action="read",
+                     target_file="config.py"),
+            PlanStep(step_id=2, description="Write app", action="create",
+                     target_file="app.py"),
+        ]
+        state = AgentState(
+            user_request="test",
+            project_root="/root",
+            plan=plan,
+            current_step_index=1,  # 第1步已完成
+            original_goal_summary="Build app",
+            completed_steps_summary="Read config",
+        )
+        llm = AsyncMock(return_value=MockLLMResponse(choices=[MockChoice(
+            message=MockChoiceMessage(content="Done")
+        )]))
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=make_gateway(),
+            validation_gateway=make_validation_gateway(),
+        )
+        await node(state)
+        call_kwargs = llm.call_args[1]
+        system_msg = call_kwargs["messages"][0]["content"]
+        assert "Read config" in system_msg
+
+
+# ── Phase 3.5: TaskFocus — Progress Tracking ───────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestProgressTracking:
+    """进度追踪测试。"""
+
+    async def test_tracks_completed_steps_summary(self) -> None:
+        """执行完步骤应更新 completed_steps_summary。"""
+        plan = [
+            PlanStep(step_id=1, description="Read main.py", action="read",
+                     target_file="main.py"),
+            PlanStep(step_id=2, description="Create app.py", action="create",
+                     target_file="app.py"),
+        ]
+        state = AgentState(
+            user_request="test",
+            project_root="/root",
+            plan=plan,
+        )
+        llm = AsyncMock(return_value=MockLLMResponse(choices=[MockChoice(
+            message=MockChoiceMessage(content="Done")
+        )]))
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=make_gateway(),
+            validation_gateway=make_validation_gateway(),
+        )
+        result = await node(state)
+        assert "completed_steps_summary" in result
+        # 两步的描述应以分号分隔
+        assert "Read main.py" in result["completed_steps_summary"]
+        assert "Create app.py" in result["completed_steps_summary"]
+
+    async def test_tracks_tasks_remaining(self) -> None:
+        """应正确计算剩余步骤。"""
+        plan = [
+            PlanStep(step_id=1, description="Read", action="read",
+                     target_file="a.py"),
+            PlanStep(step_id=2, description="Modify", action="modify",
+                     target_file="b.py"),
+            PlanStep(step_id=3, description="Delete", action="delete",
+                     target_file="c.py"),
+        ]
+        state = AgentState(
+            user_request="test",
+            project_root="/root",
+            plan=plan,
+            current_step_index=1,  # 从第2步开始
+        )
+        llm = AsyncMock(return_value=MockLLMResponse(choices=[MockChoice(
+            message=MockChoiceMessage(content="Done")
+        )]))
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=make_gateway(),
+            validation_gateway=make_validation_gateway(),
+        )
+        result = await node(state)
+        assert "tasks_remaining" in result
+        assert len(result["tasks_remaining"]) == 0  # 所有步骤都执行完了
+
+    async def test_full_cycle_updates_progress(self) -> None:
+        """完整执行周期应正确更新所有进度指标。"""
+        plan = [
+            PlanStep(step_id=1, description="First step", action="read",
+                     target_file="f1.py"),
+            PlanStep(step_id=2, description="Second step", action="read",
+                     target_file="f2.py"),
+        ]
+        state = AgentState(
+            user_request="test",
+            project_root="/root",
+            plan=plan,
+        )
+        # 每个步骤 LLM 返回不同内容
+        step1_resp = MockLLMResponse(choices=[MockChoice(
+            message=MockChoiceMessage(content="Step 1 done")
+        )])
+        step2_resp = MockLLMResponse(choices=[MockChoice(
+            message=MockChoiceMessage(content="Step 2 done")
+        )])
+        llm = AsyncMock(side_effect=[step1_resp, step2_resp])
+
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=make_gateway(),
+            validation_gateway=make_validation_gateway(),
+        )
+        result = await node(state)
+        # current_step_index 应为 2
+        assert result["current_step_index"] == 2
+        # completed_steps_summary 包含两个步骤
+        assert "First step" in result["completed_steps_summary"]
+        assert "Second step" in result["completed_steps_summary"]
+        # tasks_remaining 应为空（所有步骤完成）
+        assert len(result["tasks_remaining"]) == 0

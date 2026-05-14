@@ -14,6 +14,7 @@ from codeagent.gateway.validation_gateway import IValidationGateway
 from codeagent.orchestration.graph import build_workflow
 from codeagent.orchestration.nodes.context_node import ContextNode
 from codeagent.orchestration.nodes.execution_node import ExecutionNode
+from codeagent.orchestration.nodes.human_review_node import HumanReviewNode
 from codeagent.orchestration.nodes.planning_node import PlanningNode
 from codeagent.orchestration.nodes.validation_node import ValidationNode
 from codeagent.orchestration.state import AgentState
@@ -60,6 +61,7 @@ class Orchestrator:
             progress_callback=progress_callback,
         )
         self._validation_node = ValidationNode(validation_gateway)
+        self._human_review_node = HumanReviewNode()
 
         # 组装并编译图
         self._graph = build_workflow(
@@ -67,6 +69,7 @@ class Orchestrator:
             planning_node=self._planning_node,
             execution_node=self._execution_node,
             validation_node=self._validation_node,
+            human_review_node=self._human_review_node,
         )
 
         # 运行配置追踪
