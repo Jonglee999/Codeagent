@@ -1495,3 +1495,469 @@ class TestProgressTracking:
         assert "Second step" in result["completed_steps_summary"]
         # tasks_remaining 应为空（所有步骤完成）
         assert len(result["tasks_remaining"]) == 0
+
+
+# ── Phase 4.A.5: Repair Mode ───────────────────────────────────────────────
+
+
+class _MockValidationResult:
+    """模拟 ValidationResult（避免导入问题）。"""
+    def __init__(self, passed: bool = True,
+                 file_path: str = "test.py",
+                 line: int = 1,
+                 message: str = "test error") -> None:
+        self.passed = passed
+        self.errors: list[Any] = []
+        self.warnings: list[Any] = []
+        self.duration_ms: float = 0.0
+        if not passed:
+            self.errors = [type("Err", (), {
+                "file_path": file_path, "line": line,
+                "message": message, "severity": "error",
+                "code": "E001",
+            })()]
+
+
+@pytest.mark.asyncio
+class TestRepairModeEntry:
+    """修复模式入口检测测试。"""
+
+    async def test_no_validation_results_no_repair(self) -> None:
+        """无验证结果时不应进入修复模式。"""
+        state = AgentState(
+            user_request="test", project_root="/root",
+        )
+        llm = AsyncMock(return_value=MockLLMResponse(choices=[MockChoice(
+            message=MockChoiceMessage(content="Direct mode")
+        )]))
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=make_gateway(),
+            validation_gateway=make_validation_gateway(),
+        )
+        result = await node(state)
+        # 应走直连模式
+        assert "execution_log" in result
+        repair_entries = [e for e in result["execution_log"] if e["type"] == "repair_mode"]
+        assert len(repair_entries) == 0
+
+    async def test_all_passed_no_repair(self) -> None:
+        """所有验证通过时不应进入修复模式。"""
+        state = AgentState(
+            user_request="test", project_root="/root",
+            validation_results=[_MockValidationResult(passed=True)],  # type: ignore[arg-type]
+            plan=[PlanStep(step_id=1, description="Done", action="read", target_file="f.py")],
+            current_step_index=1,
+        )
+        llm = AsyncMock(return_value=MockLLMResponse(choices=[MockChoice(
+            message=MockChoiceMessage(content="Direct mode")
+        )]))
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=make_gateway(),
+            validation_gateway=make_validation_gateway(),
+        )
+        result = await node(state)
+        repair_entries = [e for e in result["execution_log"] if e["type"] == "repair_mode"]
+        assert len(repair_entries) == 0
+
+    async def test_failure_with_pending_plan_no_repair(self) -> None:
+        """验证失败但有未完成的计划步骤时不应进入修复模式。"""
+        state = AgentState(
+            user_request="test", project_root="/root",
+            validation_results=[_MockValidationResult(passed=False)],  # type: ignore[arg-type]
+            plan=[PlanStep(step_id=1, description="Do something", action="read", target_file="f.py")],
+            current_step_index=0,  # 还有未执行的步骤
+        )
+        llm = AsyncMock(return_value=MockLLMResponse(choices=[MockChoice(
+            message=MockChoiceMessage(content="Execute plan")
+        )]))
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=make_gateway(),
+            validation_gateway=make_validation_gateway(),
+        )
+        result = await node(state)
+        # 应走 plan-aware 模式而非修复模式
+        repair_entries = [e for e in result["execution_log"] if e["type"] == "repair_mode"]
+        assert len(repair_entries) == 0
+
+    async def test_failure_triggers_repair_mode(self) -> None:
+        """验证失败且计划完成时应进入修复模式。"""
+        state = AgentState(
+            user_request="test", project_root="/root",
+            validation_results=[_MockValidationResult(passed=False)],  # type: ignore[arg-type]
+            plan=[PlanStep(step_id=1, description="Done", action="read", target_file="f.py")],
+            current_step_index=1,  # 所有步骤已完成
+        )
+        # LLM 在修复模式下直接返回文本（无工具调用）
+        llm = AsyncMock(return_value=MockLLMResponse(choices=[MockChoice(
+            message=MockChoiceMessage(content="I see the error, let me fix it")
+        )]))
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=make_gateway(),
+            validation_gateway=make_validation_gateway(),
+        )
+        result = await node(state)
+        # 应包含修复模式日志
+        repair_entries = [e for e in result["execution_log"] if e["type"] == "repair_mode"]
+        assert len(repair_entries) == 1
+        assert repair_entries[0]["retry_count"] == 1  # retry_count 应递增
+
+    async def test_repair_mode_no_plan_fallback(self) -> None:
+        """无计划时验证失败也应进入修复模式。"""
+        state = AgentState(
+            user_request="test", project_root="/root",
+            validation_results=[_MockValidationResult(passed=False)],  # type: ignore[arg-type]
+        )
+        llm = AsyncMock(return_value=MockLLMResponse(choices=[MockChoice(
+            message=MockChoiceMessage(content="Repairing")
+        )]))
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=make_gateway(),
+            validation_gateway=make_validation_gateway(),
+        )
+        result = await node(state)
+        repair_entries = [e for e in result["execution_log"] if e["type"] == "repair_mode"]
+        assert len(repair_entries) == 1
+
+
+@pytest.mark.asyncio
+class TestRepairModeExecution:
+    """修复模式执行流程测试。"""
+
+    async def test_repair_success_with_tool_calls(self) -> None:
+        """修复模式中 LLM 调用工具成功修复。"""
+        state = AgentState(
+            user_request="test", project_root="/root",
+            validation_results=[_MockValidationResult(passed=False)],  # type: ignore[arg-type]
+        )
+        # LLM 先调用 write_file 修复，然后返回完成
+        responses = [
+            MockLLMResponse(choices=[MockChoice(
+                message=MockChoiceMessage(
+                    content="Fixing error",
+                    tool_calls=[MockToolCall(
+                        id="call_repair",
+                        function=MockToolCall.Function(
+                            name="write_file",
+                            arguments='{"file_path": "fix.py", "content": "x=1", "mode": "modify"}',
+                        ),
+                    )],
+                )
+            )]),
+            MockLLMResponse(choices=[MockChoice(
+                message=MockChoiceMessage(content="Fixed!")
+            )]),
+        ]
+        llm = AsyncMock(side_effect=responses)
+        gateway = make_gateway(tool_results=[
+            ToolResult(success=True, data={"file_path": "fix.py", "lines_added": 1}),
+        ])
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=gateway,
+            validation_gateway=make_validation_gateway(),
+        )
+        result = await node(state)
+
+        # 有修复模式日志
+        assert len(result["execution_log"]) >= 2
+        repair_entries = [e for e in result["execution_log"] if e["type"] == "repair_mode"]
+        assert len(repair_entries) == 1
+        assert result["retry_count"] == 1
+
+        # 工具调用包含 repair_mode=True 标记
+        tool_entries = [e for e in result["execution_log"]
+                        if e.get("type") == "tool_call" and e.get("repair_mode")]
+        assert len(tool_entries) >= 1
+
+    async def test_repair_accumulates_changes(self) -> None:
+        """修复模式中的 write_file 应记录到 accumulated_changes。"""
+        state = AgentState(
+            user_request="test", project_root="/root",
+            validation_results=[_MockValidationResult(passed=False)],  # type: ignore[arg-type]
+        )
+        responses = [
+            MockLLMResponse(choices=[MockChoice(
+                message=MockChoiceMessage(
+                    content="Fixing",
+                    tool_calls=[MockToolCall(
+                        id="call_fix",
+                        function=MockToolCall.Function(
+                            name="write_file",
+                            arguments='{"file_path": "bug.py", "content": "fixed", "mode": "modify"}',
+                        ),
+                    )],
+                )
+            )]),
+            MockLLMResponse(choices=[MockChoice(
+                message=MockChoiceMessage(content="Fixed!")
+            )]),
+        ]
+        llm = AsyncMock(side_effect=responses)
+        gateway = make_gateway(tool_results=[
+            ToolResult(success=True, data={"file_path": "bug.py", "lines_added": 1}),
+        ])
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=gateway,
+            validation_gateway=make_validation_gateway(),
+        )
+        result = await node(state)
+        assert result["retry_count"] == 1
+        changes = result["accumulated_changes"]
+        assert len(changes) >= 1
+        # repair mode 的 change 应有 repair_mode=True 标记
+        repair_changes = [c for c in changes if c.get("repair_mode")]
+        assert len(repair_changes) >= 1
+        assert repair_changes[0]["file_path"] == "bug.py"
+
+    async def test_repair_llm_failure(self) -> None:
+        """修复模式中 LLM 失败应记录错误。"""
+        state = AgentState(
+            user_request="test", project_root="/root",
+            validation_results=[_MockValidationResult(passed=False)],  # type: ignore[arg-type]
+        )
+        llm = AsyncMock(side_effect=RuntimeError("LLM unavailable in repair"))
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=make_gateway(),
+            validation_gateway=make_validation_gateway(),
+        )
+        result = await node(state)
+        assert len(result["errors"]) >= 1
+        assert "Repair LLM call failed" in result["errors"][0]
+        repair_entries = [e for e in result["execution_log"] if e["type"] == "repair_mode"]
+        assert len(repair_entries) == 1  # 进入修复模式的日志仍在
+
+    async def test_repair_preserves_existing_errors(self) -> None:
+        """修复模式应保留已有的 errors。"""
+        state = AgentState(
+            user_request="test", project_root="/root",
+            validation_results=[_MockValidationResult(passed=False)],  # type: ignore[arg-type]
+            errors=["Previous error"],
+        )
+        llm = AsyncMock(return_value=MockLLMResponse(choices=[MockChoice(
+            message=MockChoiceMessage(content="Repairing...")
+        )]))
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=make_gateway(),
+            validation_gateway=make_validation_gateway(),
+        )
+        result = await node(state)
+        assert "Previous error" in result["errors"]
+
+
+@pytest.mark.asyncio
+class TestRetryCounting:
+    """重试计数测试。"""
+
+    async def test_first_repair_increments_retry_to_1(self) -> None:
+        """首次修复后 retry_count 应为 1。"""
+        state = AgentState(
+            user_request="test", project_root="/root",
+            validation_results=[_MockValidationResult(passed=False)],  # type: ignore[arg-type]
+            retry_count=0,
+        )
+        llm = AsyncMock(return_value=MockLLMResponse(choices=[MockChoice(
+            message=MockChoiceMessage(content="Repairing")
+        )]))
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=make_gateway(),
+            validation_gateway=make_validation_gateway(),
+        )
+        result = await node(state)
+        assert result["retry_count"] == 1
+
+    async def test_second_repair_increments_retry_to_2(self) -> None:
+        """第二次修复后 retry_count 应为 2。"""
+        state = AgentState(
+            user_request="test", project_root="/root",
+            validation_results=[_MockValidationResult(passed=False)],  # type: ignore[arg-type]
+            retry_count=1,
+        )
+        llm = AsyncMock(return_value=MockLLMResponse(choices=[MockChoice(
+            message=MockChoiceMessage(content="Repairing again")
+        )]))
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=make_gateway(),
+            validation_gateway=make_validation_gateway(),
+        )
+        result = await node(state)
+        assert result["retry_count"] == 2
+
+    async def test_third_repair_reaches_limit(self) -> None:
+        """第三次修复后 retry_count 应为 3。"""
+        state = AgentState(
+            user_request="test", project_root="/root",
+            validation_results=[_MockValidationResult(passed=False)],  # type: ignore[arg-type]
+            retry_count=2,
+        )
+        llm = AsyncMock(return_value=MockLLMResponse(choices=[MockChoice(
+            message=MockChoiceMessage(content="Repairing third time")
+        )]))
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=make_gateway(),
+            validation_gateway=make_validation_gateway(),
+        )
+        result = await node(state)
+        assert result["retry_count"] == 3
+
+
+@pytest.mark.asyncio
+class TestRepairToolCallLimits:
+    """修复模式工具调用限制测试。"""
+
+    async def test_repair_has_lower_tool_call_limit(self) -> None:
+        """修复模式使用较低的工具调用上限。"""
+        state = AgentState(
+            user_request="test", project_root="/root",
+            validation_results=[_MockValidationResult(passed=False)],  # type: ignore[arg-type]
+        )
+        # 每次 LLM 返回一个 tool_call，直到超限
+        tool_call_resp = MockLLMResponse(choices=[MockChoice(
+            message=MockChoiceMessage(
+                content="Working...",
+                tool_calls=[MockToolCall(
+                    function=MockToolCall.Function(
+                        name="read_file",
+                        arguments='{"file_path": "test.py"}',
+                    )
+                )],
+            )
+        )])
+        llm = AsyncMock(return_value=tool_call_resp)
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=make_gateway(),
+            validation_gateway=make_validation_gateway(),
+        )
+        result = await node(state)
+
+        tool_calls = [e for e in result["execution_log"]
+                      if e.get("type") == "tool_call" and e.get("repair_mode")]
+        # 不应超过 5（_MAX_REPAIR_TOOL_CALLS）
+        assert len(tool_calls) <= 5
+
+    async def test_repair_exceeding_limit_terminates(self) -> None:
+        """超过修复模式工具调用上限应终止。"""
+        state = AgentState(
+            user_request="test", project_root="/root",
+            validation_results=[_MockValidationResult(passed=False)],  # type: ignore[arg-type]
+        )
+        tool_call_resp = MockLLMResponse(choices=[MockChoice(
+            message=MockChoiceMessage(
+                content="Working...",
+                tool_calls=[MockToolCall(
+                    function=MockToolCall.Function(
+                        name="read_file",
+                        arguments='{"file_path": "test.py"}',
+                    )
+                )],
+            )
+        )])
+        llm = AsyncMock(return_value=tool_call_resp)
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=make_gateway(),
+            validation_gateway=make_validation_gateway(),
+        )
+        result = await node(state)
+
+        tool_calls = [e for e in result["execution_log"]
+                      if e.get("type") == "tool_call" and e.get("repair_mode")]
+        assert len(tool_calls) <= 5
+
+
+@pytest.mark.asyncio
+class TestRepairPrompt:
+    """修复提示词测试。"""
+
+    async def test_validation_report_in_prompt(self) -> None:
+        """修复模式的 LLM prompt 应包含验证报告。"""
+        state = AgentState(
+            user_request="test", project_root="/root",
+            validation_results=[_MockValidationResult(passed=False)],  # type: ignore[arg-type]
+        )
+        llm = AsyncMock(return_value=MockLLMResponse(choices=[MockChoice(
+            message=MockChoiceMessage(content="Repairing based on report")
+        )]))
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=make_gateway(),
+            validation_gateway=make_validation_gateway(),
+        )
+        await node(state)
+
+        # 检查传递给 LLM 的 user 消息包含验证报告
+        call_kwargs = llm.call_args[1]
+        messages = call_kwargs.get("messages", [])
+        user_msgs = [m for m in messages if m["role"] == "user"]
+        assert len(user_msgs) >= 1
+        user_content = user_msgs[0]["content"]
+        assert "### Validation Report" in user_content or "验证修复模式" in user_content
+        assert "FAILED" in user_content
+
+    async def test_fix_suggestions_in_prompt(self) -> None:
+        """修复模式的 LLM prompt 应包含修复建议。"""
+        state = AgentState(
+            user_request="test", project_root="/root",
+            validation_results=[_MockValidationResult(passed=False)],  # type: ignore[arg-type]
+            execution_log=[{
+                "type": "validation_report",
+                "report": "### Fix Suggestions\n1. Test error found",
+                "fix_suggestion_count": 1,
+                "timestamp": 1000.0,
+            }],
+        )
+        llm = AsyncMock(return_value=MockLLMResponse(choices=[MockChoice(
+            message=MockChoiceMessage(content="Repairing")
+        )]))
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=make_gateway(),
+            validation_gateway=make_validation_gateway(),
+        )
+        await node(state)
+
+        call_kwargs = llm.call_args[1]
+        messages = call_kwargs.get("messages", [])
+        user_msgs = [m for m in messages if m["role"] == "user"]
+        assert len(user_msgs) >= 1
+        user_content = user_msgs[0]["content"]
+        # 应包含修复建议信息
+        assert "fix suggestion" in user_content.lower()
+
+    async def test_repair_prompt_includes_error_details(self) -> None:
+        """修复提示词应包含具体错误细节。"""
+        state = AgentState(
+            user_request="test", project_root="/root",
+            validation_results=[_MockValidationResult(
+                passed=False, file_path="buggy.py",
+                line=42, message="SyntaxError: invalid syntax",
+            )],  # type: ignore[arg-type]
+        )
+        llm = AsyncMock(return_value=MockLLMResponse(choices=[MockChoice(
+            message=MockChoiceMessage(content="Fixing syntax")
+        )]))
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=make_gateway(),
+            validation_gateway=make_validation_gateway(),
+        )
+        await node(state)
+
+        call_kwargs = llm.call_args[1]
+        messages = call_kwargs.get("messages", [])
+        user_msgs = [m for m in messages if m["role"] == "user"]
+        assert len(user_msgs) >= 1
+        user_content = user_msgs[0]["content"]
+        assert "buggy.py" in user_content or "SyntaxError" in user_content
+        assert "invalid syntax" in user_content

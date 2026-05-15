@@ -16,6 +16,10 @@ AfterExecution = Literal["validation", "execution", "end", "human_review"]
 AfterValidation = Literal["execution", "planning", "human_review", "end"]
 AfterHumanReview = Literal["execution", "planning", "end"]
 
+# 验证修复循环常量
+_MAX_VALIDATION_RETRIES = 3          # 单轮最大重试次数
+_MAX_CONSECUTIVE_FAILURES = 9        # 连续验证失败上限（3 轮 × 3 次）
+
 
 def route_after_planning(state: AgentState) -> AfterPlanning:
     """规划完成后的路由。
@@ -99,9 +103,10 @@ def route_after_validation(state: AgentState) -> AfterValidation:
 
     路由逻辑：
     - 全部验证通过 → "end"
-    - 验证失败且 retry_count < 3 → "execution"（重试）
-    - 验证失败且 retry_count >= 3 → "planning"（重新规划）
-    - 连续失败且非 auto_mode → "human_review"
+    - 验证失败且 retry_count < MAX_RETRIES → "execution"（修复模式）
+    - 验证失败且 retry_count >= MAX_CONSECUTIVE_FAILURES → "human_review"（连续失败过多）
+    - 验证失败且 retry_count >= MAX_RETRIES → "planning"（需要重新规划）
+    - 非自动模式且重试耗尽 → "human_review"
 
     Args:
         state: 当前 Agent 状态
@@ -110,19 +115,21 @@ def route_after_validation(state: AgentState) -> AfterValidation:
         下一节点名称
     """
     if not state.validation_results:
-        # 无验证结果 → 默认通过
         return "end"
 
     all_passed = all(r.passed for r in state.validation_results)
-
     if all_passed:
         return "end"
 
-    # 验证失败，检查重试次数
-    if state.retry_count < 3:
+    # ── Phase 4.A.5 增强：修复循环路由 ─────────────────────────
+    if state.retry_count < _MAX_VALIDATION_RETRIES:
         return "execution"
 
-    # 重试已耗尽，需要重新规划
+    # 超过连续失败上限（3 轮共 9 次）→ 人工审核
+    if state.retry_count >= _MAX_CONSECUTIVE_FAILURES:
+        return "human_review"
+
+    # 重试耗尽，需要重新规划
     if not state.auto_mode:
         return "human_review"
 

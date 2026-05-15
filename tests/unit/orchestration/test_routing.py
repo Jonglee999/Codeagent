@@ -283,6 +283,49 @@ class TestRouteAfterValidation:
         )
         assert route_after_validation(state) == "planning"
 
+    def test_retry_count_9_triggers_human_review_even_in_auto(self) -> None:
+        """retry_count >= 9 时即使 auto_mode 也应转到 human_review。"""
+        state = AgentState(
+            user_request="test", project_root="/root",
+            validation_results=[ValidationResult(passed=False)],
+            retry_count=9,
+            auto_mode=True,
+        )
+        assert route_after_validation(state) == "human_review"
+
+    def test_retry_count_9_triggers_human_review_non_auto(self) -> None:
+        """retry_count >= 9 时非 auto_mode 也应转到 human_review。"""
+        state = AgentState(
+            user_request="test", project_root="/root",
+            validation_results=[ValidationResult(passed=False)],
+            retry_count=9,
+            auto_mode=False,
+        )
+        assert route_after_validation(state) == "human_review"
+
+    def test_retry_count_above_9_triggers_human_review(self) -> None:
+        """retry_count > 9 时也应转到 human_review。"""
+        state = AgentState(
+            user_request="test", project_root="/root",
+            validation_results=[ValidationResult(passed=False)],
+            retry_count=10,
+            auto_mode=True,
+        )
+        assert route_after_validation(state) == "human_review"
+
+    def test_retry_count_3_to_8_auto_goes_planning(self) -> None:
+        """retry_count 在 3-8 之间且 auto_mode 时转到 planning。"""
+        for rc in [3, 4, 5, 6, 7, 8]:
+            state = AgentState(
+                user_request="test", project_root="/root",
+                validation_results=[ValidationResult(passed=False)],
+                retry_count=rc,
+                auto_mode=True,
+            )
+            assert route_after_validation(state) == "planning", (
+                f"retry_count={rc} should route to planning"
+            )
+
     def test_multiple_results_all_passed(self) -> None:
         state = AgentState(
             user_request="test", project_root="/root",

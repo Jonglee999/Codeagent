@@ -24,10 +24,8 @@ import click
 
 from codeagent.config import load_env_file, get_env
 from codeagent.gateway.tool_gateway import IToolGateway
-from codeagent.gateway.validation_gateway import (
-    IValidationGateway,
-    ValidationResult,
-)
+from codeagent.gateway.validation_gateway_impl import ValidationGateway
+
 from codeagent.interaction.cli.formatters import (
     console,
     format_error_report,
@@ -49,44 +47,21 @@ from codeagent.tools.file.write_file import WriteFileTool
 from codeagent.tools.gateway import ToolGateway
 from codeagent.tools.registry import ToolRegistry
 from codeagent.tools.terminal.run_terminal import RunTerminalTool
-from codeagent.validation.syntax_validator import SyntaxValidator
 
 logger = logging.getLogger(__name__)
 
 # ── IValidationGateway 适配器 ─────────────────────────────────────────────
 
 
-class _ValidationGateway(IValidationGateway):
-    """将 SyntaxValidator 适配为 IValidationGateway 接口。"""
+class _ValidationGateway(ValidationGateway):
+    """将 ValidationGateway 适配为 CLI 使用的网关接口。
 
-    def __init__(self, validator: SyntaxValidator) -> None:
-        self._validator = validator
+    Phase 4 升级：使用 SyntaxValidator + StaticAnalyzer + RuntimeValidator
+    的三层完整验证实现。
+    """
 
-    async def run_syntax_check(self, file_path: str) -> ValidationResult:
-        return await self._validator.check_file(file_path)
-
-    async def run_lint(self, files: list[str]) -> ValidationResult:
-        # Phase 1a: lint 简化为语法检查
-        results = await self._validator.check_files(files)
-        passed = all(r.passed for r in results)
-        all_errors: list = []
-        all_warnings: list = []
-        for r in results:
-            all_errors.extend(r.errors)
-            all_warnings.extend(r.warnings)
-        return ValidationResult(
-            passed=passed,
-            errors=all_errors,
-            warnings=all_warnings,
-        )
-
-    async def run_tests(self, project_root: str) -> ValidationResult:
-        # Phase 1a: 不支持
-        return ValidationResult(passed=True)
-
-    async def run_runtime_check(self, file_path: str) -> ValidationResult:
-        # Phase 1a: 不支持
-        return ValidationResult(passed=True)
+    def __init__(self) -> None:
+        super().__init__()
 
 
 # ── 环境变量与 .env 加载 ────────────────────────────────────────────────────
@@ -156,10 +131,9 @@ def _build_tool_gateway(project_root: str) -> ToolGateway:
     return ToolGateway(registry)
 
 
-def _build_validation_gateway() -> _ValidationGateway:
+def _build_validation_gateway(project_root: str = "") -> _ValidationGateway:
     """构建验证 Gateway。"""
-    validator = SyntaxValidator()
-    return _ValidationGateway(validator)
+    return _ValidationGateway()
 
 
 # ── click 命令 ──────────────────────────────────────────────────────────────
@@ -259,7 +233,7 @@ def ask(
         raise click.ClickException(f"Failed to build tool gateway: {e}")
 
     try:
-        validation_gateway = _build_validation_gateway()
+        validation_gateway = _build_validation_gateway(project_root)
     except Exception as e:
         raise click.ClickException(f"Failed to build validation gateway: {e}")
 

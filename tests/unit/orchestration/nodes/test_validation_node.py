@@ -9,7 +9,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -20,6 +20,9 @@ from codeagent.gateway.validation_gateway import (
 )
 from codeagent.orchestration.nodes.validation_node import ValidationNode
 from codeagent.orchestration.state import AgentState
+from codeagent.validation.error_analyzer import ErrorAnalyzer, FixSuggestion
+from codeagent.validation.runtime_validator import RuntimeValidator
+from codeagent.validation.static_analyzer import StaticAnalyzer
 
 
 @pytest.fixture
@@ -239,6 +242,356 @@ class TestValidationNodeEdgeCases:
         assert len(result["execution_log"]) == 2
         assert result["execution_log"][0]["type"] == "previous_entry"
         assert result["execution_log"][1]["type"] == "validation_report"
+
+
+class TestStaticAnalyzerIntegration:
+    """StaticAnalyzer 集成测试 — Layer 2 增强。"""
+
+    async def test_full_static_analysis_executed(
+        self, mock_gateway: AsyncMock
+    ) -> None:
+        """StaticAnalyzer.run_all() 被调用，结果正确聚合。"""
+        mock_sa = AsyncMock(spec=StaticAnalyzer)
+        mock_sa.run_all.return_value = [
+            ValidationResult(passed=True),
+            ValidationResult(passed=True),
+            ValidationResult(passed=True),
+        ]
+        node = ValidationNode(mock_gateway, static_analyzer=mock_sa)
+        state = make_state(accumulated_changes=[{"file_path": "main.py"}])
+        result = await node(state)
+
+        assert len(result["validation_results"]) == 3
+        assert all(r.passed for r in result["validation_results"])
+        mock_sa.run_all.assert_awaited_once_with(["main.py"])
+        # gateway.run_lint 不应再被调用
+        mock_gateway.run_lint.assert_not_called()
+
+    async def test_static_analysis_aggregates_errors(
+        self, mock_gateway: AsyncMock
+    ) -> None:
+        """多个子分析的错误聚合为一个 ValidationResult。"""
+        mock_sa = AsyncMock(spec=StaticAnalyzer)
+        mock_sa.run_all.return_value = [
+            ValidationResult(passed=True),  # lint 通过
+            ValidationResult(                # typecheck 失败
+                passed=False,
+                errors=[ValidationError(file_path="main.py", line=5, message="Incompatible types", code="MYPY_ERROR")],
+            ),
+            ValidationResult(                # security 失败
+                passed=False,
+                errors=[ValidationError(file_path="main.py", line=10, message="eval detected", code="SEC_EVAL")],
+            ),
+        ]
+        node = ValidationNode(mock_gateway, static_analyzer=mock_sa)
+        state = make_state(accumulated_changes=[{"file_path": "main.py"}])
+        result = await node(state)
+
+        assert not result["validation_results"][1].passed  # layer 2
+        assert len(result["validation_results"][1].errors) == 2
+        assert any("Incompatible" in e.message for e in result["validation_results"][1].errors)
+        assert any("eval" in e.message for e in result["validation_results"][1].errors)
+
+    async def test_static_analysis_breakdown_in_report(
+        self, mock_gateway: AsyncMock
+    ) -> None:
+        """报告中包含子分析 breakdown warning。"""
+        mock_sa = AsyncMock(spec=StaticAnalyzer)
+        mock_sa.run_all.return_value = [
+            ValidationResult(passed=True),
+            ValidationResult(passed=False, errors=[ValidationError(file_path="x.py", message="Type error", code="MYPY")]),
+            ValidationResult(
+                passed=False,
+                errors=[ValidationError(file_path="x.py", message="Security issue", code="SEC")],
+            ),
+        ]
+        node = ValidationNode(mock_gateway, static_analyzer=mock_sa)
+        state = make_state(accumulated_changes=[{"file_path": "main.py"}])
+        result = await node(state)
+        report = result["execution_log"][-1]["report"]
+
+        assert "Static Analysis: ❌ FAILED" in report
+        assert "Type error" in report
+        assert "Security issue" in report
+        assert "warning(s)" in report  # breakdown warning
+
+    async def test_static_analysis_fallback_to_gateway(
+        self, node: ValidationNode, mock_gateway: AsyncMock
+    ) -> None:
+        """无 StaticAnalyzer 时回退到 gateway.run_lint()。"""
+        state = make_state(accumulated_changes=[{"file_path": "main.py"}])
+        result = await node(state)
+
+        assert result["validation_results"][1].passed
+        mock_gateway.run_lint.assert_awaited_once()
+
+
+class TestRuntimeValidatorIntegration:
+    """RuntimeValidator 集成测试 — Layer 3 增强。"""
+
+    async def test_runtime_tests_executed(
+        self, mock_gateway: AsyncMock
+    ) -> None:
+        """RuntimeValidator.run_tests() 被调用。"""
+        mock_rv = AsyncMock(spec=RuntimeValidator)
+        mock_rv.run_tests.return_value = ValidationResult(passed=True)
+        mock_rv.last_test_output = None
+
+        node = ValidationNode(mock_gateway, runtime_validator=mock_rv)
+        state = make_state(accumulated_changes=[{"file_path": "main.py"}])
+        result = await node(state)
+
+        assert result["validation_results"][2].passed
+        mock_rv.run_tests.assert_awaited_once()
+        # gateway.run_runtime_check 不应被调用
+        mock_gateway.run_runtime_check.assert_not_called()
+
+    async def test_runtime_fallback_when_no_framework(
+        self, mock_gateway: AsyncMock
+    ) -> None:
+        """无测试框架时使用降级检查。"""
+        mock_rv = AsyncMock(spec=RuntimeValidator)
+        mock_rv.run_tests.return_value = ValidationResult(
+            passed=True,
+            warnings=[
+                ValidationError(
+                    file_path="", message="No test framework detected", code="NO_TEST_FRAMEWORK", severity="warning",
+                )
+            ],
+        )
+        mock_rv.run_fallback_check.return_value = ValidationResult(passed=True)
+        mock_rv.last_test_output = None
+
+        node = ValidationNode(mock_gateway, runtime_validator=mock_rv)
+        state = make_state(accumulated_changes=[{"file_path": "main.py"}])
+        result = await node(state)
+
+        assert result["validation_results"][2].passed
+        mock_rv.run_fallback_check.assert_awaited_once_with(["main.py"])
+
+    async def test_runtime_tests_failure(
+        self, mock_gateway: AsyncMock
+    ) -> None:
+        """测试失败时结果正确传播。"""
+        mock_rv = AsyncMock(spec=RuntimeValidator)
+        mock_rv.run_tests.return_value = ValidationResult(
+            passed=False,
+            errors=[ValidationError(file_path="test_main.py", message="AssertionError: assert 1 == 2", code="AssertionError")],
+        )
+        mock_rv.last_test_output = "FAILED test_main.py::test_fail - AssertionError: assert 1 == 2"
+
+        node = ValidationNode(mock_gateway, runtime_validator=mock_rv)
+        state = make_state(accumulated_changes=[{"file_path": "main.py"}])
+        result = await node(state)
+
+        assert not result["validation_results"][2].passed
+        assert any("AssertionError" in e.message for e in result["validation_results"][2].errors)
+        # 不应有降级检查
+        mock_rv.run_fallback_check.assert_not_called()
+
+    async def test_runtime_fallback_to_gateway(
+        self, node: ValidationNode, mock_gateway: AsyncMock
+    ) -> None:
+        """无 RuntimeValidator 时回退到 gateway.run_runtime_check()。"""
+        state = make_state(accumulated_changes=[{"file_path": "main.py"}])
+        result = await node(state)
+
+        assert result["validation_results"][2].passed
+        mock_gateway.run_runtime_check.assert_awaited_once_with("main.py")
+
+
+class TestFixSuggestionIntegration:
+    """FixSuggestion 集成测试 — 错误分析和修复建议。"""
+
+    async def test_fix_suggestions_in_result_dict(
+        self, mock_gateway: AsyncMock
+    ) -> None:
+        """返回字典包含 fix_suggestions 键。"""
+        mock_ea = MagicMock(spec=ErrorAnalyzer)
+        mock_ea.analyze.return_value = [
+            FixSuggestion(
+                error_summary="AssertionError: assert 1 == 2",
+                affected_files=["test_main.py"],
+                likely_cause="Test assertion failed",
+                suggested_fix="Review assertion logic",
+                is_pre_existing=False,
+            ),
+        ]
+
+        mock_rv = AsyncMock(spec=RuntimeValidator)
+        mock_rv.run_tests.return_value = ValidationResult(
+            passed=False,
+            errors=[ValidationError(file_path="test_main.py", message="AssertionError", code="AssertionError")],
+        )
+        mock_rv.last_test_output = "FAILED test_main.py::test_fail - AssertionError: assert 1 == 2"
+
+        node = ValidationNode(
+            mock_gateway,
+            runtime_validator=mock_rv,
+            error_analyzer=mock_ea,
+        )
+        state = make_state(accumulated_changes=[{"file_path": "main.py"}])
+        result = await node(state)
+
+        assert "fix_suggestions" in result
+        assert len(result["fix_suggestions"]) == 1
+        assert result["fix_suggestions"][0].error_summary == "AssertionError: assert 1 == 2"
+        mock_ea.analyze.assert_called_once()
+
+    async def test_fix_suggestions_in_report(
+        self, mock_gateway: AsyncMock
+    ) -> None:
+        """报告中包含 FixSuggestion 部分。"""
+        mock_ea = MagicMock(spec=ErrorAnalyzer)
+        mock_ea.analyze.return_value = [
+            FixSuggestion(
+                error_summary="TypeError: unsupported operand",
+                affected_files=["utils.py"],
+                likely_cause="Type mismatch",
+                suggested_fix="Check function signature",
+                is_pre_existing=True,
+            ),
+        ]
+
+        mock_rv = AsyncMock(spec=RuntimeValidator)
+        mock_rv.run_tests.return_value = ValidationResult(
+            passed=False,
+            errors=[ValidationError(file_path="utils.py", message="TypeError", code="TypeError")],
+        )
+        mock_rv.last_test_output = "FAILED test_utils.py::test_type - TypeError"
+
+        node = ValidationNode(
+            mock_gateway,
+            runtime_validator=mock_rv,
+            error_analyzer=mock_ea,
+        )
+        state = make_state(accumulated_changes=[{"file_path": "main.py"}])
+        result = await node(state)
+        report = result["execution_log"][-1]["report"]
+
+        assert "### Fix Suggestions" in report
+        assert "TypeError: unsupported operand" in report
+        assert "Type mismatch" in report
+        assert "Check function signature" in report
+        assert "pre-existing" in report  # pre_existing 标记
+
+    async def test_fix_suggestions_empty_when_runtime_passes(
+        self, mock_gateway: AsyncMock
+    ) -> None:
+        """运行时通过时无 FixSuggestion。"""
+        mock_ea = MagicMock(spec=ErrorAnalyzer)
+        mock_ea.analyze.return_value = []
+
+        mock_rv = AsyncMock(spec=RuntimeValidator)
+        mock_rv.run_tests.return_value = ValidationResult(passed=True)
+        mock_rv.last_test_output = None
+
+        node = ValidationNode(
+            mock_gateway,
+            runtime_validator=mock_rv,
+            error_analyzer=mock_ea,
+        )
+        state = make_state(accumulated_changes=[{"file_path": "main.py"}])
+        result = await node(state)
+
+        assert len(result["fix_suggestions"]) == 0
+        report = result["execution_log"][-1]["report"]
+        assert "### Fix Suggestions" not in report
+        # ErrorAnalyzer 不应被调用
+        mock_ea.analyze.assert_not_called()
+
+    async def test_fix_suggestions_with_pre_existing_markers(
+        self, mock_gateway: AsyncMock
+    ) -> None:
+        """pre_existing 标记正确出现。"""
+        mock_ea = MagicMock(spec=ErrorAnalyzer)
+        mock_ea.analyze.return_value = [
+            FixSuggestion(
+                error_summary="ValueError: bad value",
+                affected_files=["legacy.py"],
+                likely_cause="Invalid input",
+                suggested_fix="Add validation",
+                is_pre_existing=True,  # 已有错误
+            ),
+            FixSuggestion(
+                error_summary="NameError: undefined",
+                affected_files=["new_code.py"],
+                likely_cause="Missing definition",
+                suggested_fix="Define before use",
+                is_pre_existing=False,  # 新错误
+            ),
+        ]
+
+        mock_rv = AsyncMock(spec=RuntimeValidator)
+        mock_rv.run_tests.return_value = ValidationResult(
+            passed=False,
+            errors=[ValidationError(file_path="test_all.py", message="Failures", code="TEST_FAILURE")],
+        )
+        mock_rv.last_test_output = "FAILED test_all.py - Error"
+
+        node = ValidationNode(
+            mock_gateway,
+            runtime_validator=mock_rv,
+            error_analyzer=mock_ea,
+        )
+        state = make_state(accumulated_changes=[{"file_path": "main.py"}])
+        result = await node(state)
+        report = result["execution_log"][-1]["report"]
+
+        assert "pre-existing" in report
+        assert "new" in report
+        assert len(result["fix_suggestions"]) == 2
+
+    async def test_fix_suggestions_layer_failure_independent(
+        self, mock_gateway: AsyncMock, tmp_path
+    ) -> None:
+        """某层验证失败不影响其他层和 FixSuggestion 收集。"""
+        mock_sa = AsyncMock(spec=StaticAnalyzer)
+        mock_sa.run_all.return_value = [
+            ValidationResult(passed=True),
+            ValidationResult(passed=True),
+            ValidationResult(
+                passed=False,
+                errors=[ValidationError(file_path="main.py", line=3, message="Hardcoded password", code="SEC_HARDCODED_SECRET")],
+            ),
+        ]
+
+        mock_ea = MagicMock(spec=ErrorAnalyzer)
+        mock_ea.analyze.return_value = [
+            FixSuggestion(
+                error_summary="AssertionError: assert 1 == 2",
+                affected_files=["test_main.py"],
+                likely_cause="Assertion failed",
+                suggested_fix="Fix assertion",
+                is_pre_existing=False,
+            ),
+        ]
+
+        mock_rv = AsyncMock(spec=RuntimeValidator)
+        mock_rv.run_tests.return_value = ValidationResult(
+            passed=False,
+            errors=[ValidationError(file_path="test_main.py", message="AssertionError", code="AssertionError")],
+        )
+        mock_rv.last_test_output = "FAILED test_main.py::test_fail - AssertionError"
+
+        node = ValidationNode(
+            mock_gateway,
+            static_analyzer=mock_sa,
+            runtime_validator=mock_rv,
+            error_analyzer=mock_ea,
+        )
+        state = make_state(accumulated_changes=[{"file_path": "main.py"}])
+        result = await node(state)
+
+        # Layer 1: syntax (via gateway) — 通过
+        assert result["validation_results"][0].passed
+        # Layer 2: static — 失败 (security scan)
+        assert not result["validation_results"][1].passed
+        # Layer 3: runtime — 失败
+        assert not result["validation_results"][2].passed
+        # FixSuggestions 正常收集
+        assert len(result["fix_suggestions"]) == 1
+        assert "Fix Suggestions" in result["execution_log"][-1]["report"]
 
 
 class TestValidationReport:

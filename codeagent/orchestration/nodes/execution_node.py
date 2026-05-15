@@ -29,6 +29,30 @@ _MAX_TOOL_CALLS = 10
 # 单步最大重试次数
 _MAX_RETRIES = 3
 
+# 修复模式常量
+_MAX_REPAIR_TOOL_CALLS = 5           # 修复模式最大 tool_calls 次数
+_MAX_VALIDATION_ROUNDS = 3           # 最大验证重试轮次
+
+# 修复模式提示词模板
+_REPAIR_MODE_PROMPT = """\
+## 验证修复模式
+
+上一次修改后验证失败，需要你修复以下错误。
+
+### 验证报告
+{validation_report}
+
+### 修复建议
+{fix_suggestions_text}
+
+请分析以上错误，读取相关文件，修复代码中的问题。
+注意：
+1. 只修复验证报告中指出的问题
+2. 不要修改与验证失败无关的文件
+3. 修复后代码必须通过所有验证
+4. 尽量在 {max_repair_tool_calls} 次工具调用内完成修复
+"""
+
 # 每个 action 类型的合理工具列表
 _ALLOWED_TOOLS_BY_ACTION: dict[str, set[str]] = {
     "create": {"write_file", "read_file"},
@@ -84,8 +108,8 @@ class ExecutionNode:
     async def __call__(self, state: AgentState) -> dict[str, Any]:
         """执行主入口。
 
-        如果 state.plan 存在且包含未执行步骤，按计划逐步执行；
-        否则走 Phase 1a 直连模式。
+        新增 Phase 4.A.5 修复模式：当 state.validation_results 有失败
+        且无待执行计划步骤时，进入验证反馈驱动的自动修复循环。
 
         Args:
             state: 当前 Agent 状态
@@ -93,6 +117,9 @@ class ExecutionNode:
         Returns:
             dict: 更新的状态字段（execution_log, errors, plan 等）
         """
+        # Phase 4.A.5: 优先检查修复模式
+        if self._needs_repair(state):
+            return await self._execute_repair_mode(state)
         if state.plan and state.current_step_index < len(state.plan):
             return await self._execute_with_plan(state)
         return await self._execute_direct(state)
@@ -565,6 +592,278 @@ class ExecutionNode:
             return True
 
         return False
+
+    # ── Phase 4.A.5 修复模式 ────────────────────────────────────
+
+    def _needs_repair(self, state: AgentState) -> bool:
+        """检查是否需要进入验证反馈驱动的修复模式。
+
+        当验证结果中有失败项，且所有计划步骤已完成（或无计划）时，
+        进入修复模式让 LLM 根据验证报告自动修复代码。
+
+        Returns:
+            True 表示应进入修复模式
+        """
+        if not state.validation_results:
+            return False
+
+        any_failed = any(not r.passed for r in state.validation_results)
+        if not any_failed:
+            return False
+
+        # 仅当所有计划步骤已完成（或无计划）时才进入修复模式
+        plan_done = (
+            state.plan is None
+            or len(state.plan) == 0
+            or state.current_step_index >= len(state.plan)
+        )
+        return plan_done
+
+    async def _execute_repair_mode(self, state: AgentState) -> dict[str, Any]:
+        """验证反馈驱动的自动修复模式。
+
+        将验证报告和修复建议作为额外上下文注入 LLM，让 LLM 自动
+        定位和修复问题。修复完成后递增 retry_count。
+
+        Returns:
+            dict: 更新的状态字段
+        """
+        start_time = time.monotonic()
+        execution_log: list[dict] = list(state.execution_log)
+        errors: list[str] = list(state.errors)
+        accumulated_changes: list[dict] = list(state.accumulated_changes)
+
+        # 构建验证报告文本
+        validation_report = self._format_validation_report(state.validation_results)
+        fix_suggestions_text = self._format_fix_suggestions(state)
+
+        # 构建修复提示词
+        repair_prompt = _REPAIR_MODE_PROMPT.format(
+            validation_report=validation_report,
+            fix_suggestions_text=fix_suggestions_text,
+            max_repair_tool_calls=_MAX_REPAIR_TOOL_CALLS,
+        )
+
+        tool_definitions = self._tool_gateway.list_tools()
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": self._build_system_prompt(state, tool_definitions)},
+            {"role": "user", "content": repair_prompt},
+        ]
+
+        # 记录修复模式进入日志
+        new_retry_count = state.retry_count + 1
+        execution_log.append({
+            "type": "repair_mode",
+            "retry_count": new_retry_count,
+            "validation_failure_count": sum(
+                1 for r in state.validation_results if not r.passed
+            ),
+            "timestamp": time.time(),
+        })
+
+        logger.info(
+            "Entering repair mode (retry %d/%d)",
+            new_retry_count, _MAX_VALIDATION_ROUNDS,
+        )
+
+        # 执行修复工具调用循环（使用较低的工具调用上限）
+        tool_call_count = 0
+        syntax_retries = 0
+        openai_tools = self._to_openai_tools(tool_definitions)
+
+        while tool_call_count < _MAX_REPAIR_TOOL_CALLS:
+            try:
+                response = await self._llm(
+                    model=self._model_name,
+                    messages=messages,
+                    tools=openai_tools if openai_tools else None,
+                    tool_choice="auto" if openai_tools else None,
+                )
+            except Exception as e:
+                logger.error("Repair LLM call failed: %s", e)
+                errors.append(f"Repair LLM call failed: {e}")
+                break
+
+            choice = response.choices[0]
+            msg = choice.message
+
+            if not msg.tool_calls:
+                if msg.content:
+                    execution_log.append({
+                        "type": "llm_response",
+                        "content": msg.content,
+                        "repair_mode": True,
+                        "timestamp": time.time(),
+                    })
+                break
+
+            # assistant message with tool calls
+            assistant_tool_calls = [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                }
+                for tc in msg.tool_calls
+            ]
+            assistant_msg: dict[str, object] = {
+                "role": "assistant",
+                "content": msg.content if msg.content is not None else None,
+                "tool_calls": assistant_tool_calls,
+            }
+            if hasattr(msg, "reasoning_content") and msg.reasoning_content:
+                assistant_msg["reasoning_content"] = msg.reasoning_content
+            messages.append(assistant_msg)
+
+            executed_tool_ids: list[str] = []
+
+            for tool_call in msg.tool_calls:
+                if tool_call_count >= _MAX_REPAIR_TOOL_CALLS:
+                    errors.append(
+                        f"Exceeded max repair tool calls ({_MAX_REPAIR_TOOL_CALLS})"
+                    )
+                    break
+
+                tool_call_count += 1
+                tool_name = tool_call.function.name
+                tool_args = self._parse_tool_args(tool_call.function.arguments)
+
+                logger.info(
+                    "Repair tool #%d: %s(%s)", tool_call_count, tool_name, tool_args,
+                )
+
+                tool_result = await self._tool_gateway.execute_tool(
+                    tool_name, tool_args
+                )
+
+                log_entry: dict[str, Any] = {
+                    "type": "tool_call",
+                    "tool_name": tool_name,
+                    "arguments": tool_args,
+                    "success": tool_result.success,
+                    "duration_ms": tool_result.duration_ms,
+                    "repair_mode": True,
+                    "timestamp": time.time(),
+                }
+
+                if tool_result.success:
+                    log_entry["result"] = tool_result.data
+                else:
+                    log_entry["error"] = tool_result.error_message
+                    logger.warning(
+                        "Repair tool '%s' failed: %s",
+                        tool_name, tool_result.error_message,
+                    )
+
+                execution_log.append(log_entry)
+
+                result_content = (
+                    json.dumps(tool_result.data, ensure_ascii=False)
+                    if tool_result.success
+                    else f"Error: {tool_result.error_message}"
+                )
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": result_content,
+                })
+                executed_tool_ids.append(tool_call.id)
+
+                # write_file → track change + syntax check
+                if tool_name == "write_file" and tool_result.success:
+                    file_path = tool_args.get("file_path", "")
+                    if file_path:
+                        accumulated_changes.append({
+                            "file_path": file_path,
+                            "step_id": -1,  # repair mode step
+                            "action": tool_args.get("mode", "modify"),
+                            "repair_mode": True,
+                            "timestamp": time.time(),
+                        })
+                        syntax_retries = await self._run_syntax_check(
+                            file_path=file_path,
+                            project_root="",
+                            messages=messages,
+                            execution_log=execution_log,
+                            retry_count=syntax_retries,
+                            step_id=None,
+                        )
+
+                if tool_call_count >= _MAX_REPAIR_TOOL_CALLS:
+                    break
+
+            # fill missing tool responses
+            for tc in msg.tool_calls:
+                if tc.id not in executed_tool_ids:
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": "Tool execution skipped (limit reached).",
+                    })
+
+            if tool_call_count >= _MAX_REPAIR_TOOL_CALLS:
+                logger.info("Repair mode reached max tool calls (%d)", _MAX_REPAIR_TOOL_CALLS)
+                break
+
+        total_duration = (time.monotonic() - start_time) * 1000
+        logger.info(
+            "Repair mode completed in %.1fms (%d tool calls, retry %d)",
+            total_duration, tool_call_count, new_retry_count,
+        )
+
+        return {
+            "execution_log": execution_log,
+            "errors": errors,
+            "accumulated_changes": accumulated_changes,
+            "retry_count": new_retry_count,
+        }
+
+    def _format_validation_report(
+        self, validation_results: list[Any],
+    ) -> str:
+        """将 ValidationResult 列表格式化为可读的验证报告文本。"""
+        lines: list[str] = []
+        for i, r in enumerate(validation_results):
+            status = "✅ PASSED" if r.passed else "❌ FAILED"
+            label = ["Syntax", "Static Analysis", "Runtime"][i] if i < 3 else f"Layer {i + 1}"
+            lines.append(f"### Layer {i + 1}: {label}")
+            lines.append(f"Status: {status}")
+            if r.errors:
+                lines.append(f"Errors ({len(r.errors)}):")
+                for err in r.errors[:5]:  # 最多显示 5 个
+                    loc = f"{err.file_path}:{err.line}" if hasattr(err, "file_path") and err.file_path else ""
+                    msg = err.message if hasattr(err, "message") else str(err)
+                    lines.append(f"  - {loc}: {msg}" if loc else f"  - {msg}")
+                if len(r.errors) > 5:
+                    lines.append(f"  - ... and {len(r.errors) - 5} more")
+            if r.warnings:
+                lines.append(f"Warnings ({len(r.warnings)}):")
+                for w in r.warnings[:3]:
+                    lines.append(f"  - {w.message if hasattr(w, 'message') else w}")
+            lines.append("")
+        return "\n".join(lines)
+
+    def _format_fix_suggestions(self, state: AgentState) -> str:
+        """从 state 中提取 FixSuggestion 并格式化为文本。
+
+        查找 execution_log 中的验证报告或 fix_suggestions 数据。
+        """
+        # 尝试从 execution_log 中提取 fix_suggestions
+        suggestion_texts: list[str] = []
+        for entry in reversed(state.execution_log):
+            if entry.get("type") == "validation_report":
+                fix_count = entry.get("fix_suggestion_count", 0)
+                if fix_count > 0:
+                    suggestion_texts.append(f"Found {fix_count} fix suggestion(s) in validation report.")
+                break
+
+        if not suggestion_texts:
+            return "No specific fix suggestions available."
+
+        return "\n".join(suggestion_texts)
 
     # ── Phase 1a 直连模式 ────────────────────────────────────
 
