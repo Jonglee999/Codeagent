@@ -11,7 +11,10 @@ import subprocess
 import time
 from pathlib import Path
 
+from typing import Optional
+
 from codeagent.gateway.validation_gateway import ValidationError, ValidationResult
+from codeagent.sandbox.docker_executor import DockerExecutor
 from codeagent.validation.error_analyzer import ErrorAnalyzer, FixSuggestion
 from codeagent.validation.test_detector import TestDetector
 
@@ -84,15 +87,21 @@ class RuntimeValidator:
     4. 无测试框架时执行降级检查
     """
 
-    def __init__(self, project_root: str) -> None:
+    def __init__(
+        self,
+        project_root: str,
+        executor: Optional[DockerExecutor] = None,
+    ) -> None:
         """初始化 RuntimeValidator。
 
         Args:
             project_root: 项目根目录路径
+            executor: DockerExecutor 实例（None 时降级为直接 subprocess 执行）
         """
         self._project_root = Path(project_root).resolve()
         self._test_detector = TestDetector(project_root)
         self._error_analyzer = ErrorAnalyzer()
+        self._executor = executor
         self._last_raw_output: str | None = None
 
     # ── 测试执行 ────────────────────────────────────────────────
@@ -144,6 +153,29 @@ class RuntimeValidator:
                 duration_ms=(time.monotonic() - start) * 1000,
             )
 
+        # ── DockerExecutor 沙箱模式 ────────────────────────────
+        if self._executor and await self._executor.is_available():
+            exec_result = await self._executor.run_tests(
+                project_root=str(self._project_root),
+                test_command=info.test_command,
+            )
+            output = exec_result.stdout + "\n" + exec_result.stderr
+            self._last_raw_output = output
+            passed = exec_result.exit_code == 0
+
+            if not passed:
+                errors = self._parse_test_errors(output)
+            else:
+                errors = []
+
+            return ValidationResult(
+                passed=passed,
+                errors=errors,
+                duration_ms=(time.monotonic() - start) * 1000,
+                sandboxed=exec_result.sandboxed,
+            )
+
+        # ── 降级：直接 subprocess 执行 ─────────────────────────
         try:
             proc = _run_subprocess(
                 cmd, timeout=timeout, cwd=str(self._project_root)

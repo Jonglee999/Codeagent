@@ -461,6 +461,7 @@ class StaticAnalyzer:
     ) -> ValidationResult:
         """对文件列表执行通用安全检查。
 
+        优先使用 bandit（AST 分析），不可用时降级为正则检测。
         检测模式：
         - eval() / exec() / compile() 动态代码执行
         - SQL 注入模式（字符串拼接 SQL）
@@ -482,10 +483,71 @@ class StaticAnalyzer:
                 duration_ms=(time.monotonic() - start) * 1000,
             )
 
+        # 优先使用 bandit
+        bandit_result = self._run_bandit(py_files)
+        if bandit_result is not None:
+            bandit_result.duration_ms = (time.monotonic() - start) * 1000
+            return bandit_result
+
+        # 降级：正则检测
+        result = await self._run_security_check_regex(py_files)
+        result.duration_ms = (time.monotonic() - start) * 1000
+        return result
+
+    def _run_bandit(self, files: list[str]) -> ValidationResult | None:
+        """运行 bandit 安全扫描。
+
+        bandit 可用时返回 ValidationResult，不可用或出错时返回 None（降级）。
+
+        bandit 返回码：0=无问题，1=有问题，2=自身错误。
+        HIGH severity → errors，MEDIUM → warnings，LOW → 忽略。
+        """
+        if not shutil.which("bandit"):
+            return None
+
+        try:
+            cmd = ["bandit", "-f", "json", "--quiet", "-ll"] + files
+            result = _run_subprocess(cmd, timeout=_TOOL_TIMEOUT)
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            return None
+
+        if result.returncode == 2:
+            return None
+
+        try:
+            data = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError:
+            return None
+
+        errors: list[ValidationError] = []
+        warnings: list[ValidationError] = []
+        for issue in data.get("results", []):
+            severity = issue.get("issue_severity", "LOW")
+            err = ValidationError(
+                file_path=issue.get("filename", ""),
+                line=issue.get("line_number", 0),
+                message=issue.get("issue_text", ""),
+                code=issue.get("test_id", ""),
+                severity="error" if severity == "HIGH" else "warning",
+            )
+            if severity == "HIGH":
+                errors.append(err)
+            elif severity == "MEDIUM":
+                warnings.append(err)
+            # LOW severity: 忽略，避免噪音
+
+        return ValidationResult(
+            passed=len(errors) == 0,
+            errors=errors,
+            warnings=warnings,
+        )
+
+    async def _run_security_check_regex(self, files: list[str]) -> ValidationResult:
+        """降级安全扫描：使用正则检测。"""
         errors: list[ValidationError] = []
         warnings: list[ValidationError] = []
 
-        for file_path in py_files:
+        for file_path in files:
             try:
                 with open(file_path, encoding="utf-8", errors="ignore") as f:
                     source = f.read()
@@ -495,7 +557,6 @@ class StaticAnalyzer:
             if not source:
                 continue
 
-            # 安全检查
             file_errors, file_warnings = self._scan_source(
                 source, file_path
             )
@@ -506,7 +567,6 @@ class StaticAnalyzer:
             passed=len(errors) == 0,
             errors=errors,
             warnings=warnings,
-            duration_ms=(time.monotonic() - start) * 1000,
         )
 
     def _scan_source(

@@ -58,3 +58,44 @@ def get_max_retries() -> int:
 def get_context_budget() -> int:
     """Get the context budget in tokens."""
     return int(get_env("CONTEXT_BUDGET_TOKENS", "8000"))
+
+
+# ── LLM 成本控制配置 ──────────────────────────────────────
+
+
+def get_max_llm_calls_per_task() -> int:
+    """单次任务最大 LLM 调用次数，默认 50。"""
+    return int(get_env("MAX_LLM_CALLS_PER_TASK", "50"))
+
+
+def get_max_tokens_per_task() -> int:
+    """单次任务最大 token 消耗估算，默认 100000。"""
+    return int(get_env("MAX_TOKENS_PER_TASK", "100000"))
+
+
+# ── Sandbox / Docker 配置 ──────────────────────────────────────
+
+
+def get_sandbox_enabled() -> bool:
+    """获取沙箱模式是否启用。
+
+    从 SANDBOX_ENABLED 环境变量读取，默认 false。
+    启用后代码执行将在 Docker 容器中隔离运行。
+    """
+    return get_env("SANDBOX_ENABLED", "false").lower() == "true"
+
+
+def get_sandbox_timeout() -> int:
+    """获取沙箱命令执行超时秒数。
+
+    从 SANDBOX_TIMEOUT 环境变量读取，默认 60 秒。
+    """
+    return int(get_env("SANDBOX_TIMEOUT", "60"))
+
+
+def get_sandbox_memory_mb() -> int:
+    """获取沙箱容器内存限制（MB）。
+
+    从 SANDBOX_MEMORY_MB 环境变量读取，默认 512 MB。
+    """
+    return int(get_env("SANDBOX_MEMORY_MB", "512"))

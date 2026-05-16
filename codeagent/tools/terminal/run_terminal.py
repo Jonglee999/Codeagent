@@ -8,11 +8,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
-from typing import Any
+from typing import Any, Optional
 
+from codeagent import config as codeagent_config
 from codeagent.gateway.tool_gateway import ToolResult
+from codeagent.sandbox.docker_executor import DockerExecutor
 from codeagent.tools.base import BaseTool
 from codeagent.tools.terminal.safety_checker import SafetyChecker, SafetyResult
 from codeagent.tools.terminal.sandbox import (
@@ -76,6 +79,7 @@ class RunTerminalTool(BaseTool):
         sandbox: TerminalSandbox | None = None,
         safety_checker: SafetyChecker | None = None,
         project_root: str = "",
+        executor: Optional[DockerExecutor] = None,
     ) -> None:
         """初始化 RunTerminalTool。
 
@@ -83,11 +87,13 @@ class RunTerminalTool(BaseTool):
             sandbox: TerminalSandbox 实例（如不提供则自动创建）
             safety_checker: SafetyChecker 实例（如不提供则自动创建）
             project_root: 项目根目录（用于挂载到容器）
+            executor: DockerExecutor 实例（SANDBOX_ENABLED=true 时使用）
         """
         super().__init__()
         self._safety_checker = safety_checker or SafetyChecker()
         self._sandbox = sandbox
         self._project_root = project_root
+        self._executor = executor
 
     @property
     def sandbox(self) -> TerminalSandbox:
@@ -145,7 +151,36 @@ class RunTerminalTool(BaseTool):
                 duration_ms=duration,
             )
 
-        # ── Layer 2+3: Docker Sandbox ─────────────────────────
+        # ── Layer 2: DockerExecutor 沙箱模式 ──────────────────
+        if self._executor and codeagent_config.get_sandbox_enabled():
+            try:
+                exec_result = await self._executor.run(
+                    command=command,
+                    workdir=self._project_root or ".",
+                )
+                duration = (time.monotonic() - start) * 1000
+                return ToolResult(
+                    success=exec_result.exit_code == 0,
+                    data={
+                        "stdout": exec_result.stdout,
+                        "stderr": exec_result.stderr,
+                        "exit_code": exec_result.exit_code,
+                        "duration_ms": duration,
+                        "sandboxed": exec_result.sandboxed,
+                    },
+                    duration_ms=duration,
+                )
+            except Exception as exc:
+                duration = (time.monotonic() - start) * 1000
+                logger.exception("DockerExecutor execution failed")
+                return ToolResult(
+                    success=False,
+                    error_message=f"Docker execution error: {exc}",
+                    error_code="DOCKER_EXECUTOR_ERROR",
+                    duration_ms=duration,
+                )
+
+        # ── Layer 2+3: TerminalSandbox (现有 Docker 沙箱) ─────
         try:
             # 构建卷映射
             volumes: dict = {}

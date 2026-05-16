@@ -14,12 +14,15 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
-from typing import Any, Callable
+from pathlib import Path
+from typing import Any, Callable, Optional
 
+from codeagent import config as codeagent_config
 from codeagent.gateway.tool_gateway import IToolGateway
 from codeagent.gateway.validation_gateway import IValidationGateway
-from codeagent.orchestration.state import AgentState, PlanStep
+from codeagent.orchestration.state import AgentState, PlanStep, RepairContext, StructuredError
 
 logger = logging.getLogger(__name__)
 
@@ -183,6 +186,7 @@ class ExecutionNode:
             # 执行该步骤的工具调用循环（含偏离检测）
             step_result, step_deviation_count, step_human_review, step_review_request = (
                 await self._execute_step_tool_loop(
+                    state=state,
                     step=step,
                     messages=messages,
                     tool_definitions=tool_definitions,
@@ -303,6 +307,7 @@ class ExecutionNode:
 
     async def _execute_step_tool_loop(
         self,
+        state: AgentState,
         step: PlanStep,
         messages: list[dict[str, Any]],
         tool_definitions: list[Any],
@@ -326,8 +331,8 @@ class ExecutionNode:
 
         while tool_call_count < self._max_tool_calls:
             try:
-                response = await self._llm(
-                    model=self._model_name,
+                response = await self._call_llm_with_limit(
+                    state=state,
                     messages=messages,
                     tools=openai_tools if openai_tools else None,
                     tool_choice="auto" if openai_tools else None,
@@ -335,6 +340,12 @@ class ExecutionNode:
             except Exception as e:
                 logger.error("LLM call failed: %s", e)
                 errors.append(f"LLM call failed: {e}")
+                break
+
+            if response is None:
+                # 成本控制：超出 LLM 调用次数上限
+                human_review_required = True
+                review_request = state.review_request
                 break
 
             choice = response.choices[0]
@@ -474,6 +485,11 @@ class ExecutionNode:
                     step.step_id, tool_call_count, tool_name, tool_args,
                 )
 
+                # ── Rollback: write_file/delete_file 前保存原始内容 ──
+                orig_file_path, original_content = (
+                    self._save_original_content_before_tool(tool_name, tool_args)
+                )
+
                 tool_result = await self._tool_gateway.execute_tool(
                     tool_name, tool_args
                 )
@@ -513,24 +529,36 @@ class ExecutionNode:
                 })
                 executed_tool_ids.append(tool_call.id)
 
-                # write_file → track change + syntax check
+                # write_file → track change (含 original_content) + syntax check
                 if tool_name == "write_file" and tool_result.success:
-                    file_path = tool_args.get("file_path", "")
-                    if file_path:
+                    if orig_file_path:
+                        action = tool_args.get("mode", "modify")
                         accumulated_changes.append({
-                            "file_path": file_path,
+                            "file_path": orig_file_path,
                             "step_id": step.step_id,
-                            "action": tool_args.get("mode", "modify"),
+                            "action": action,
+                            "original_content": original_content,
                             "timestamp": time.time(),
                         })
                         syntax_retries = await self._run_syntax_check(
-                            file_path=file_path,
+                            file_path=orig_file_path,
                             project_root="",  # will resolve in _run_syntax_check
                             messages=messages,
                             execution_log=execution_log,
                             retry_count=syntax_retries,
                             step_id=step.step_id,
                         )
+
+                # delete_file → track change (含 original_content 用于重建)
+                if tool_name == "delete_file" and tool_result.success:
+                    if orig_file_path:
+                        accumulated_changes.append({
+                            "file_path": orig_file_path,
+                            "step_id": step.step_id,
+                            "action": "delete",
+                            "original_content": original_content,
+                            "timestamp": time.time(),
+                        })
 
                 if tool_call_count >= self._max_tool_calls:
                     break
@@ -633,16 +661,20 @@ class ExecutionNode:
         errors: list[str] = list(state.errors)
         accumulated_changes: list[dict] = list(state.accumulated_changes)
 
-        # 构建验证报告文本
-        validation_report = self._format_validation_report(state.validation_results)
-        fix_suggestions_text = self._format_fix_suggestions(state)
-
-        # 构建修复提示词
-        repair_prompt = _REPAIR_MODE_PROMPT.format(
-            validation_report=validation_report,
-            fix_suggestions_text=fix_suggestions_text,
-            max_repair_tool_calls=_MAX_REPAIR_TOOL_CALLS,
+        # ── Phase 5.4: 构建修复上下文 ──────────────────────────
+        new_errors, pre_existing = self._extract_structured_errors(state.validation_results)
+        attempt_number = state.retry_count + 1
+        last_fix_summary = state.repair_context.last_fix_summary if state.repair_context else None
+        ctx = RepairContext(
+            attempt_number=attempt_number,
+            errors=new_errors,
+            pre_existing_errors=pre_existing,
+            last_fix_summary=last_fix_summary,
         )
+        state.repair_context = ctx
+
+        # 构建结构化的修复提示词
+        repair_prompt = self._build_repair_prompt(state)
 
         tool_definitions = self._tool_gateway.list_tools()
         messages: list[dict[str, Any]] = [
@@ -673,8 +705,8 @@ class ExecutionNode:
 
         while tool_call_count < _MAX_REPAIR_TOOL_CALLS:
             try:
-                response = await self._llm(
-                    model=self._model_name,
+                response = await self._call_llm_with_limit(
+                    state=state,
                     messages=messages,
                     tools=openai_tools if openai_tools else None,
                     tool_choice="auto" if openai_tools else None,
@@ -682,6 +714,10 @@ class ExecutionNode:
             except Exception as e:
                 logger.error("Repair LLM call failed: %s", e)
                 errors.append(f"Repair LLM call failed: {e}")
+                break
+
+            if response is None:
+                # 成本控制：超出 LLM 调用次数上限
                 break
 
             choice = response.choices[0]
@@ -735,6 +771,11 @@ class ExecutionNode:
                     "Repair tool #%d: %s(%s)", tool_call_count, tool_name, tool_args,
                 )
 
+                # ── Rollback: write_file/delete_file 前保存原始内容 ──
+                orig_file_path, original_content = (
+                    self._save_original_content_before_tool(tool_name, tool_args)
+                )
+
                 tool_result = await self._tool_gateway.execute_tool(
                     tool_name, tool_args
                 )
@@ -772,25 +813,38 @@ class ExecutionNode:
                 })
                 executed_tool_ids.append(tool_call.id)
 
-                # write_file → track change + syntax check
+                # write_file → track change (含 original_content) + syntax check
                 if tool_name == "write_file" and tool_result.success:
-                    file_path = tool_args.get("file_path", "")
-                    if file_path:
+                    if orig_file_path:
+                        action = tool_args.get("mode", "modify")
                         accumulated_changes.append({
-                            "file_path": file_path,
+                            "file_path": orig_file_path,
                             "step_id": -1,  # repair mode step
-                            "action": tool_args.get("mode", "modify"),
+                            "action": action,
+                            "original_content": original_content,
                             "repair_mode": True,
                             "timestamp": time.time(),
                         })
                         syntax_retries = await self._run_syntax_check(
-                            file_path=file_path,
+                            file_path=orig_file_path,
                             project_root="",
                             messages=messages,
                             execution_log=execution_log,
                             retry_count=syntax_retries,
                             step_id=None,
                         )
+
+                # delete_file → track change (含 original_content 用于重建)
+                if tool_name == "delete_file" and tool_result.success:
+                    if orig_file_path:
+                        accumulated_changes.append({
+                            "file_path": orig_file_path,
+                            "step_id": -1,
+                            "action": "delete",
+                            "original_content": original_content,
+                            "repair_mode": True,
+                            "timestamp": time.time(),
+                        })
 
                 if tool_call_count >= _MAX_REPAIR_TOOL_CALLS:
                     break
@@ -814,11 +868,29 @@ class ExecutionNode:
             total_duration, tool_call_count, new_retry_count,
         )
 
+        # ── Phase 5.4: 生成 last_fix_summary ────────────────────
+        tool_calls_log = [
+            e for e in execution_log
+            if e.get("type") == "tool_call" and e.get("repair_mode")
+        ]
+        summary_parts: list[str] = []
+        for entry in tool_calls_log:
+            tn = entry.get("tool_name", "")
+            args = entry.get("arguments", {})
+            if tn == "write_file":
+                summary_parts.append(f"Modified {args.get('file_path', 'unknown')}")
+            elif tn == "read_file":
+                summary_parts.append(f"Read {args.get('file_path', 'unknown')}")
+            elif tn == "delete_file":
+                summary_parts.append(f"Deleted {args.get('file_path', 'unknown')}")
+        ctx.last_fix_summary = "; ".join(summary_parts) if summary_parts else (ctx.last_fix_summary or "No changes made")
+
         return {
             "execution_log": execution_log,
             "errors": errors,
             "accumulated_changes": accumulated_changes,
             "retry_count": new_retry_count,
+            "repair_context": ctx,
         }
 
     def _format_validation_report(
@@ -865,6 +937,91 @@ class ExecutionNode:
 
         return "\n".join(suggestion_texts)
 
+    # ── Phase 5.4: 修复上下文结构化 ────────────────────────────
+
+    def _extract_structured_errors(
+        self,
+        validation_results: list[Any],
+    ) -> tuple[list[StructuredError], list[str]]:
+        """从 ValidationResult 列表中提取结构化错误。
+
+        validation_results 顺序：0=syntax, 1=lint, 2=runtime。
+        当前系统中尚无 is_pre_existing 机制，所有错误均标记为新的。
+
+        Returns:
+            tuple[list[StructuredError], list[str]]:
+                (需要修复的新错误列表, 预存在的错误描述列表)
+        """
+        error_types: list[str] = ["syntax", "lint", "runtime"]
+        new_errors: list[StructuredError] = []
+        pre_existing: list[str] = []
+
+        for i, vr in enumerate(validation_results):
+            error_type = error_types[i] if i < len(error_types) else "runtime"
+            for err in vr.errors:
+                file_path = err.file_path if hasattr(err, "file_path") and err.file_path else ""
+                line_number: int | None = err.line if hasattr(err, "line") and err.line else None
+                message = err.message if hasattr(err, "message") else str(err)
+                new_errors.append(StructuredError(
+                    file_path=file_path,
+                    line_number=line_number,
+                    error_type=error_type,  # type: ignore[arg-type]
+                    message=message,
+                ))
+
+        return new_errors, pre_existing
+
+    def _build_repair_prompt(self, state: AgentState) -> str:
+        """构建结构化的修复提示词。
+
+        当 state.repair_context 存在时使用结构化格式，
+        否则回退到原有的纯文本验证报告。
+        """
+        ctx = state.repair_context
+        if ctx is None:
+            # 兼容旧逻辑：无 RepairContext 时使用纯文本格式
+            validation_report = self._format_validation_report(state.validation_results)
+            fix_suggestions_text = self._format_fix_suggestions(state)
+            return _REPAIR_MODE_PROMPT.format(
+                validation_report=validation_report,
+                fix_suggestions_text=fix_suggestions_text,
+                max_repair_tool_calls=_MAX_REPAIR_TOOL_CALLS,
+            )
+
+        lines: list[str] = [
+            f"## 修复尝试 #{ctx.attempt_number}",
+            "",
+        ]
+        if ctx.last_fix_summary:
+            lines += [f"**上次修复内容：** {ctx.last_fix_summary}", ""]
+
+        lines += [
+            f"**需要修复的错误（{len(ctx.errors)} 个）：**",
+        ]
+        for err in ctx.errors:
+            loc = f"{err.file_path}:{err.line_number}" if err.line_number is not None else err.file_path
+            lines.append(f"- `{loc}` [{err.error_type}] {err.message}")
+
+        if ctx.pre_existing_errors:
+            lines += [
+                "",
+                f"**以下是预存在的错误，请勿修复（{len(ctx.pre_existing_errors)} 个）：**",
+            ]
+            for e in ctx.pre_existing_errors:
+                lines.append(f"- {e}")
+
+        lines += [
+            "",
+            f"请分析以上错误，读取相关文件，修复代码中的问题。",
+            f"注意：",
+            f"1. 只修复列表中指出的问题",
+            f"2. 不要修改与验证失败无关的文件",
+            f"3. 修复后代码必须通过所有验证",
+            f"4. 尽量在 {_MAX_REPAIR_TOOL_CALLS} 次工具调用内完成修复",
+        ]
+
+        return "\n".join(lines)
+
     # ── Phase 1a 直连模式 ────────────────────────────────────
 
     async def _execute_direct(self, state: AgentState) -> dict[str, Any]:
@@ -894,8 +1051,8 @@ class ExecutionNode:
             openai_tools = self._to_openai_tools(tool_definitions)
 
             try:
-                response = await self._llm(
-                    model=self._model_name,
+                response = await self._call_llm_with_limit(
+                    state=state,
                     messages=messages,
                     tools=openai_tools if openai_tools else None,
                     tool_choice="auto" if openai_tools else None,
@@ -903,6 +1060,10 @@ class ExecutionNode:
             except Exception as e:
                 logger.error("LLM call failed: %s", e)
                 errors.append(f"LLM call failed: {e}")
+                break
+
+            if response is None:
+                # 成本控制：超出 LLM 调用次数上限
                 break
 
             choice = response.choices[0]
@@ -953,6 +1114,11 @@ class ExecutionNode:
                 logger.info(
                     "Tool call #%d: %s(%s)",
                     tool_call_count, tool_name, tool_args,
+                )
+
+                # ── Rollback: write_file/delete_file 前保存原始内容 ──
+                orig_file_path, original_content = (
+                    self._save_original_content_before_tool(tool_name, tool_args)
                 )
 
                 tool_result = await self._tool_gateway.execute_tool(
@@ -1129,6 +1295,54 @@ class ExecutionNode:
 
         return "\n".join(parts)
 
+    # ── Phase 5.5: LLM 成本控制 ────────────────────────────────
+
+    async def _call_llm_with_limit(
+        self,
+        state: AgentState,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        tool_choice: str | None,
+    ) -> Any | None:
+        """调用 LLM 并检查成本限制。
+
+        Args:
+            state: Agent 状态（读取/更新 llm_call_count）
+            messages: 对话消息列表
+            tools: OpenAI 兼容 tools 格式
+            tool_choice: tool_choice 参数
+
+        Returns:
+            LLM 响应对象，或 None（超出限制时，同时设置 human_review_required）
+        """
+        max_calls = codeagent_config.get_max_llm_calls_per_task()
+        current_count = state.llm_call_count
+
+        if current_count >= max_calls:
+            state.human_review_required = True
+            state.review_type = "cost_limit_reached"
+            state.review_request = {
+                "review_type": "cost_limit_reached",
+                "title": "LLM 调用次数已达上限",
+                "details": {
+                    "current_count": current_count,
+                    "max_calls": max_calls,
+                },
+                "options": ["approve", "abort"],
+            }
+            return None
+
+        response = await self._llm(
+            model=self._model_name,
+            messages=messages,
+            tools=tools,
+            tool_choice=tool_choice,
+        )
+
+        state.llm_call_count = current_count + 1
+
+        return response
+
     def _to_openai_tools(
         self, tool_definitions: list[Any]
     ) -> list[dict[str, Any]]:
@@ -1161,3 +1375,35 @@ class ExecutionNode:
                 self._progress_callback(progress)
             except Exception as exc:
                 logger.warning("Progress callback failed: %s", exc)
+
+    # ── Rollback 支持 ──────────────────────────────────────────
+
+    def _save_original_content_before_tool(
+        self, tool_name: str, tool_args: dict
+    ) -> tuple[str, Optional[str]]:
+        """在 write_file/delete_file 前保存原始内容。
+
+        Args:
+            tool_name: 工具名称
+            tool_args: 工具参数字典
+
+        Returns:
+            tuple[file_path, original_content]:
+                file_path: 目标文件路径
+                original_content: 原始内容（文件不存在时为 None）
+        """
+        file_path = tool_args.get("file_path", "")
+        if not file_path or tool_name not in ("write_file", "delete_file"):
+            return ("", None)
+
+        # 尝试读取文件原始内容
+        try:
+            path = Path(file_path)
+            if path.is_file():
+                original_content = path.read_text(encoding="utf-8")
+            else:
+                original_content = None
+        except (OSError, PermissionError):
+            original_content = None
+
+        return (file_path, original_content)

@@ -6,15 +6,16 @@ Mock IToolGateway、IValidationGateway 和 LLM，验证调度逻辑。
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from codeagent.gateway.tool_gateway import IToolGateway, ToolDefinition, ToolResult
-from codeagent.gateway.validation_gateway import IValidationGateway, ValidationResult
+from codeagent.gateway.validation_gateway import IValidationGateway, ValidationError, ValidationResult
 from codeagent.orchestration.nodes.execution_node import ExecutionNode
-from codeagent.orchestration.state import AgentState, PlanStep
+from codeagent.orchestration.state import AgentState, PlanStep, RepairContext, StructuredError
 
 
 # ── Mock helpers ──────────────────────────────────────────────────────────
@@ -1896,26 +1897,20 @@ class TestRepairPrompt:
         )
         await node(state)
 
-        # 检查传递给 LLM 的 user 消息包含验证报告
+        # 检查传递给 LLM 的 user 消息包含结构化错误信息
         call_kwargs = llm.call_args[1]
         messages = call_kwargs.get("messages", [])
         user_msgs = [m for m in messages if m["role"] == "user"]
         assert len(user_msgs) >= 1
         user_content = user_msgs[0]["content"]
-        assert "### Validation Report" in user_content or "验证修复模式" in user_content
-        assert "FAILED" in user_content
+        assert "修复尝试 #1" in user_content
+        assert "test error" in user_content
 
-    async def test_fix_suggestions_in_prompt(self) -> None:
-        """修复模式的 LLM prompt 应包含修复建议。"""
+    async def test_repair_prompt_structured_instead_of_fix_suggestions(self) -> None:
+        """修复模式的 LLM prompt 使用结构化错误格式（替代旧修复建议）。"""
         state = AgentState(
             user_request="test", project_root="/root",
             validation_results=[_MockValidationResult(passed=False)],  # type: ignore[arg-type]
-            execution_log=[{
-                "type": "validation_report",
-                "report": "### Fix Suggestions\n1. Test error found",
-                "fix_suggestion_count": 1,
-                "timestamp": 1000.0,
-            }],
         )
         llm = AsyncMock(return_value=MockLLMResponse(choices=[MockChoice(
             message=MockChoiceMessage(content="Repairing")
@@ -1932,8 +1927,9 @@ class TestRepairPrompt:
         user_msgs = [m for m in messages if m["role"] == "user"]
         assert len(user_msgs) >= 1
         user_content = user_msgs[0]["content"]
-        # 应包含修复建议信息
-        assert "fix suggestion" in user_content.lower()
+        # 新的结构化格式包含修复尝试编号和错误详情
+        assert "修复尝试 #1" in user_content
+        assert "test.py" in user_content
 
     async def test_repair_prompt_includes_error_details(self) -> None:
         """修复提示词应包含具体错误细节。"""
@@ -1961,3 +1957,473 @@ class TestRepairPrompt:
         user_content = user_msgs[0]["content"]
         assert "buggy.py" in user_content or "SyntaxError" in user_content
         assert "invalid syntax" in user_content
+
+
+# ── Tests: Rollback original_content ────────────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestOriginalContentSaving:
+    """_save_original_content_before_tool 测试。"""
+
+    async def test_save_before_write_file(self, tmp_path: Path) -> None:
+        """write_file 前保存原始内容。"""
+        test_file = tmp_path / "test.py"
+        test_file.write_text("# original content")
+
+        node = ExecutionNode(
+            llm=make_llm(),
+            tool_gateway=make_gateway(),
+            validation_gateway=make_validation_gateway(),
+        )
+
+        file_path, content = node._save_original_content_before_tool(
+            "write_file", {"file_path": str(test_file)},
+        )
+
+        assert file_path == str(test_file)
+        assert content == "# original content"
+
+    async def test_save_before_write_new_file(self, tmp_path: Path) -> None:
+        """新文件（create）write_file 前 original_content 为 None。"""
+        new_file = tmp_path / "new.py"
+
+        node = ExecutionNode(
+            llm=make_llm(),
+            tool_gateway=make_gateway(),
+            validation_gateway=make_validation_gateway(),
+        )
+
+        file_path, content = node._save_original_content_before_tool(
+            "write_file", {"file_path": str(new_file)},
+        )
+
+        assert file_path == str(new_file)
+        assert content is None  # 文件不存在
+
+    async def test_save_before_delete_file(self, tmp_path: Path) -> None:
+        """delete_file 前保存原始内容。"""
+        test_file = tmp_path / "to_delete.py"
+        test_file.write_text("# content to delete")
+
+        node = ExecutionNode(
+            llm=make_llm(),
+            tool_gateway=make_gateway(),
+            validation_gateway=make_validation_gateway(),
+        )
+
+        file_path, content = node._save_original_content_before_tool(
+            "delete_file", {"file_path": str(test_file)},
+        )
+
+        assert file_path == str(test_file)
+        assert content == "# content to delete"
+
+    async def test_save_ignores_other_tools(self) -> None:
+        """其他工具（如 read_file）不保存原始内容。"""
+        node = ExecutionNode(
+            llm=make_llm(),
+            tool_gateway=make_gateway(),
+            validation_gateway=make_validation_gateway(),
+        )
+
+        file_path, content = node._save_original_content_before_tool(
+            "read_file", {"file_path": "test.py"},
+        )
+
+        assert file_path == ""
+        assert content is None
+
+
+# ── Phase 5.4: 修复上下文结构化 ──────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestStructuredRepairContext:
+    """修复上下文结构化测试。"""
+
+    async def test_extract_structured_errors_basic(self) -> None:
+        """_extract_structured_errors 正确提取单层错误。"""
+        node = ExecutionNode(
+            llm=make_llm(),
+            tool_gateway=make_gateway(),
+            validation_gateway=make_validation_gateway(),
+        )
+        vrs = [
+            ValidationResult(passed=False, errors=[
+                ValidationError(file_path="test.py", line=5, message="SyntaxError"),
+            ]),
+            ValidationResult(passed=True),
+            ValidationResult(passed=True),
+        ]
+        new_errors, pre_existing = node._extract_structured_errors(vrs)
+        assert len(new_errors) == 1
+        assert new_errors[0].file_path == "test.py"
+        assert new_errors[0].line_number == 5
+        assert new_errors[0].message == "SyntaxError"
+        assert new_errors[0].error_type == "syntax"
+        assert len(pre_existing) == 0
+
+    async def test_extract_structured_errors_multiple_layers(self) -> None:
+        """多层验证错误正确映射 error_type。"""
+        node = ExecutionNode(
+            llm=make_llm(),
+            tool_gateway=make_gateway(),
+            validation_gateway=make_validation_gateway(),
+        )
+        vrs = [
+            ValidationResult(passed=False, errors=[
+                ValidationError(file_path="a.py", message="E1"),
+            ]),
+            ValidationResult(passed=False, errors=[
+                ValidationError(file_path="b.py", message="E2"),
+            ]),
+            ValidationResult(passed=False, errors=[
+                ValidationError(file_path="c.py", message="E3"),
+            ]),
+        ]
+        new_errors, _ = node._extract_structured_errors(vrs)
+        assert len(new_errors) == 3
+        assert new_errors[0].error_type == "syntax"
+        assert new_errors[1].error_type == "lint"
+        assert new_errors[2].error_type == "runtime"
+
+    async def test_extract_structured_errors_empty(self) -> None:
+        """空 validation_results 返回空列表。"""
+        node = ExecutionNode(
+            llm=make_llm(),
+            tool_gateway=make_gateway(),
+            validation_gateway=make_validation_gateway(),
+        )
+        new_errors, pre_existing = node._extract_structured_errors([])
+        assert len(new_errors) == 0
+        assert len(pre_existing) == 0
+
+    async def test_extract_handles_mock_validation_result(self) -> None:
+        """兼容 _MockValidationResult 格式。"""
+        node = ExecutionNode(
+            llm=make_llm(),
+            tool_gateway=make_gateway(),
+            validation_gateway=make_validation_gateway(),
+        )
+        vrs = [_MockValidationResult(passed=False, file_path="mock.py", line=3, message="mock error")]  # type: ignore[arg-type]
+        new_errors, _ = node._extract_structured_errors(vrs)
+        assert len(new_errors) == 1
+        assert new_errors[0].file_path == "mock.py"
+        assert new_errors[0].line_number == 3
+        assert "mock error" in new_errors[0].message
+
+    async def test_build_repair_prompt_with_context(self) -> None:
+        """_build_repair_prompt 使用结构化格式。"""
+        state = AgentState(
+            user_request="test", project_root="/root",
+            repair_context=RepairContext(
+                attempt_number=2,
+                errors=[
+                    StructuredError(file_path="bug.py", line_number=10, error_type="syntax", message="invalid syntax"),
+                ],
+            ),
+        )
+        node = ExecutionNode(
+            llm=make_llm(),
+            tool_gateway=make_gateway(),
+            validation_gateway=make_validation_gateway(),
+        )
+        prompt = node._build_repair_prompt(state)
+        assert "修复尝试 #2" in prompt
+        assert "bug.py:10" in prompt
+        assert "invalid syntax" in prompt
+
+    async def test_build_repair_prompt_with_last_fix(self) -> None:
+        """包含 last_fix_summary 时显示上次修复内容。"""
+        state = AgentState(
+            user_request="test", project_root="/root",
+            repair_context=RepairContext(
+                attempt_number=3,
+                errors=[StructuredError(file_path="x.py", message="err")],
+                last_fix_summary="Modified x.py",
+            ),
+        )
+        node = ExecutionNode(
+            llm=make_llm(),
+            tool_gateway=make_gateway(),
+            validation_gateway=make_validation_gateway(),
+        )
+        prompt = node._build_repair_prompt(state)
+        assert "上次修复内容" in prompt
+        assert "Modified x.py" in prompt
+
+    async def test_build_repair_prompt_with_pre_existing(self) -> None:
+        """包含预存在错误时显示请勿修复列表。"""
+        state = AgentState(
+            user_request="test", project_root="/root",
+            repair_context=RepairContext(
+                attempt_number=1,
+                errors=[StructuredError(file_path="x.py", message="new err")],
+                pre_existing_errors=["existing issue in y.py"],
+            ),
+        )
+        node = ExecutionNode(
+            llm=make_llm(),
+            tool_gateway=make_gateway(),
+            validation_gateway=make_validation_gateway(),
+        )
+        prompt = node._build_repair_prompt(state)
+        assert "预存在的错误" in prompt
+        assert "existing issue in y.py" in prompt
+
+    async def test_build_repair_prompt_fallback(self) -> None:
+        """repair_context 为 None 时回退到传统格式。"""
+        state = AgentState(
+            user_request="test", project_root="/root",
+            validation_results=[_MockValidationResult(passed=False)],  # type: ignore[arg-type]
+        )
+        node = ExecutionNode(
+            llm=make_llm(),
+            tool_gateway=make_gateway(),
+            validation_gateway=make_validation_gateway(),
+        )
+        prompt = node._build_repair_prompt(state)
+        assert "FAILED" in prompt or "验证报告" in prompt
+
+    async def test_repair_context_populated_after_repair(self) -> None:
+        """修复模式执行后 repair_context 被填充。"""
+        state = AgentState(
+            user_request="test", project_root="/root",
+            validation_results=[_MockValidationResult(passed=False)],  # type: ignore[arg-type]
+        )
+        llm = AsyncMock(return_value=MockLLMResponse(choices=[MockChoice(
+            message=MockChoiceMessage(content="Fixed"),
+        )]))
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=make_gateway(),
+            validation_gateway=make_validation_gateway(),
+        )
+        result = await node(state)
+        assert "repair_context" in result
+        assert result["repair_context"] is not None
+        assert result["repair_context"].attempt_number == 1
+        assert len(result["repair_context"].errors) >= 1
+
+    async def test_repair_context_attempt_number_increments(self) -> None:
+        """repair_context.attempt_number 继承 retry_count。"""
+        state = AgentState(
+            user_request="test", project_root="/root",
+            validation_results=[_MockValidationResult(passed=False)],  # type: ignore[arg-type]
+            retry_count=2,
+        )
+        llm = AsyncMock(return_value=MockLLMResponse(choices=[MockChoice(
+            message=MockChoiceMessage(content="Fixed"),
+        )]))
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=make_gateway(),
+            validation_gateway=make_validation_gateway(),
+        )
+        result = await node(state)
+        assert result["repair_context"].attempt_number == 3
+
+    async def test_repair_context_inherits_last_fix_summary(self) -> None:
+        """repair_context 继承上一次的 last_fix_summary。"""
+        state = AgentState(
+            user_request="test", project_root="/root",
+            validation_results=[_MockValidationResult(passed=False)],  # type: ignore[arg-type]
+            repair_context=RepairContext(
+                attempt_number=1,
+                errors=[],
+                last_fix_summary="Modified fix.py",
+            ),
+        )
+        llm = AsyncMock(return_value=MockLLMResponse(choices=[MockChoice(
+            message=MockChoiceMessage(content="Repairing again"),
+        )]))
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=make_gateway(),
+            validation_gateway=make_validation_gateway(),
+        )
+        result = await node(state)
+        # 新的 repair_context 应继承上次的 last_fix_summary
+        assert result["repair_context"].last_fix_summary == "Modified fix.py"
+
+    async def test_last_fix_summary_generated_from_tool_calls(self) -> None:
+        """修复模式中的工具调用生成 last_fix_summary。"""
+        state = AgentState(
+            user_request="test", project_root="/root",
+            validation_results=[_MockValidationResult(passed=False)],  # type: ignore[arg-type]
+        )
+        responses = [
+            MockLLMResponse(choices=[MockChoice(
+                message=MockChoiceMessage(
+                    content="Fixing",
+                    tool_calls=[MockToolCall(
+                        id="c1",
+                        function=MockToolCall.Function(
+                            name="write_file",
+                            arguments='{"file_path": "fix.py", "content": "x=1", "mode": "modify"}',
+                        ),
+                    )],
+                )
+            )]),
+            MockLLMResponse(choices=[MockChoice(
+                message=MockChoiceMessage(content="Done"),
+            )]),
+        ]
+        llm = AsyncMock(side_effect=responses)
+        gateway = make_gateway(tool_results=[
+            ToolResult(success=True, data={}),
+        ])
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=gateway,
+            validation_gateway=make_validation_gateway(),
+        )
+        result = await node(state)
+        assert result["repair_context"].last_fix_summary is not None
+        assert "fix.py" in result["repair_context"].last_fix_summary
+
+
+# ── Phase 5.5: LLM 成本控制 ──────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestLLMCostControl:
+    """LLM 成本控制测试。"""
+
+    async def test_limit_reached_sets_human_review(self, mocker) -> None:
+        """达到 LLM 调用上限时设置 human_review_required。"""
+        mocker.patch(
+            "codeagent.orchestration.nodes.execution_node.codeagent_config.get_max_llm_calls_per_task",
+            return_value=3,
+        )
+        state = AgentState(
+            user_request="test", project_root="/root",
+            llm_call_count=3,
+        )
+        node = ExecutionNode(
+            llm=make_llm(),
+            tool_gateway=make_gateway(),
+            validation_gateway=make_validation_gateway(),
+        )
+        result = await node._call_llm_with_limit(
+            state=state,
+            messages=[{"role": "user", "content": "hello"}],
+            tools=None,
+            tool_choice=None,
+        )
+        assert result is None
+        assert state.human_review_required is True
+        assert state.review_type == "cost_limit_reached"
+        assert state.review_request is not None
+        assert "LLM 调用次数" in state.review_request.get("title", "")
+
+    async def test_normal_call_increments_counter(self, mocker) -> None:
+        """正常 LLM 调用后 llm_call_count 递增。"""
+        mocker.patch(
+            "codeagent.orchestration.nodes.execution_node.codeagent_config.get_max_llm_calls_per_task",
+            return_value=50,
+        )
+        state = AgentState(
+            user_request="test", project_root="/root",
+            llm_call_count=0,
+        )
+        llm = AsyncMock(return_value=MockLLMResponse(choices=[MockChoice(
+            message=MockChoiceMessage(content="Hello"),
+        )]))
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=make_gateway(),
+            validation_gateway=make_validation_gateway(),
+        )
+        result = await node._call_llm_with_limit(
+            state=state,
+            messages=[{"role": "user", "content": "hello"}],
+            tools=None,
+            tool_choice=None,
+        )
+        assert result is not None
+        assert state.llm_call_count == 1
+        llm.assert_called_once()
+
+    async def test_cross_round_accumulation(self, mocker) -> None:
+        """llm_call_count 跨多轮累计。"""
+        mocker.patch(
+            "codeagent.orchestration.nodes.execution_node.codeagent_config.get_max_llm_calls_per_task",
+            return_value=50,
+        )
+        state = AgentState(
+            user_request="test", project_root="/root",
+        )
+        llm = AsyncMock(return_value=MockLLMResponse(choices=[MockChoice(
+            message=MockChoiceMessage(content="Hello"),
+        )]))
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=make_gateway(),
+            validation_gateway=make_validation_gateway(),
+        )
+        # 第一次调用
+        await node._call_llm_with_limit(
+            state=state,
+            messages=[{"role": "user", "content": "hi"}],
+            tools=None, tool_choice=None,
+        )
+        assert state.llm_call_count == 1
+
+        # 第二次调用
+        await node._call_llm_with_limit(
+            state=state,
+            messages=[{"role": "user", "content": "hi"}],
+            tools=None, tool_choice=None,
+        )
+        assert state.llm_call_count == 2
+
+        # 第三次调用
+        await node._call_llm_with_limit(
+            state=state,
+            messages=[{"role": "user", "content": "hi"}],
+            tools=None, tool_choice=None,
+        )
+        assert state.llm_call_count == 3
+
+    async def test_limit_respected_in_direct_mode(self, mocker) -> None:
+        """直连模式中达到调用上限时不再调用 LLM。"""
+        mocker.patch(
+            "codeagent.orchestration.nodes.execution_node.codeagent_config.get_max_llm_calls_per_task",
+            return_value=2,
+        )
+        state = AgentState(
+            user_request="test", project_root="/root",
+            llm_call_count=2,  # 已达上限
+        )
+        llm = AsyncMock()
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=make_gateway(),
+            validation_gateway=make_validation_gateway(),
+        )
+        result = await node(state)
+        # LLM 不应被调用（达到上限后立即 break）
+        llm.assert_not_called()
+        assert "execution_log" in result
+
+    async def test_zero_max_calls_triggers_limit(self, mocker) -> None:
+        """max_llm_calls=0 时立即触发限制。"""
+        mocker.patch(
+            "codeagent.orchestration.nodes.execution_node.codeagent_config.get_max_llm_calls_per_task",
+            return_value=0,
+        )
+        state = AgentState(
+            user_request="test", project_root="/root",
+        )
+        llm = AsyncMock()
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=make_gateway(),
+            validation_gateway=make_validation_gateway(),
+        )
+        result = await node(state)
+        assert state.human_review_required is True
+        llm.assert_not_called()
+        assert "execution_log" in result

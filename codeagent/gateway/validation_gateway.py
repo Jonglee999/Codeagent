@@ -34,12 +34,14 @@ class ValidationResult:
         errors: 错误列表
         warnings: 警告列表
         duration_ms: 验证耗时（毫秒）
+        sandboxed: 是否在沙箱中执行验证
     """
 
     passed: bool = True
     errors: list[ValidationError] = field(default_factory=list)
     warnings: list[ValidationError] = field(default_factory=list)
     duration_ms: float = 0.0
+    sandboxed: bool = False
 
 
 class IValidationGateway(ABC):

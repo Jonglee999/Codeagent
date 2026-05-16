@@ -5,8 +5,10 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -148,6 +150,11 @@ class TestRunTypeCheck:
 @pytest.mark.asyncio
 class TestSecurityScan:
     """安全扫描相关测试。"""
+
+    @pytest.fixture(autouse=True)
+    def _disable_bandit(self, analyzer: StaticAnalyzer, mocker):
+        """确保正则测试不受 bandit 影响。"""
+        mocker.patch.object(analyzer, "_run_bandit", return_value=None)
 
     async def test_detect_eval(self, analyzer: StaticAnalyzer, tmp_path: Path) -> None:
         """检测 eval() 调用。"""
@@ -393,3 +400,158 @@ class TestPathHandling:
         result = await analyzer.run_lint(["/tmp/__nonexistent_test_file__.py"])
         assert result.duration_ms >= 0
         # ruff 会返回一个错误信息，但不会 crash
+
+
+# ── Tests: bandit 集成 ──────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestBanditIntegration:
+    """bandit 安全扫描集成测试。"""
+
+    async def test_bandit_clean_file(self, analyzer: StaticAnalyzer, mocker, tmp_path: Path) -> None:
+        """bandit 可用时扫描无问题文件。"""
+        mocker.patch("shutil.which", return_value="/usr/bin/bandit")
+        mock_run = mocker.patch("codeagent.validation.static_analyzer._run_subprocess")
+        mock_run.return_value = mocker.Mock(
+            returncode=0,
+            stdout='{"results": []}',
+            stderr="",
+        )
+        f = tmp_path / "clean.py"
+        f.write_text("x = 1\n")
+        result = await analyzer.run_security_scan([str(f)])
+        assert result.passed is True
+        mock_run.assert_called_once()
+
+    async def test_bandit_high_severity(self, analyzer: StaticAnalyzer, mocker, tmp_path: Path) -> None:
+        """bandit 检测到 HIGH 级别问题 → errors。"""
+        mocker.patch("shutil.which", return_value="/usr/bin/bandit")
+        mock_run = mocker.patch("codeagent.validation.static_analyzer._run_subprocess")
+        mock_run.return_value = mocker.Mock(
+            returncode=1,
+            stdout=json.dumps({
+                "results": [{
+                    "filename": str(tmp_path / "test.py"),
+                    "line_number": 5,
+                    "issue_severity": "HIGH",
+                    "issue_text": "Use of exec detected.",
+                    "test_id": "B102",
+                }],
+            }),
+            stderr="",
+        )
+        f = tmp_path / "test.py"
+        f.write_text("exec('test')\n")
+        result = await analyzer.run_security_scan([str(f)])
+        assert not result.passed
+        assert len(result.errors) == 1
+        assert len(result.warnings) == 0
+        assert result.errors[0].code == "B102"
+        assert result.errors[0].line == 5
+
+    async def test_bandit_medium_severity(self, analyzer: StaticAnalyzer, mocker, tmp_path: Path) -> None:
+        """bandit 检测到 MEDIUM 级别问题 → warnings。"""
+        mocker.patch("shutil.which", return_value="/usr/bin/bandit")
+        mock_run = mocker.patch("codeagent.validation.static_analyzer._run_subprocess")
+        mock_run.return_value = mocker.Mock(
+            returncode=1,
+            stdout=json.dumps({
+                "results": [{
+                    "filename": str(tmp_path / "test.py"),
+                    "line_number": 10,
+                    "issue_severity": "MEDIUM",
+                    "issue_text": "Possible hardcoded password.",
+                    "test_id": "B105",
+                }],
+            }),
+            stderr="",
+        )
+        f = tmp_path / "test.py"
+        f.write_text("password = 'secret'\n")
+        result = await analyzer.run_security_scan([str(f)])
+        assert result.passed is True  # MEDIUM → warnings, not errors
+        assert len(result.errors) == 0
+        assert len(result.warnings) == 1
+        assert result.warnings[0].code == "B105"
+
+    async def test_bandit_low_severity_ignored(self, analyzer: StaticAnalyzer, mocker, tmp_path: Path) -> None:
+        """bandit LOW 级别问题被忽略。"""
+        mocker.patch("shutil.which", return_value="/usr/bin/bandit")
+        mock_run = mocker.patch("codeagent.validation.static_analyzer._run_subprocess")
+        mock_run.return_value = mocker.Mock(
+            returncode=1,
+            stdout=json.dumps({
+                "results": [{
+                    "filename": str(tmp_path / "test.py"),
+                    "line_number": 15,
+                    "issue_severity": "LOW",
+                    "issue_text": "Consider security implications.",
+                    "test_id": "B199",
+                }],
+            }),
+            stderr="",
+        )
+        f = tmp_path / "test.py"
+        f.write_text("x = 1\n")
+        result = await analyzer.run_security_scan([str(f)])
+        assert result.passed is True
+        assert len(result.errors) == 0
+        assert len(result.warnings) == 0
+
+    async def test_bandit_not_available_fallback(self, analyzer: StaticAnalyzer, mocker, tmp_path: Path) -> None:
+        """bandit 不可用时降级为正则检测。"""
+        mocker.patch("shutil.which", return_value=None)
+        f = tmp_path / "test.py"
+        f.write_text("result = eval('x + 1')\n")
+        result = await analyzer.run_security_scan([str(f)])
+        assert not result.passed  # regex 应检测到 eval
+        assert any(e.code == "SEC_EVAL" for e in result.errors)
+
+    async def test_bandit_returncode_2_fallback(self, analyzer: StaticAnalyzer, mocker, tmp_path: Path) -> None:
+        """bandit 返回码 2（自身错误）时降级为正则。"""
+        mocker.patch("shutil.which", return_value="/usr/bin/bandit")
+        mock_run = mocker.patch("codeagent.validation.static_analyzer._run_subprocess")
+        mock_run.return_value = mocker.Mock(returncode=2, stdout="", stderr="error")
+        f = tmp_path / "test.py"
+        f.write_text("result = eval('x + 1')\n")
+        result = await analyzer.run_security_scan([str(f)])
+        assert not result.passed  # 降级为正则后检测到 eval
+        assert any(e.code == "SEC_EVAL" for e in result.errors)
+
+    async def test_bandit_json_parse_error_fallback(self, analyzer: StaticAnalyzer, mocker, tmp_path: Path) -> None:
+        """bandit JSON 解析失败时降级为正则。"""
+        mocker.patch("shutil.which", return_value="/usr/bin/bandit")
+        mock_run = mocker.patch("codeagent.validation.static_analyzer._run_subprocess")
+        mock_run.return_value = mocker.Mock(returncode=0, stdout="invalid json", stderr="")
+        f = tmp_path / "test.py"
+        f.write_text("result = eval('x + 1')\n")
+        result = await analyzer.run_security_scan([str(f)])
+        assert not result.passed  # 降级为正则后检测到 eval
+        assert any(e.code == "SEC_EVAL" for e in result.errors)
+
+    async def test_bandit_timeout_fallback(self, analyzer: StaticAnalyzer, mocker, tmp_path: Path) -> None:
+        """bandit 超时时降级为正则。"""
+        mocker.patch("shutil.which", return_value="/usr/bin/bandit")
+        mocker.patch(
+            "codeagent.validation.static_analyzer._run_subprocess",
+            side_effect=subprocess.TimeoutExpired(cmd=["bandit"], timeout=60),
+        )
+        f = tmp_path / "test.py"
+        f.write_text("result = eval('x + 1')\n")
+        result = await analyzer.run_security_scan([str(f)])
+        assert not result.passed  # 降级为正则后检测到 eval
+        assert any(e.code == "SEC_EVAL" for e in result.errors)
+
+    async def test_bandit_file_not_found_fallback(self, analyzer: StaticAnalyzer, mocker, tmp_path: Path) -> None:
+        """bandit 命令文件不存在时降级为正则。"""
+        mocker.patch("shutil.which", return_value="/usr/bin/bandit")
+        mocker.patch(
+            "codeagent.validation.static_analyzer._run_subprocess",
+            side_effect=FileNotFoundError,
+        )
+        f = tmp_path / "test.py"
+        f.write_text("result = eval('x + 1')\n")
+        result = await analyzer.run_security_scan([str(f)])
+        assert not result.passed  # 降级为正则后检测到 eval
+        assert any(e.code == "SEC_EVAL" for e in result.errors)

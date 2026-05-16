@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, PropertyMock
 import pytest
 
 from codeagent.gateway.validation_gateway import ValidationResult
+from codeagent.sandbox.docker_executor import ExecutionResult
 from codeagent.validation.error_analyzer import FixSuggestion
 from codeagent.validation.runtime_validator import RuntimeValidator
 from codeagent.validation.test_detector import TestFrameworkInfo
@@ -434,7 +435,75 @@ class TestAnalyzeFailures:
         assert suggestions == []
 
 
-# ── 边界情况 ──────────────────────────────────────────────────────────────
+# ── DockerExecutor 集成 ────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestDockerExecutorIntegration:
+    """DockerExecutor 集成测试。"""
+
+    async def test_run_tests_with_executor_sandboxed(
+        self, mock_test_detector, mocker
+    ) -> None:
+        """使用 DockerExecutor 时 sandboxed=True。"""
+        mock_test_detector.detect.return_value = _make_framework_info()
+
+        mock_executor = mocker.AsyncMock()
+        mock_executor.is_available.return_value = True
+        mock_executor.run_tests.return_value = ExecutionResult(
+            stdout="=== 3 passed in 0.10s ===",
+            stderr="",
+            exit_code=0,
+            duration_ms=100,
+            sandboxed=True,
+        )
+
+        validator = RuntimeValidator("/tmp/project", executor=mock_executor)
+        result = await validator.run_tests()
+
+        assert result.passed is True
+        assert result.sandboxed is True
+        mock_executor.run_tests.assert_called_once()
+
+    async def test_run_tests_executor_unavailable_fallback(
+        self, mock_test_detector, mocker
+    ) -> None:
+        """DockerExecutor 不可用时降级到 subprocess。"""
+        mock_test_detector.detect.return_value = _make_framework_info()
+
+        mock_executor = mocker.AsyncMock()
+        mock_executor.is_available.return_value = False
+
+        mock_proc = MagicMock()
+        mock_proc.returncode = 0
+        mock_proc.stdout = "=== 3 passed in 0.10s ==="
+        mock_proc.stderr = ""
+        mocker.patch(
+            "codeagent.validation.runtime_validator._run_subprocess",
+            return_value=mock_proc,
+        )
+
+        validator = RuntimeValidator("/tmp/project", executor=mock_executor)
+        result = await validator.run_tests()
+
+        assert result.passed is True
+        assert result.sandboxed is False
+
+    async def test_executor_injection_no_error(
+        self, mock_test_detector, mocker
+    ) -> None:
+        """注入 executor 不导致错误。"""
+        mock_test_detector.detect.return_value = _make_framework_info(
+            framework=None,
+        )
+
+        mock_executor = mocker.AsyncMock()
+        validator = RuntimeValidator("/tmp/project", executor=mock_executor)
+        result = await validator.run_tests()
+
+        # 无测试框架时不会调用 executor
+        assert result.passed is True
+        mock_executor.run_tests.assert_not_called()
 
 
 @pytest.mark.asyncio

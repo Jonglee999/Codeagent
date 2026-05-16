@@ -41,6 +41,7 @@ from codeagent.interaction.cli.formatters import (
     make_progress,
 )
 from codeagent.orchestration.nodes.execution_node import ExecutionNode
+from codeagent.orchestration.rollback import RollbackManager
 from codeagent.orchestration.state import AgentState
 from codeagent.tools.file.read_file import ReadFileTool
 from codeagent.tools.file.write_file import WriteFileTool
@@ -172,6 +173,12 @@ def cli() -> None:
     show_default=True,
 )
 @click.option(
+    "--max-llm-calls",
+    type=int,
+    default=None,
+    help="Max LLM calls per task (from env MAX_LLM_CALLS_PER_TASK or 50)",
+)
+@click.option(
     "--model",
     default=None,
     help="LLM model name (default: from LLM_MODEL env or deepseek/deepseek-v4-flash)",
@@ -200,6 +207,7 @@ def ask(
     project: str,
     auto: bool,
     max_retries: int,
+    max_llm_calls: int | None,
     model: str | None,
     verbose: bool,
     json_output: bool,
@@ -214,6 +222,9 @@ def ask(
     """
     request = " ".join(request_text)
     project_root = str(Path(project).resolve())
+
+    if max_llm_calls is not None:
+        os.environ["MAX_LLM_CALLS_PER_TASK"] = str(max_llm_calls)
 
     if not Path(project_root).is_dir():
         raise click.ClickException(f"Project directory not found: {project_root}")
@@ -329,7 +340,80 @@ def ask(
     # 最终报告
     console.print()
     console.print(format_final_report(request, summary, execution_log, errors, total_duration))
+    if not json_output:
+        llm_call_count = state.llm_call_count
+        if llm_call_count > 0:
+            console.print(f"  LLM 调用次数: {llm_call_count}")
     console.print()
+
+    # ── Rollback: 执行完成后检查是否可回滚 ────────────────
+    accumulated_changes: list[dict] = result.get("accumulated_changes", [])
+    if accumulated_changes and not json_output and not auto:
+        try:
+            _handle_rollback_interactive(accumulated_changes)
+        except Exception as e:
+            logger.warning("Rollback handler error: %s", e)
+
+
+def _handle_rollback_interactive(accumulated_changes: list[dict]) -> None:
+    """交互式回滚处理 — 在 ask 命令执行完成后提供回滚选项。
+
+    Args:
+        accumulated_changes: 累计修改记录列表
+    """
+    from rich.prompt import Confirm, Prompt
+
+    prompt_msg = (
+        f"[bold]任务执行完成，共 {len(accumulated_changes)} 个文件变更。"
+        "输入 /rollback 查看回滚选项，或直接回车跳过。[/bold]"
+    )
+    console.print(prompt_msg)
+
+    user_input = Prompt.ask("")
+    if not user_input or not user_input.startswith("/rollback"):
+        return
+
+    parts = user_input.split()
+    step_id: int | None = None
+    if len(parts) > 1:
+        try:
+            step_id = int(parts[1])
+        except ValueError:
+            console.print("[yellow]无效的步骤编号，将回滚全部。[/yellow]")
+
+    manager = RollbackManager()
+    state = AgentState(
+        user_request="",
+        project_root="",
+        accumulated_changes=accumulated_changes,
+    )
+
+    # 展示回滚预览
+    preview = manager.get_rollback_preview(state, step_id)
+    console.print(preview)
+
+    # 确认后执行
+    if Confirm.ask("确认执行回滚？"):
+        if step_id is not None:
+            result = manager.rollback_step(state, step_id)
+        else:
+            result = manager.rollback_all(state)
+
+        if result.success:
+            console.print(
+                f"[green]回滚完成：恢复 {len(result.restored_files)} 个文件，"
+                f"删除 {len(result.deleted_files)} 个文件[/green]"
+            )
+        else:
+            console.print(
+                f"[yellow]回滚部分完成：恢复 {len(result.restored_files)} 个文件，"
+                f"删除 {len(result.deleted_files)} 个文件，"
+                f"{len(result.errors)} 个错误[/yellow]"
+            )
+            for err in result.errors:
+                console.print(f"  [red]- {err}[/red]")
+    else:
+        console.print("[yellow]回滚已取消。[/yellow]")
 
 
 def _display_entry(entry: dict[str, Any], project_root: str) -> None:

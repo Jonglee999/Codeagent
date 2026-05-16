@@ -38,6 +38,45 @@ class PlanStep:
     dependencies: list[int] = field(default_factory=list)
 
 
+# ── Phase 5.4: 修复上下文 ──────────────────────────────────
+
+
+@dataclass
+class StructuredError:
+    """单个结构化错误/警告项。
+
+    Attributes:
+        file_path: 文件路径
+        line_number: 行号（可选）
+        error_type: 错误类型（syntax/lint/test/runtime）
+        message: 错误消息
+        is_pre_existing: 是否为预存在的错误（无需修复）
+    """
+
+    file_path: str = ""
+    line_number: int | None = None
+    error_type: Literal["syntax", "lint", "test", "runtime"] = "syntax"
+    message: str = ""
+    is_pre_existing: bool = False
+
+
+@dataclass
+class RepairContext:
+    """修复上下文，跟踪修复尝试的状态。
+
+    Attributes:
+        attempt_number: 当前修复尝试次数（从 1 开始）
+        errors: 需要修复的结构化错误列表（非 pre_existing）
+        pre_existing_errors: 预存在的错误描述列表（无需修复）
+        last_fix_summary: 上次修复的内容摘要（防止 LLM 重复）
+    """
+
+    attempt_number: int = 0
+    errors: list[StructuredError] = field(default_factory=list)
+    pre_existing_errors: list[str] = field(default_factory=list)
+    last_fix_summary: str | None = None
+
+
 # ── Agent 状态 ──────────────────────────────────────────────
 
 
@@ -98,3 +137,10 @@ class AgentState:
     human_review_required: bool = False           # 是否需要人工审核
     review_request: dict | None = None            # 当前审核请求详情
     review_type: str | None = None                # 审核触发类型
+
+    # ── Phase 5.4 新增字段 ────────────────────────────────────
+    repair_context: RepairContext | None = None    # 修复上下文（结构化）
+
+    # ── Phase 5.5 新增字段 ────────────────────────────────────
+    llm_call_count: int = 0              # 当前任务已调用 LLM 次数
+    estimated_tokens: int = 0            # 当前任务估算 token 消耗
