@@ -91,6 +91,19 @@ class ValidationNode:
             sum(1 for v in layers_status.values() if v), len(layers_status),
         )
 
+        # Phase 7.6: 记录验证结果到轨迹
+        trajectory_steps = list(state.trajectory_steps)
+        trajectory_steps.append({
+            "node_name": "validation",
+            "step_type": "validation",
+            "file_count": len(file_paths),
+            "layers_passed": sum(1 for v in layers_status.values() if v),
+            "layers_total": len(layers_status),
+            "validation_passed": all(r.passed for _, r in layers),
+            "duration_ms": int(total_duration),
+            "fix_suggestion_count": len(fix_suggestions),
+        })
+
         return {
             "validation_results": validation_results,
             "fix_suggestions": fix_suggestions,
@@ -103,6 +116,7 @@ class ValidationNode:
                     "timestamp": time.time(),
                 },
             ],
+            "trajectory_steps": trajectory_steps,
         }
 
     # ── 文件收集 ──────────────────────────────────────────────────

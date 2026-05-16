@@ -160,6 +160,7 @@ class ExecutionNode:
         deviation_detected = state.deviation_detected
         human_review_required = state.human_review_required
         review_request = state.review_request
+        trajectory_steps: list[dict] = list(state.trajectory_steps)
 
         tool_definitions = self._tool_gateway.list_tools()
         memory_section = await self._assemble_memory_section(state)
@@ -196,7 +197,7 @@ class ExecutionNode:
             ]
 
             # 执行该步骤的工具调用循环（含偏离检测）
-            step_result, step_deviation_count, step_human_review, step_review_request = (
+            step_result, step_deviation_count, step_human_review, step_review_request, step_trajectory_steps = (
                 await self._execute_step_tool_loop(
                     state=state,
                     step=step,
@@ -212,6 +213,8 @@ class ExecutionNode:
 
             if step_result is not None:
                 accumulated_changes = step_result
+
+            trajectory_steps.extend(step_trajectory_steps)
 
             deviation_count = step_deviation_count
             if step_human_review:
@@ -259,6 +262,7 @@ class ExecutionNode:
             "deviation_count": deviation_count,
             "human_review_required": human_review_required,
             "review_request": review_request,
+            "trajectory_steps": trajectory_steps,
         }
 
     def _build_step_prompt(
@@ -341,12 +345,15 @@ class ExecutionNode:
         accumulated_changes: list[dict],
         deviation_count: int = 0,
         remaining_descriptions: list[str] | None = None,
+        trajectory_steps: list[dict] | None = None,
     ) -> tuple[list[dict] | None, int, bool, dict | None]:
         """执行单个步骤的 tool calling 循环（含偏离检测）。
 
         Returns:
             tuple[accumulated_changes, deviation_count, human_review_required, review_request]
         """
+        if trajectory_steps is None:
+            trajectory_steps = []
         tool_call_count = 0
         syntax_retries = 0
         pending_syntax_check: str | None = None
@@ -478,7 +485,7 @@ class ExecutionNode:
                                 f"执行已暂停，需要人工审核。"
                             ),
                         })
-                        return accumulated_changes, deviation_count, human_review_required, review_request
+                        return accumulated_changes, deviation_count, human_review_required, review_request, trajectory_steps
                     elif deviation_count >= _DEVIATION_UPGRADE_LIMIT:
                         # 连续 2 次 → 升级警告（收集，在 tool 结果后追加）
                         pending_deviation_warnings.append({
@@ -540,6 +547,17 @@ class ExecutionNode:
                     )
 
                 execution_log.append(log_entry)
+
+                # Phase 7.6: 记录工具调用到轨迹
+                trajectory_steps.append({
+                    "node_name": "execution",
+                    "step_type": "tool_call",
+                    "step_id": step.step_id,
+                    "tool_name": tool_name,
+                    "tool_args_summary": json.dumps(tool_args, ensure_ascii=False)[:100],
+                    "success": tool_result.success,
+                    "duration_ms": elapsed,
+                })
 
                 # 添加工具结果到消息
                 result_content = (
@@ -604,7 +622,7 @@ class ExecutionNode:
             if tool_call_count >= self._max_tool_calls:
                 break
 
-        return accumulated_changes, deviation_count, human_review_required, review_request
+        return accumulated_changes, deviation_count, human_review_required, review_request, trajectory_steps
 
     # ── Phase 3.5 偏离检测 ────────────────────────────────────
 
@@ -685,6 +703,7 @@ class ExecutionNode:
         execution_log: list[dict] = list(state.execution_log)
         errors: list[str] = list(state.errors)
         accumulated_changes: list[dict] = list(state.accumulated_changes)
+        trajectory_steps: list[dict] = list(state.trajectory_steps)
 
         # ── Phase 5.4: 构建修复上下文 ──────────────────────────
         new_errors, pre_existing = self._extract_structured_errors(state.validation_results)
@@ -829,6 +848,18 @@ class ExecutionNode:
 
                 execution_log.append(log_entry)
 
+                # Phase 7.6: 记录修复工具调用到轨迹
+                trajectory_steps.append({
+                    "node_name": "execution",
+                    "step_type": "tool_call",
+                    "step_id": -1,
+                    "tool_name": tool_name,
+                    "tool_args_summary": json.dumps(tool_args, ensure_ascii=False)[:100],
+                    "success": tool_result.success,
+                    "duration_ms": tool_result.duration_ms,
+                    "repair_mode": True,
+                })
+
                 result_content = (
                     json.dumps(tool_result.data, ensure_ascii=False)
                     if tool_result.success
@@ -919,6 +950,8 @@ class ExecutionNode:
             "accumulated_changes": accumulated_changes,
             "retry_count": new_retry_count,
             "repair_context": ctx,
+            "trajectory_steps": trajectory_steps,
+            "repair_rounds": state.repair_rounds + 1,
         }
 
     def _format_validation_report(
@@ -1060,6 +1093,7 @@ class ExecutionNode:
         start_time = time.monotonic()
         execution_log: list[dict] = []
         errors: list[str] = list(state.errors)
+        trajectory_steps: list[dict] = list(state.trajectory_steps)
 
         tool_definitions = self._tool_gateway.list_tools()
         memory_section = await self._assemble_memory_section(state)
@@ -1179,6 +1213,17 @@ class ExecutionNode:
 
                 execution_log.append(log_entry)
 
+                # Phase 7.6: 记录工具调用到轨迹
+                trajectory_steps.append({
+                    "node_name": "execution",
+                    "step_type": "tool_call",
+                    "step_id": 0,
+                    "tool_name": tool_name,
+                    "tool_args_summary": json.dumps(tool_args, ensure_ascii=False)[:100],
+                    "success": tool_result.success,
+                    "duration_ms": elapsed,
+                })
+
                 result_content = (
                     json.dumps(tool_result.data, ensure_ascii=False)
                     if tool_result.success
@@ -1227,6 +1272,7 @@ class ExecutionNode:
         return {
             "execution_log": execution_log,
             "errors": errors,
+            "trajectory_steps": trajectory_steps,
         }
 
     # ── 语法检查 ──────────────────────────────────────────────

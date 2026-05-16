@@ -10,6 +10,7 @@ import json
 import logging
 from typing import Any, Callable, Optional
 
+from codeagent.context_engine.evolution.strategy_applier import StrategyApplier
 from codeagent.gateway.memory_gateway import IMemoryGateway
 from codeagent.orchestration.state import AgentState, PlanStep
 
@@ -132,6 +133,7 @@ class PlanningNode:
         model_name: str = "deepseek/deepseek-v4-flash",
         max_retries: int = _MAX_RETRIES,
         memory_gateway: Optional[IMemoryGateway] = None,
+        strategy_applier: Optional[StrategyApplier] = None,
     ) -> None:
         """初始化 PlanningNode。
 
@@ -140,11 +142,14 @@ class PlanningNode:
             model_name: 模型名称
             max_retries: JSON 解析失败重试次数
             memory_gateway: 记忆系统 Gateway，None 时跳过记忆检索
+            strategy_applier: StrategyApplier 实例，None 时不注入策略
         """
         self._llm = llm
         self._model_name = model_name
         self._max_retries = max_retries
         self._memory_gateway = memory_gateway
+        self._strategy_applier = strategy_applier
+        self._current_strategy_ids: list[str] = []
 
     async def __call__(self, state: AgentState) -> dict[str, Any]:
         """执行规划。
@@ -161,6 +166,11 @@ class PlanningNode:
         memory_section = await self._assemble_memory_section(state)
         if memory_section:
             prompt = f"{prompt}\n\n{memory_section}"
+
+        # Phase 7.4: 注入相关策略到 System Prompt（在 Memory 层之后）
+        strategy_section = await self._assemble_strategy_section(state)
+        if strategy_section:
+            prompt = f"{prompt}\n\n{strategy_section}"
 
         messages: list[dict[str, str]] = [
             {"role": "system", "content": prompt},
@@ -222,11 +232,13 @@ class PlanningNode:
                 return {
                     "plan": steps,
                     "original_goal_summary": original_goal_summary,
+                    "applied_strategy_ids": list(self._current_strategy_ids),
                     "execution_log": [{
                         "type": "plan_generated",
                         "steps": len(steps),
                         "conflicts": conflicts or None,
                         "original_goal_summary": original_goal_summary or None,
+                        "strategy_ids": list(self._current_strategy_ids) or None,
                     }],
                 }
 
@@ -303,6 +315,37 @@ class PlanningNode:
             return f"## Relevant Memories\n\n{memory_xml}"
         except Exception as exc:
             logger.warning("Memory recall failed in PlanningNode (non-blocking): %s", exc)
+            return ""
+
+    # ── Phase 7.4: 策略注入 ─────────────────────────────────
+
+    async def _assemble_strategy_section(self, state: AgentState) -> str:
+        """检索相关策略并组装为 System Prompt 的 Strategy 层。
+
+        在 Memory 层之后注入，格式为 XML 块。
+        记录已应用的策略 ID 供后续效果追踪。
+
+        Args:
+            state: Agent 状态（使用 user_request 作为查询）
+
+        Returns:
+            "## Relevant Strategies\n\n{strategy_xml}" 或 ""
+        """
+        if not self._strategy_applier:
+            return ""
+
+        try:
+            strategies = await self._strategy_applier.get_relevant_strategies(
+                task_description=state.user_request,
+            )
+            if not strategies:
+                return ""
+
+            strategy_xml = self._strategy_applier.format_for_prompt(strategies)
+            self._current_strategy_ids = [s.strategy_id for s in strategies]
+            return f"## Relevant Strategies\n\n{strategy_xml}"
+        except Exception as exc:
+            logger.warning("Strategy assembly failed in PlanningNode (non-blocking): %s", exc)
             return ""
 
     def _format_tree_for_prompt(

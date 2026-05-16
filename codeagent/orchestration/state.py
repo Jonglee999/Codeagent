@@ -147,3 +147,10 @@ class AgentState:
 
     # ── Phase 6.6 新增字段 ────────────────────────────────────
     memory_extracted: bool = False       # 防止重复提取记忆
+
+    # ── Phase 7.1 自进化系统字段 ──────────────────────────────
+    task_id: str = ""                          # 当前任务 ID（UUID）
+    trajectory_steps: list[dict] = field(default_factory=list)  # 轨迹步骤缓存
+    repair_rounds: int = 0                     # 当前任务修复轮数
+    applied_strategy_ids: list[str] = field(default_factory=list)  # 应用的策略 ID
+    evolution_enabled: bool = True             # 是否启用自进化

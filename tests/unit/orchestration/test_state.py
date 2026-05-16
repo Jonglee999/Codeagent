@@ -270,6 +270,63 @@ class TestAgentStatePhase35Fields:
         assert len(state.conversation_history) == 2
 
 
+class TestAgentStatePhase7Fields:
+    """Phase 7 自进化系统字段测试。"""
+
+    def test_task_id_default(self) -> None:
+        state = AgentState(user_request="req", project_root="/root")
+        assert state.task_id == ""
+        assert isinstance(state.task_id, str)
+
+    def test_task_id_assignment(self) -> None:
+        state = AgentState(user_request="req", project_root="/root")
+        state.task_id = "550e8400-e29b-41d4-a716-446655440000"
+        assert state.task_id == "550e8400-e29b-41d4-a716-446655440000"
+
+    def test_trajectory_steps_default(self) -> None:
+        state = AgentState(user_request="req", project_root="/root")
+        assert state.trajectory_steps == []
+        assert isinstance(state.trajectory_steps, list)
+
+    def test_trajectory_steps_append(self) -> None:
+        state = AgentState(user_request="req", project_root="/root")
+        step = {"node_name": "execution", "step_type": "tool_call", "tool_name": "read_file"}
+        state.trajectory_steps.append(step)
+        assert len(state.trajectory_steps) == 1
+        assert state.trajectory_steps[0]["tool_name"] == "read_file"
+
+    def test_repair_rounds_default(self) -> None:
+        state = AgentState(user_request="req", project_root="/root")
+        assert state.repair_rounds == 0
+
+    def test_repair_rounds_increment(self) -> None:
+        state = AgentState(user_request="req", project_root="/root")
+        state.repair_rounds += 1
+        assert state.repair_rounds == 1
+        state.repair_rounds += 1
+        assert state.repair_rounds == 2
+
+    def test_applied_strategy_ids_default(self) -> None:
+        state = AgentState(user_request="req", project_root="/root")
+        assert state.applied_strategy_ids == []
+        assert isinstance(state.applied_strategy_ids, list)
+
+    def test_applied_strategy_ids_assignment(self) -> None:
+        state = AgentState(user_request="req", project_root="/root")
+        state.applied_strategy_ids = ["s1", "s2"]
+        assert len(state.applied_strategy_ids) == 2
+        assert "s1" in state.applied_strategy_ids
+
+    def test_evolution_enabled_default(self) -> None:
+        state = AgentState(user_request="req", project_root="/root")
+        assert state.evolution_enabled is True
+
+    def test_evolution_enabled_disable(self) -> None:
+        state = AgentState(user_request="req", project_root="/root")
+        state.evolution_enabled = False
+        assert state.evolution_enabled is False
+
+
 class TestAgentStateFullConstruction:
     """完整构造测试。"""
 

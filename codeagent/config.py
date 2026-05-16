@@ -133,3 +133,21 @@ def get_sandbox_memory_mb() -> int:
     从 SANDBOX_MEMORY_MB 环境变量读取，默认 512 MB。
     """
     return int(get_env("SANDBOX_MEMORY_MB", "512"))
+
+
+# ── 自进化系统配置（Phase 7.1） ────────────────────────────────
+
+
+def get_evolution_enabled() -> bool:
+    """是否启用自进化机制，默认 True。"""
+    return get_env("EVOLUTION_ENABLED", "true").lower() == "true"
+
+
+def get_trajectory_base_path() -> str:
+    """轨迹存储路径，默认 .codeagent/trajectories/。"""
+    return get_env("TRAJECTORY_BASE_PATH", ".codeagent/trajectories")
+
+
+def get_strategy_base_path() -> str:
+    """策略存储路径，默认 .codeagent/strategies/。"""
+    return get_env("STRATEGY_BASE_PATH", ".codeagent/strategies")

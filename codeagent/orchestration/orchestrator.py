@@ -8,11 +8,12 @@ from __future__ import annotations
 import logging
 import time
 import uuid
-from typing import Any
+from typing import Any, Optional
 
+from codeagent.context_engine.evolution import SelfEvolutionManager
 from codeagent.gateway.tool_gateway import IToolGateway
 from codeagent.gateway.validation_gateway import IValidationGateway
-from codeagent.orchestration.graph import build_workflow
+from codeagent.orchestration.graph import build_workflow, run_workflow
 from codeagent.orchestration.nodes.context_node import ContextNode
 from codeagent.orchestration.nodes.execution_node import ExecutionNode
 from codeagent.orchestration.nodes.human_review_node import HumanReviewNode
@@ -39,6 +40,7 @@ class Orchestrator:
         llm: Any,
         model_name: str = "deepseek/deepseek-v4-flash",
         progress_callback: Any | None = None,
+        evolution_manager: Optional[SelfEvolutionManager] = None,
     ) -> None:
         """初始化 Orchestrator。
 
@@ -65,6 +67,7 @@ class Orchestrator:
         )
         self._validation_node = ValidationNode(validation_gateway)
         self._human_review_node = HumanReviewNode()
+        self._evolution_manager = evolution_manager
 
         # 组装并编译图
         self._graph = build_workflow(
@@ -73,6 +76,7 @@ class Orchestrator:
             execution_node=self._execution_node,
             validation_node=self._validation_node,
             human_review_node=self._human_review_node,
+            evolution_manager=evolution_manager,
         )
 
         # 运行配置追踪
@@ -126,7 +130,12 @@ class Orchestrator:
         )
 
         try:
-            final_state = await self._graph.ainvoke(initial_state, config)
+            final_state = await run_workflow(
+                graph=self._graph,
+                initial_state=initial_state,
+                config=config,
+                evolution_manager=self._evolution_manager,
+            )
             logger.info("Orchestrator.run completed (thread=%s)", thread_id)
             return final_state
         except Exception as e:
