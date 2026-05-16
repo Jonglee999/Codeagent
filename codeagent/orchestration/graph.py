@@ -6,10 +6,40 @@
 
 from __future__ import annotations
 
+import os
+import logging
+from pathlib import Path
 from typing import Any
 
-from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
+
+logger = logging.getLogger(__name__)
+
+
+def _build_checkpointer() -> Any:
+    """构建 Checkpointer — 优先 SqliteSaver（持久化），回退 MemorySaver（开发模式）。
+
+    环境变量 CHECKPOINT_DB_PATH 控制存储路径，默认 ~/.codeagent/checkpoints.db。
+    """
+    db_path = os.environ.get(
+        "CHECKPOINT_DB_PATH",
+        str(Path.home() / ".codeagent" / "checkpoints.db"),
+    )
+    try:
+        from langgraph.checkpoint.sqlite import SqliteSaver
+
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        logger.info("Using SqliteSaver checkpointer: %s", db_path)
+        return SqliteSaver.from_conn_string(db_path)
+    except ImportError:
+        from langgraph.checkpoint.memory import MemorySaver
+
+        logger.warning(
+            "langgraph-checkpoint-sqlite not installed, using MemorySaver (non-persistent). "
+            "Install with: pip install langgraph-checkpoint-sqlite"
+        )
+        return MemorySaver()
+
 
 from codeagent.orchestration.routing import (
     route_after_execution,
@@ -114,8 +144,8 @@ def build_workflow(
     )
 
     # 编译图，在 human_review 前设置中断点
-    memory = MemorySaver()
+    checkpointer = _build_checkpointer()
     return workflow.compile(
-        checkpointer=memory,
+        checkpointer=checkpointer,
         interrupt_before=["human_review"],
     )

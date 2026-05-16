@@ -15,14 +15,35 @@ import pytest
 from click.testing import CliRunner
 
 from codeagent.interaction.cli.main import cli
+from codeagent.orchestration.state import AgentState
 
 
-def _mock_run(return_value: dict) -> callable:
+def _make_result_state(**overrides: object) -> AgentState:
+    """Create an AgentState with defaults for testing the ask command.
+
+    Tests can override specific fields to simulate different execution outcomes.
+    """
+    defaults: dict[str, object] = {
+        "user_request": "test",
+        "project_root": "/tmp",
+        "auto_mode": False,
+        "execution_log": [],
+        "errors": [],
+        "accumulated_changes": [],
+        "llm_call_count": 0,
+        "human_review_required": False,
+        "review_request": None,
+    }
+    defaults.update(overrides)
+    return AgentState(**defaults)  # type: ignore[arg-type]
+
+
+def _mock_run(return_value: AgentState) -> callable:
     """Create a side_effect for asyncio.run mock that properly closes the coroutine.
 
     Prevents RuntimeWarning about unawaited coroutines when mocking asyncio.run.
     """
-    def _side_effect(coro: object, *args: object, **kwargs: object) -> dict:
+    def _side_effect(coro: object, *args: object, **kwargs: object) -> AgentState:
         if hasattr(coro, "close"):
             coro.close()  # type: ignore[union-attr]
         return return_value
@@ -82,7 +103,7 @@ class TestAskCommand:
         mock_build_vg.return_value = mock_vg
 
         with patch("codeagent.interaction.cli.main.asyncio.run") as mock_run:
-            mock_run.side_effect = _mock_run({"execution_log": [], "errors": []})
+            mock_run.side_effect = _mock_run(_make_result_state())
             result = runner.invoke(
                 cli,
                 ["ask", "write a test function", "--project", str(temp_project)],
@@ -110,7 +131,7 @@ class TestAskCommand:
         mock_build_vg.return_value = MagicMock()
 
         with patch("codeagent.interaction.cli.main.asyncio.run") as mock_run:
-            mock_run.side_effect = _mock_run({"execution_log": [], "errors": []})
+            mock_run.side_effect = _mock_run(_make_result_state())
             result = runner.invoke(
                 cli,
                 ["ask", "hello", "--project", str(temp_project), "--auto"],
@@ -135,7 +156,7 @@ class TestAskCommand:
         mock_build_vg.return_value = MagicMock()
 
         with patch("codeagent.interaction.cli.main.asyncio.run") as mock_run:
-            mock_run.side_effect = _mock_run({"execution_log": [], "errors": []})
+            mock_run.side_effect = _mock_run(_make_result_state())
             result = runner.invoke(
                 cli,
                 ["ask", "hello", "--project", str(temp_project), "--max-retries", "5"],
@@ -160,7 +181,7 @@ class TestAskCommand:
         mock_build_vg.return_value = MagicMock()
 
         with patch("codeagent.interaction.cli.main.asyncio.run") as mock_run:
-            mock_run.side_effect = _mock_run({"execution_log": [], "errors": []})
+            mock_run.side_effect = _mock_run(_make_result_state())
             result = runner.invoke(
                 cli,
                 ["ask", "hello", "--project", str(temp_project), "--model", "gpt-4"],
@@ -185,8 +206,8 @@ class TestAskCommand:
         mock_build_vg.return_value = MagicMock()
 
         with patch("codeagent.interaction.cli.main.asyncio.run") as mock_run:
-            mock_run.side_effect = _mock_run({
-                "execution_log": [
+            mock_run.side_effect = _mock_run(_make_result_state(
+                execution_log=[
                     {
                         "type": "llm_response",
                         "content": "I will create the file.",
@@ -200,8 +221,8 @@ class TestAskCommand:
                         "duration_ms": 10.0,
                     },
                 ],
-                "errors": [],
-            })
+                errors=[],
+            ))
             result = runner.invoke(
                 cli,
                 ["ask", "hello", "--project", str(temp_project), "--verbose"],
@@ -226,7 +247,7 @@ class TestAskCommand:
         mock_build_vg.return_value = MagicMock()
 
         with patch("codeagent.interaction.cli.main.asyncio.run") as mock_run:
-            mock_run.side_effect = _mock_run({"execution_log": [], "errors": []})
+            mock_run.side_effect = _mock_run(_make_result_state())
             result = runner.invoke(
                 cli,
                 ["ask", "hello", "--project", str(temp_project), "--json"],
@@ -255,10 +276,9 @@ class TestAskCommand:
         mock_build_vg.return_value = MagicMock()
 
         with patch("codeagent.interaction.cli.main.asyncio.run") as mock_run:
-            mock_run.side_effect = _mock_run({
-                "execution_log": [],
-                "errors": ["Tool execution failed"],
-            })
+            mock_run.side_effect = _mock_run(_make_result_state(
+                errors=["Tool execution failed"],
+            ))
             result = runner.invoke(
                 cli,
                 ["ask", "hello", "--project", str(temp_project)],
@@ -300,7 +320,7 @@ class TestAskCommand:
             mock_btg.return_value = MagicMock()
             mock_bvg.return_value = MagicMock()
             mock_blm.return_value = AsyncMock()
-            mock_run.side_effect = _mock_run({"execution_log": [], "errors": []})
+            mock_run.side_effect = _mock_run(_make_result_state())
             result = runner.invoke(
                 cli,
                 ["ask", "create", "a", "test", "file", "--project", str(temp_project)],
@@ -350,13 +370,227 @@ class TestAskCommand:
         mock_build_vg.return_value = MagicMock()
 
         with patch("codeagent.interaction.cli.main.asyncio.run") as mock_run:
-            mock_run.side_effect = _mock_run({"execution_log": [], "errors": []})
+            mock_run.side_effect = _mock_run(_make_result_state())
             result = runner.invoke(
                 cli,
                 ["ask", "hello", "--project", str(temp_project), "--no-color"],
             )
 
         assert result.exit_code == 0
+
+
+# ── Tests: R1 — Orchestrator 集成 ──────────────────────────────────────────
+
+
+class TestAskOrchestratorIntegration:
+    """R1: 验证 ask 命令已接入 Orchestrator 而非直接调用 ExecutionNode。"""
+
+    @patch("codeagent.interaction.cli.main._build_tool_gateway")
+    @patch("codeagent.interaction.cli.main._build_validation_gateway")
+    @patch("codeagent.interaction.cli.main._build_llm")
+    @patch("codeagent.interaction.cli.main._build_context_gateway")
+    def test_ask_creates_orchestrator_and_runs(
+        self,
+        mock_build_cg: MagicMock,
+        mock_build_llm: MagicMock,
+        mock_build_vg: MagicMock,
+        mock_build_tg: MagicMock,
+        runner: CliRunner,
+        temp_project: Path,
+    ) -> None:
+        """验证 ask 命令创建 Orchestrator 并调用其 run 方法。"""
+        mock_build_cg.return_value = MagicMock()
+        mock_build_llm.return_value = AsyncMock()
+        mock_build_vg.return_value = MagicMock()
+        mock_build_tg.return_value = MagicMock()
+
+        with patch("codeagent.interaction.cli.main.Orchestrator") as mock_orc_cls:
+            mock_orc = MagicMock()
+            mock_orc.run = AsyncMock(return_value=_make_result_state())
+            mock_orc_cls.return_value = mock_orc
+
+            result = runner.invoke(
+                cli,
+                ["ask", "create hello.py", "--project", str(temp_project)],
+            )
+
+        assert result.exit_code == 0
+        # Orchestrator 应被实例化
+        mock_orc_cls.assert_called_once()
+        _, kwargs = mock_orc_cls.call_args
+        assert "context_gateway" in kwargs
+        assert "tool_gateway" in kwargs
+        assert "validation_gateway" in kwargs
+        assert "llm" in kwargs
+        # run 方法应被调用
+        mock_orc.run.assert_awaited_once()
+        run_args = mock_orc.run.call_args[0]
+        run_kwargs = mock_orc.run.call_args.kwargs
+        assert run_args[0] == "create hello.py"
+        assert run_kwargs["auto_mode"] is False
+
+    @patch("codeagent.interaction.cli.main._build_tool_gateway")
+    @patch("codeagent.interaction.cli.main._build_validation_gateway")
+    @patch("codeagent.interaction.cli.main._build_llm")
+    @patch("codeagent.interaction.cli.main._build_context_gateway")
+    def test_ask_auto_mode_passed_to_orchestrator(
+        self,
+        mock_build_cg: MagicMock,
+        mock_build_llm: MagicMock,
+        mock_build_vg: MagicMock,
+        mock_build_tg: MagicMock,
+        runner: CliRunner,
+        temp_project: Path,
+    ) -> None:
+        """--auto 标志应传递到 orchestrator.run 的 auto_mode 参数。"""
+        mock_build_cg.return_value = MagicMock()
+        mock_build_llm.return_value = AsyncMock()
+        mock_build_vg.return_value = MagicMock()
+        mock_build_tg.return_value = MagicMock()
+
+        with patch("codeagent.interaction.cli.main.Orchestrator") as mock_orc_cls:
+            mock_orc = MagicMock()
+            mock_orc.run = AsyncMock(return_value=_make_result_state())
+            mock_orc_cls.return_value = mock_orc
+
+            result = runner.invoke(
+                cli,
+                ["ask", "hello", "--project", str(temp_project), "--auto"],
+            )
+
+        assert result.exit_code == 0
+        mock_orc.run.assert_awaited_once()
+        assert mock_orc.run.call_args.kwargs["auto_mode"] is True
+
+    @patch("codeagent.interaction.cli.main._build_tool_gateway")
+    @patch("codeagent.interaction.cli.main._build_validation_gateway")
+    @patch("codeagent.interaction.cli.main._build_llm")
+    @patch("codeagent.interaction.cli.main._build_context_gateway")
+    def test_ask_context_gateway_built(
+        self,
+        mock_build_cg: MagicMock,
+        mock_build_llm: MagicMock,
+        mock_build_vg: MagicMock,
+        mock_build_tg: MagicMock,
+        runner: CliRunner,
+        temp_project: Path,
+    ) -> None:
+        """验证 _build_context_gateway 被调用。"""
+        mock_build_cg.return_value = MagicMock()
+        mock_build_llm.return_value = AsyncMock()
+        mock_build_vg.return_value = MagicMock()
+        mock_build_tg.return_value = MagicMock()
+
+        with patch("codeagent.interaction.cli.main.asyncio.run") as mock_run:
+            mock_run.side_effect = _mock_run(_make_result_state())
+            runner.invoke(
+                cli,
+                ["ask", "hello", "--project", str(temp_project)],
+            )
+
+        mock_build_cg.assert_called_once()
+
+    @patch("codeagent.interaction.cli.main._build_tool_gateway")
+    @patch("codeagent.interaction.cli.main._build_validation_gateway")
+    @patch("codeagent.interaction.cli.main._build_llm")
+    @patch("codeagent.interaction.cli.main._build_context_gateway")
+    def test_ask_context_gateway_build_failure(
+        self,
+        mock_build_cg: MagicMock,
+        mock_build_llm: MagicMock,
+        mock_build_vg: MagicMock,
+        mock_build_tg: MagicMock,
+        runner: CliRunner,
+        temp_project: Path,
+    ) -> None:
+        """context_gateway 构建失败应报告错误。"""
+        mock_build_cg.side_effect = RuntimeError("No context engine available")
+        mock_build_llm.return_value = AsyncMock()
+        mock_build_vg.return_value = MagicMock()
+        mock_build_tg.return_value = MagicMock()
+
+        result = runner.invoke(
+            cli,
+            ["ask", "hello", "--project", str(temp_project)],
+        )
+
+        assert result.exit_code != 0
+        assert "context gateway" in result.output.lower()
+
+    @patch("codeagent.interaction.cli.main._build_tool_gateway")
+    @patch("codeagent.interaction.cli.main._build_validation_gateway")
+    @patch("codeagent.interaction.cli.main._build_llm")
+    @patch("codeagent.interaction.cli.main._build_context_gateway")
+    def test_ask_orchestrator_run_failure(
+        self,
+        mock_build_cg: MagicMock,
+        mock_build_llm: MagicMock,
+        mock_build_vg: MagicMock,
+        mock_build_tg: MagicMock,
+        runner: CliRunner,
+        temp_project: Path,
+    ) -> None:
+        """Orchestrator.run 抛出异常时应显示错误。"""
+        mock_build_cg.return_value = MagicMock()
+        mock_build_llm.return_value = AsyncMock()
+        mock_build_vg.return_value = MagicMock()
+        mock_build_tg.return_value = MagicMock()
+
+        with patch("codeagent.interaction.cli.main.asyncio.run") as mock_run:
+            mock_run.side_effect = RuntimeError("Orchestrator crashed")
+            result = runner.invoke(
+                cli,
+                ["ask", "hello", "--project", str(temp_project)],
+            )
+
+        assert result.exit_code != 0
+
+    @patch("codeagent.interaction.cli.main._display_review_request")
+    def test_orchestrator_human_review_loop_resumes(
+        self,
+        mock_display: MagicMock,
+    ) -> None:
+        """human_review_required 时应调用 orchestrator.resume()。"""
+        import asyncio
+        from codeagent.interaction.cli.main import _run_orchestrator_with_review
+
+        mock_orc = MagicMock()
+        mock_orc.run = AsyncMock()
+        mock_orc.resume = AsyncMock()
+        mock_orc.get_checkpoints = MagicMock()
+
+        # 第一次 run 返回需要审核的状态
+        review_state = _make_result_state(
+            human_review_required=True,
+            review_request={"title": "高风险操作", "review_type": "high_risk_plan"},
+            user_request="test",
+            project_root="/tmp",
+        )
+        # resume 后返回最终完成状态
+        final_state = _make_result_state(
+            human_review_required=False,
+            user_request="test",
+            project_root="/tmp",
+        )
+
+        mock_orc.run.return_value = review_state
+        mock_orc.resume.return_value = final_state
+        mock_orc.get_checkpoints.return_value = [{"thread_id": "test-thread"}]
+
+        with patch(
+            "rich.prompt.Prompt.ask",
+        ) as mock_prompt_ask:
+            mock_prompt_ask.return_value = "approve"
+            result = asyncio.run(_run_orchestrator_with_review(
+                orchestrator=mock_orc,
+                request="test",
+                project_root="/tmp",
+                auto=False,
+            ))
+
+        # resume 应被调用一次（审核被 approve）
+        mock_orc.resume.assert_awaited_once_with("test-thread", "approve")
+        assert result.human_review_required is False
 
 
 # ── Tests: init command ────────────────────────────────────────────────────
@@ -513,6 +747,29 @@ class TestBuildValidationGateway:
         assert isinstance(gateway, IValidationGateway)
 
 
+# ── Tests: _build_context_gateway ────────────────────────────────────────────
+
+
+class TestBuildContextGateway:
+    """验证 _build_context_gateway 辅助函数（R1 新增）。"""
+
+    def test_build_context_gateway(self, tmp_path: Path) -> None:
+        from codeagent.interaction.cli.main import _build_context_gateway
+
+        gateway = _build_context_gateway(str(tmp_path))
+        # 验证它实现了 IContextGateway
+        from codeagent.gateway.context_gateway import IContextGateway
+
+        assert isinstance(gateway, IContextGateway)
+
+    def test_build_context_gateway_respects_budget(self, tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        from codeagent.interaction.cli.main import _build_context_gateway
+
+        monkeypatch.setenv("CONTEXT_BUDGET_TOKENS", "16000")
+        gateway = _build_context_gateway(str(tmp_path))
+        assert gateway.config.total_budget == 16000
+
+
 # =============================================================================
 # 测试：_save_session_history 持久化
 # =============================================================================
@@ -636,7 +893,7 @@ class TestAskHistoryIntegration:
         mock_build_vg.return_value = MagicMock()
 
         with patch("codeagent.interaction.cli.main.asyncio.run") as mock_run:
-            mock_run.side_effect = _mock_run({"execution_log": [], "errors": []})
+            mock_run.side_effect = _mock_run(_make_result_state())
             result = runner.invoke(
                 cli,
                 ["ask", "write a test", "--project", str(temp_project)],
@@ -669,7 +926,7 @@ class TestAskHistoryIntegration:
         mock_build_vg.return_value = MagicMock()
 
         with patch("codeagent.interaction.cli.main.asyncio.run") as mock_run:
-            mock_run.side_effect = _mock_run({"execution_log": [], "errors": []})
+            mock_run.side_effect = _mock_run(_make_result_state())
             runner.invoke(
                 cli,
                 ["ask", "hello", "--project", str(temp_project)],
@@ -699,10 +956,9 @@ class TestAskHistoryIntegration:
         mock_build_vg.return_value = MagicMock()
 
         with patch("codeagent.interaction.cli.main.asyncio.run") as mock_run:
-            mock_run.side_effect = _mock_run({
-                "execution_log": [],
-                "errors": ["Something went wrong"],
-            })
+            mock_run.side_effect = _mock_run(_make_result_state(
+                errors=["Something went wrong"],
+            ))
             runner.invoke(
                 cli,
                 ["ask", "hello", "--project", str(temp_project)],
@@ -734,7 +990,7 @@ class TestAskHistoryIntegration:
         with runner.isolated_filesystem(temp_dir=temp_project) as td:
             (Path(td) / "test_file.py").write_text("x = 1\n")
             with patch("codeagent.interaction.cli.main.asyncio.run") as mock_run:
-                mock_run.side_effect = _mock_run({"execution_log": [], "errors": []})
+                mock_run.side_effect = _mock_run(_make_result_state())
                 runner.invoke(
                     cli,
                     ["ask", "integration test", "--project", td],
@@ -763,7 +1019,7 @@ class TestAskHistoryIntegration:
         with runner.isolated_filesystem(temp_dir=temp_project) as td:
             (Path(td) / "test_file.py").write_text("x = 1\n")
             with patch("codeagent.interaction.cli.main.asyncio.run") as mock_run:
-                mock_run.side_effect = _mock_run({"execution_log": [], "errors": []})
+                mock_run.side_effect = _mock_run(_make_result_state())
                 for i in range(3):
                     runner.invoke(
                         cli,

@@ -22,7 +22,7 @@ import asyncio
 
 import click
 
-from codeagent.config import load_env_file, get_env
+from codeagent.config import load_env_file, get_env, get_model
 from codeagent.gateway.tool_gateway import IToolGateway
 from codeagent.gateway.validation_gateway_impl import ValidationGateway
 
@@ -40,7 +40,7 @@ from codeagent.interaction.cli.formatters import (
     format_welcome,
     make_progress,
 )
-from codeagent.orchestration.nodes.execution_node import ExecutionNode
+from codeagent.orchestration.orchestrator import Orchestrator
 from codeagent.orchestration.rollback import RollbackManager
 from codeagent.orchestration.state import AgentState
 from codeagent.tools.file.read_file import ReadFileTool
@@ -135,6 +135,22 @@ def _build_tool_gateway(project_root: str) -> ToolGateway:
 def _build_validation_gateway(project_root: str = "") -> _ValidationGateway:
     """构建验证 Gateway。"""
     return _ValidationGateway()
+
+
+def _build_context_gateway(project_root: str) -> Any:
+    """构建上下文 Gateway，封装 ContextEngine 实现 IContextGateway。
+
+    Args:
+        project_root: 项目根目录路径
+
+    Returns:
+        ContextEngine 实例（实现了 IContextGateway 接口）
+    """
+    from codeagent.context_engine.engine import ContextEngine, ContextConfig
+
+    budget = int(get_env("CONTEXT_BUDGET_TOKENS", "8000"))
+    config = ContextConfig(total_budget=budget)
+    return ContextEngine(config=config)
 
 
 # ── click 命令 ──────────────────────────────────────────────────────────────
@@ -232,16 +248,19 @@ def ask(
     if no_color:
         os.environ["NO_COLOR"] = "1"
 
-    # 确定模型
-    resolved_model = (
-        model or get_env("LLM_MODEL", "") or "openai/deepseek-v4-flash"
-    )
+    # 确定模型 — R3: 使用 config.get_model() 统一默认值
+    resolved_model = model or get_env("LLM_MODEL", "") or get_model()
 
     # ── 构建组件 ──────────────────────────────────────────
     try:
         tool_gateway = _build_tool_gateway(project_root)
     except Exception as e:
         raise click.ClickException(f"Failed to build tool gateway: {e}")
+
+    try:
+        context_gateway = _build_context_gateway(project_root)
+    except Exception as e:
+        raise click.ClickException(f"Failed to build context gateway: {e}")
 
     try:
         validation_gateway = _build_validation_gateway(project_root)
@@ -255,21 +274,16 @@ def ask(
     except Exception as e:
         raise click.ClickException(f"Failed to initialize LLM: {e}")
 
-    execution_node = ExecutionNode(
-        llm=llm,
+    # ── 创建 Orchestrator（替代直接 ExecutionNode 调用）─────
+    orchestrator = Orchestrator(
+        context_gateway=context_gateway,
         tool_gateway=tool_gateway,
         validation_gateway=validation_gateway,
+        llm=llm,
         model_name=resolved_model,
-        max_retries=max_retries,
     )
 
-    state = AgentState(
-        user_request=request,
-        project_root=project_root,
-        auto_mode=auto,
-    )
-
-    # ── 异步执行 ──────────────────────────────────────────
+    # ── 异步执行（含 Human Review 循环）─────────────────────
     total_start = time.monotonic()
     summary: str | None = None
 
@@ -278,7 +292,14 @@ def ask(
         console.print(format_step_header(1, 1, "Executing request"))
 
     try:
-        result = asyncio.run(execution_node(state))
+        result = asyncio.run(
+            _run_orchestrator_with_review(
+                orchestrator=orchestrator,
+                request=request,
+                project_root=project_root,
+                auto=auto,
+            )
+        )
     except KeyboardInterrupt:
         if json_output:
             click.echo(
@@ -304,8 +325,8 @@ def ask(
 
     total_duration = (time.monotonic() - total_start) * 1000
 
-    execution_log: list[dict[str, Any]] = result.get("execution_log", [])
-    errors: list[str] = result.get("errors", [])
+    execution_log: list[dict[str, Any]] = result.execution_log
+    errors: list[str] = result.errors
 
     # 从 last llm_response 提取摘要
     for entry in reversed(execution_log):
@@ -341,13 +362,13 @@ def ask(
     console.print()
     console.print(format_final_report(request, summary, execution_log, errors, total_duration))
     if not json_output:
-        llm_call_count = state.llm_call_count
+        llm_call_count = result.llm_call_count
         if llm_call_count > 0:
             console.print(f"  LLM 调用次数: {llm_call_count}")
     console.print()
 
     # ── Rollback: 执行完成后检查是否可回滚 ────────────────
-    accumulated_changes: list[dict] = result.get("accumulated_changes", [])
+    accumulated_changes: list[dict] = result.accumulated_changes
     if accumulated_changes and not json_output and not auto:
         try:
             _handle_rollback_interactive(accumulated_changes)
@@ -449,6 +470,87 @@ def _display_entry(entry: dict[str, Any], project_root: str) -> None:
         content = entry.get("content", "")
         if content:
             console.print(format_llm_response(content))
+
+
+# ── Orchestrator 异步执行（含 Human Review 循环）────────────────────────────
+
+
+async def _run_orchestrator_with_review(
+    orchestrator: Orchestrator,
+    request: str,
+    project_root: str,
+    auto: bool,
+) -> AgentState:
+    """运行 Orchestrator 工作流，并在需要时处理 Human Review 循环。
+
+    第一次运行 orchestrator.run()，如果返回结果标记需要人工审核且
+    非 auto 模式，则循环提示用户输入决策并调用 orchestrator.resume()。
+
+    Args:
+        orchestrator: 编排器实例
+        request: 用户请求
+        project_root: 项目根目录
+        auto: 是否自动模式
+
+    Returns:
+        最终 AgentState
+    """
+    result = await orchestrator.run(request, project_root, auto_mode=auto)
+
+    # Human Review 循环：仅在需要审查且非 auto 模式下进行
+    while result.human_review_required and not auto:
+        _display_review_request(result.review_request)
+
+        from rich.prompt import Prompt
+
+        decision = Prompt.ask(
+            "请输入决策",
+            choices=["approve", "abort", "modify"],
+            default="approve",
+        )
+
+        checkpoints = orchestrator.get_checkpoints()
+        if not checkpoints:
+            logger.warning("No checkpoints found for human review resume")
+            break
+
+        thread_id = checkpoints[-1]["thread_id"]
+        result = await orchestrator.resume(thread_id, decision)
+
+    return result
+
+
+def _display_review_request(review_request: dict | None) -> None:
+    """显示 Human Review 请求内容。"""
+    if not review_request:
+        return
+
+    title = review_request.get("title", "人工审核")
+    review_type = review_request.get("review_type", "")
+    details = review_request.get("details", {})
+
+    from rich.panel import Panel
+
+    panel_text = f"[bold]{title}[/bold]\n\n"
+
+    if review_type == "high_risk_plan":
+        panel_text += "高风险步骤:\n"
+        for step in details.get("high_risk_steps", []):
+            panel_text += (
+                f"  [{step['step_id']}] {step['action']} "
+                f"{step.get('target_file', '')} — {step['description']}\n"
+            )
+    elif review_type == "deviation_detected":
+        panel_text += f"偏离计数: {details.get('deviation_count', '?')}\n"
+        if "tool_name" in details:
+            panel_text += f"工具: {details['tool_name']}\n"
+    elif review_type == "validation_failure":
+        panel_text += f"验证失败 ({details.get('retry_count', '?')} 次重试):\n"
+        for v in details.get("failed_validations", []):
+            panel_text += f"  {v.get('file_path', '?')}: {v.get('errors', [])}\n"
+
+    panel_text += "\n选项: approve / abort / modify"
+    console.print(Panel(panel_text, title="Human Review", border_style="yellow"))
 
 
 # ── 历史记录持久化 ────────────────────────────────────────────────────────────

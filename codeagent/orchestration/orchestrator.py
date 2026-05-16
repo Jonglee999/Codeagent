@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import time
 import uuid
 from typing import Any
 
@@ -20,6 +21,8 @@ from codeagent.orchestration.nodes.validation_node import ValidationNode
 from codeagent.orchestration.state import AgentState
 
 logger = logging.getLogger(__name__)
+
+_CONFIG_TTL_SECONDS = 3600 * 24  # 24 小时后过期
 
 
 class Orchestrator:
@@ -74,6 +77,21 @@ class Orchestrator:
 
         # 运行配置追踪
         self._configs: dict[str, dict[str, Any]] = {}
+        self._config_timestamps: dict[str, float] = {}
+
+    def _cleanup_stale_configs(self) -> None:
+        """清理超过 TTL 的 thread_id 记录。"""
+        now = time.monotonic()
+        stale = [
+            tid
+            for tid, ts in self._config_timestamps.items()
+            if now - ts > _CONFIG_TTL_SECONDS
+        ]
+        for tid in stale:
+            self._configs.pop(tid, None)
+            self._config_timestamps.pop(tid, None)
+        if stale:
+            logger.debug("Cleaned %d stale config(s)", len(stale))
 
     async def run(
         self,
@@ -98,7 +116,9 @@ class Orchestrator:
             auto_mode=auto_mode,
         )
         config = {"configurable": {"thread_id": thread_id}}
+        self._cleanup_stale_configs()
         self._configs[thread_id] = config
+        self._config_timestamps[thread_id] = time.monotonic()
 
         logger.info(
             "Orchestrator.run starting (thread=%s, auto_mode=%s)",

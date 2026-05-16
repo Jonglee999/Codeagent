@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from codeagent.orchestration.orchestrator import Orchestrator
+from codeagent.orchestration.state import AgentState
 
 
 @pytest.fixture
@@ -25,13 +26,24 @@ def mock_gateways():
 
 @pytest.fixture
 def orchestrator(mock_gateways: dict) -> Orchestrator:
-    return Orchestrator(
+    orch = Orchestrator(
         context_gateway=mock_gateways["context_gateway"],
         tool_gateway=mock_gateways["tool_gateway"],
         validation_gateway=mock_gateways["validation_gateway"],
         llm=mock_gateways["llm"],
         model_name="test-model",
     )
+    # Mock 编译后的 graph，避免 MemorySaver 产生 unawaited coroutine
+    mock_graph = AsyncMock()
+    mock_graph.ainvoke.side_effect = (
+        lambda state, config=None: state
+        if state is not None
+        else AgentState(user_request="", project_root="")
+    )
+    mock_graph.aupdate_state = AsyncMock()
+    mock_graph.aget_state = AsyncMock()
+    orch._graph = mock_graph
+    return orch
 
 
 class TestOrchestratorRun:
@@ -69,7 +81,7 @@ class TestOrchestratorRun:
         assert len(orchestrator.get_checkpoints()) == 2
 
     async def test_run_error_sets_errors_in_state(self, orchestrator: Orchestrator, mock_gateways: dict) -> None:
-        mock_gateways["context_gateway"].build_context.side_effect = RuntimeError("fail")
+        orchestrator._graph.ainvoke.side_effect = RuntimeError("fail")
         result = await orchestrator.run(
             user_request="test",
             project_root="/root",

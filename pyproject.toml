@@ -37,6 +37,9 @@ sandbox = [
     "tree-sitter-javascript>=0.25.0",
     "docker>=7.0.0",
 ]
+persistence = [
+    "langgraph-checkpoint-sqlite>=2.0.0",
+]
 
 [dependency-groups]
 dev = [{include = "dev"}, {include = "sandbox"}]
@@ -44,11 +47,12 @@ dev = [{include = "dev"}, {include = "sandbox"}]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
-addopts = "-v --tb=short --strict-markers"
+addopts = "-v --tb=short --strict-markers --import-mode=importlib"
 asyncio_mode = "auto"
 markers = [
     "e2e: marks end-to-end integration tests (requires LLM API key)",
     "requires_network: marks integration tests that require network access",
+    "docker: marks integration tests that require Docker daemon",
 ]
 
 [tool.ruff]

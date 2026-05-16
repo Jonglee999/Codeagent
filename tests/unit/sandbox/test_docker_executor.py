@@ -134,6 +134,28 @@ class TestRun:
         assert result.exit_code == 0
         assert result.sandboxed is True
 
+    async def test_run_uses_environment_parameter(self, executor, mock_docker_client):
+        """R2: containers.create 应使用 environment= 而非 env=。"""
+        await executor.run(command="echo hello", workdir="/tmp", env={"KEY": "val"})
+
+        create_kwargs = mock_docker_client.containers.create.call_args.kwargs
+        # 必须使用 environment 参数
+        assert "environment" in create_kwargs
+        # 不能使用已废弃的 env 参数
+        assert "env" not in create_kwargs
+        # environment 内容正确
+        assert create_kwargs["environment"] == {"KEY": "val"}
+
+    async def test_run_environment_not_none_when_no_env(self, executor, mock_docker_client):
+        """R2: 未传 env 时 environment 应为 None。"""
+        await executor.run(command="echo hello", workdir="/tmp")
+
+        create_kwargs = mock_docker_client.containers.create.call_args.kwargs
+        # environment 应为 None（docker-py 期望 None 表示使用容器默认环境）
+        assert create_kwargs.get("environment") is None
+        # env 不应出现在参数中
+        assert "env" not in create_kwargs
+
     async def test_run_docker_not_available(self, executor, mocker):
         """Docker 不可用时优雅降级。"""
         mocker.patch("codeagent.sandbox.docker_executor._DOCKER_AVAILABLE", False)
@@ -237,11 +259,12 @@ class TestRunTests:
 class TestConfigFunctions:
     """config.py 沙箱配置函数测试。"""
 
-    def test_get_sandbox_enabled_default_false(self):
+    def test_get_sandbox_enabled_default_false(self, mocker):
         """SANDBOX_ENABLED 默认值为 false。"""
+        # 防止其他测试加载 .env 污染当前测试环境
+        mocker.patch.dict("os.environ", {"SANDBOX_ENABLED": ""})
         from codeagent import config
 
-        # 确保环境变量未设置
         enabled = config.get_sandbox_enabled()
         assert enabled is False
 

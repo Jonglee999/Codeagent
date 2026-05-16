@@ -12,7 +12,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -71,12 +71,12 @@ class DockerExecutor:
         self._image = image
         self._memory_mb = memory_mb
         self._timeout_s = timeout_s
-        self._client: Optional[any] = None
+        self._client: Optional[Any] = None
         self._sync_pool = ThreadPoolExecutor(max_workers=4)
 
     # ── 客户端连接 ────────────────────────────────────────────
 
-    def _get_client(self) -> Optional[any]:
+    def _get_client(self) -> Optional[Any]:
         """获取或创建 Docker 客户端连接。"""
         if self._client is not None:
             return self._client
@@ -168,7 +168,7 @@ class DockerExecutor:
 
     def _run_in_container_sync(
         self,
-        client: any,
+        client: Any,
         command: str,
         container_workdir: str,
         volumes: dict,
@@ -183,7 +183,7 @@ class DockerExecutor:
                 working_dir=container_workdir,
                 volumes=volumes,
                 mem_limit=f"{self._memory_mb}m",
-                env=env_vars or None,
+                environment=env_vars or None,
                 detach=True,
                 auto_remove=False,
             )
