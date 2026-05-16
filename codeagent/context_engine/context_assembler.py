@@ -19,7 +19,10 @@ from typing import Any
 
 import tiktoken
 
+from typing import Optional
+
 from codeagent.gateway.context_gateway import CodeSnippet, ContextPackage
+from codeagent.gateway.memory_gateway import IMemoryGateway
 
 logger = logging.getLogger(__name__)
 
@@ -86,13 +89,22 @@ class ContextAssembler:
     通过预算分配和裁剪策略控制上下文窗口大小。
     """
 
-    def __init__(self, total_budget: int = 8000) -> None:
+    def __init__(
+        self,
+        total_budget: int = 8000,
+        memory_gateway: Optional[IMemoryGateway] = None,
+        memory_token_budget: int = 800,
+    ) -> None:
         """初始化 ContextAssembler。
 
         Args:
             total_budget: 总 token 预算（默认 8000）
+            memory_gateway: 记忆系统 Gateway，None 时跳过 Memory 层
+            memory_token_budget: Memory 层 token 预算
         """
         self.total_budget = total_budget
+        self._memory_gateway = memory_gateway
+        self._memory_token_budget = memory_token_budget
         self._tokenizer = tiktoken.get_encoding(_ENCODING)
         self._last_report: BudgetReport | None = None
 
@@ -196,6 +208,34 @@ class ContextAssembler:
     def get_budget_report(self) -> BudgetReport | None:
         """获取最近一次组装的预算使用报告。"""
         return self._last_report
+
+    # ── Phase 6.5 Memory 层注入 ──────────────────────────────────────
+
+    async def assemble_memory_section(self, task_description: str) -> str:
+        """检索相关记忆并组装为 System Prompt Memory 层。
+
+        在 memory_gateway=None 或无可检索记忆时返回空字符串。
+
+        Args:
+            task_description: 任务描述，用作检索查询
+
+        Returns:
+            "## Relevant Memories\n{memory_xml}" 或 ""
+        """
+        if not self._memory_gateway:
+            return ""
+
+        try:
+            memory_xml = await self._memory_gateway.recall(
+                query=task_description,
+                token_budget=self._memory_token_budget,
+            )
+            if not memory_xml:
+                return ""
+            return f"## Relevant Memories\n\n{memory_xml}"
+        except Exception as exc:
+            logger.warning("Memory layer injection failed (non-blocking): %s", exc)
+            return ""
 
     # ── Token 计数 ─────────────────────────────────────────────────────────
 

@@ -144,3 +144,6 @@ class AgentState:
     # ── Phase 5.5 新增字段 ────────────────────────────────────
     llm_call_count: int = 0              # 当前任务已调用 LLM 次数
     estimated_tokens: int = 0            # 当前任务估算 token 消耗
+
+    # ── Phase 6.6 新增字段 ────────────────────────────────────
+    memory_extracted: bool = False       # 防止重复提取记忆

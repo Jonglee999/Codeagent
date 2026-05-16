@@ -93,6 +93,40 @@ def get_sandbox_timeout() -> int:
     return int(get_env("SANDBOX_TIMEOUT", "60"))
 
 
+# ── Memory 系统配置 ──────────────────────────────────────
+
+
+def get_memory_global_root() -> Path:
+    """获取全局记忆存储根目录。
+
+    默认 ~/.codeagent/memory/，可通过 MEMORY_GLOBAL_ROOT 环境变量覆盖。
+    """
+    return Path(get_env("MEMORY_GLOBAL_ROOT", str(Path.home() / ".codeagent" / "memory")))
+
+
+def get_memory_project_root(project_path: str) -> Path:
+    """获取项目记忆存储根目录。
+
+    默认 {project_path}/.codeagent/memory/。
+    """
+    return Path(project_path) / ".codeagent" / "memory"
+
+
+def get_memory_index_max_lines() -> int:
+    """获取 MEMORY.md 索引最大行数，默认 200。"""
+    return int(get_env("MEMORY_INDEX_MAX_LINES", "200"))
+
+
+def get_memory_session_ttl_days() -> int:
+    """获取 session 类型记忆过期天数，默认 7。"""
+    return int(get_env("MEMORY_SESSION_TTL_DAYS", "7"))
+
+
+def get_memory_token_budget() -> int:
+    """获取记忆注入 System Prompt 的 token 预算，默认 800。"""
+    return int(get_env("MEMORY_TOKEN_BUDGET", "800"))
+
+
 def get_sandbox_memory_mb() -> int:
     """获取沙箱容器内存限制（MB）。
 

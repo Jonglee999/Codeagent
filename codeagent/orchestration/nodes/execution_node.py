@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -20,6 +21,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from codeagent import config as codeagent_config
+from codeagent.gateway.memory_gateway import IMemoryGateway
 from codeagent.gateway.tool_gateway import IToolGateway
 from codeagent.gateway.validation_gateway import IValidationGateway
 from codeagent.orchestration.state import AgentState, PlanStep, RepairContext, StructuredError
@@ -88,6 +90,7 @@ class ExecutionNode:
         max_tool_calls: int = _MAX_TOOL_CALLS,
         max_retries: int = _MAX_RETRIES,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        memory_gateway: Optional[IMemoryGateway] = None,
     ) -> None:
         """初始化 ExecutionNode。
 
@@ -98,7 +101,8 @@ class ExecutionNode:
             model_name: 模型名称
             max_tool_calls: 单次执行最大 tool_calls 次数
             max_retries: 单步语法错误最大重试次数
-            progress_callback: 进度回调函数，接收 dict: {step_id, status, ...}
+            progress_callback: 进度回调函数
+            memory_gateway: 记忆系统 Gateway，None 时跳过记忆检索
         """
         self._llm = llm
         self._tool_gateway = tool_gateway
@@ -107,6 +111,7 @@ class ExecutionNode:
         self._max_tool_calls = max_tool_calls
         self._max_retries = max_retries
         self._progress_callback = progress_callback
+        self._memory_gateway = memory_gateway
 
     async def __call__(self, state: AgentState) -> dict[str, Any]:
         """执行主入口。
@@ -122,10 +127,16 @@ class ExecutionNode:
         """
         # Phase 4.A.5: 优先检查修复模式
         if self._needs_repair(state):
-            return await self._execute_repair_mode(state)
-        if state.plan and state.current_step_index < len(state.plan):
-            return await self._execute_with_plan(state)
-        return await self._execute_direct(state)
+            result = await self._execute_repair_mode(state)
+        elif state.plan and state.current_step_index < len(state.plan):
+            result = await self._execute_with_plan(state)
+        else:
+            result = await self._execute_direct(state)
+
+        # Phase 6.6: 任务完成后异步触发记忆提取
+        await self._trigger_post_task_extraction(state, result)
+
+        return result
 
     # ── Plan-aware 执行 ──────────────────────────────────────
 
@@ -151,6 +162,7 @@ class ExecutionNode:
         review_request = state.review_request
 
         tool_definitions = self._tool_gateway.list_tools()
+        memory_section = await self._assemble_memory_section(state)
         remaining_steps = state.plan[current_step_index:]
 
         # 构建完成/剩余步骤摘要
@@ -178,7 +190,7 @@ class ExecutionNode:
             ]
 
             # 构建步骤提示词
-            step_prompt = self._build_step_prompt(state, step, tool_definitions)
+            step_prompt = self._build_step_prompt(state, step, tool_definitions, memory_section=memory_section)
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": step_prompt},
             ]
@@ -254,8 +266,16 @@ class ExecutionNode:
         state: AgentState,
         step: PlanStep,
         tool_definitions: list[Any],
+        memory_section: str = "",
     ) -> str:
-        """为单个 PlanStep 构建提示词（含 TaskFocus 上下文注入）。"""
+        """为单个 PlanStep 构建提示词（含 TaskFocus 上下文注入）。
+
+        Args:
+            state: Agent 状态
+            step: 当前执行步骤
+            tool_definitions: 工具定义列表
+            memory_section: Phase 6.5 记忆层文本，空字符串时跳过
+        """
         total_steps = len(state.plan or [])
         parts: list[str] = [
             "You are a coding agent executing a specific step of a plan.",
@@ -288,6 +308,11 @@ class ExecutionNode:
 
         if state.context:
             parts.append(f"## Project Context\n{state.context}\n")
+
+        # Phase 6.5: Memory 层注入
+        if memory_section:
+            parts.append(memory_section)
+            parts.append("")
 
         parts.append("## Available Tools")
         for td in tool_definitions:
@@ -677,8 +702,11 @@ class ExecutionNode:
         repair_prompt = self._build_repair_prompt(state)
 
         tool_definitions = self._tool_gateway.list_tools()
+        memory_section = await self._assemble_memory_section(state)
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": self._build_system_prompt(state, tool_definitions)},
+            {"role": "system", "content": self._build_system_prompt(
+                state, tool_definitions, memory_section=memory_section,
+            )},
             {"role": "user", "content": repair_prompt},
         ]
 
@@ -1034,8 +1062,9 @@ class ExecutionNode:
         errors: list[str] = list(state.errors)
 
         tool_definitions = self._tool_gateway.list_tools()
+        memory_section = await self._assemble_memory_section(state)
         system_prompt = self._build_system_prompt(
-            state, tool_definitions
+            state, tool_definitions, memory_section=memory_section,
         )
 
         messages: list[dict[str, Any]] = [
@@ -1266,8 +1295,15 @@ class ExecutionNode:
         self,
         state: AgentState,
         tool_definitions: list[Any],
+        memory_section: str = "",
     ) -> str:
-        """构建系统提示词。"""
+        """构建系统提示词。
+
+        Args:
+            state: Agent 状态
+            tool_definitions: 工具定义列表
+            memory_section: Phase 6.5 记忆层文本，空字符串时跳过
+        """
         parts = [
             "You are a coding agent. Your task is to help the user with their coding request.",
             "",
@@ -1282,6 +1318,11 @@ class ExecutionNode:
             parts.append("## Available Tools")
             for td in tool_definitions:
                 parts.append(f"- {td.name}: {td.description}")
+            parts.append("")
+
+        # Phase 6.5: Memory 层注入
+        if memory_section:
+            parts.append(memory_section)
             parts.append("")
 
         parts.extend([
@@ -1375,6 +1416,104 @@ class ExecutionNode:
                 self._progress_callback(progress)
             except Exception as exc:
                 logger.warning("Progress callback failed: %s", exc)
+
+    # ── Phase 6.5: 记忆检索 ──────────────────────────────────
+
+    async def _assemble_memory_section(self, state: AgentState) -> str:
+        """检索相关记忆并组装为 Memory 层文本。
+
+        使用 state.user_request 作为检索查询。
+
+        Args:
+            state: Agent 状态
+
+        Returns:
+            "## Relevant Memories\n{memory_xml}" 或 ""
+        """
+        if not self._memory_gateway:
+            return ""
+
+        try:
+            memory_xml = await self._memory_gateway.recall(
+                query=state.user_request,
+                token_budget=codeagent_config.get_memory_token_budget(),
+            )
+            if not memory_xml:
+                return ""
+            return f"## Relevant Memories\n\n{memory_xml}"
+        except Exception as exc:
+            logger.warning(
+                "Memory recall failed in ExecutionNode (non-blocking): %s", exc
+            )
+            return ""
+
+    # ── Phase 6.6: 任务后异步提取记忆 ──────────────────────────
+
+    async def _trigger_post_task_extraction(
+        self, state: AgentState, result: dict[str, Any],
+    ) -> None:
+        """检查是否需要触发任务后异步记忆提取。
+
+        条件：
+        1. memory_gateway 不为 None
+        2. state.memory_extracted 不为 True（防止重复提取）
+        3. 计划模式：所有步骤已完成（current_step_index >= len(plan)）
+        4. 非修复模式（修复模式在验证循环中，任务尚未完成）
+
+        Args:
+            state: 当前 Agent 状态
+            result: __call__ 返回的状态更新字典
+        """
+        if not self._memory_gateway:
+            return
+        if state.memory_extracted:
+            return
+        # 修复模式中不触发（验证循环尚未结束）
+        if self._needs_repair(state):
+            return
+        # 有计划时检查步骤是否全部完成
+        if state.plan and len(state.plan) > 0:
+            steps_done = result.get("current_step_index", state.current_step_index)
+            if steps_done < len(state.plan):
+                return
+
+        # 根据是否有错误决定 trigger 类型
+        has_errors = bool(result.get("errors"))
+        trigger = "task_failed" if has_errors else "task_complete"
+
+        state.memory_extracted = True
+        result["memory_extracted"] = True
+
+        asyncio.create_task(
+            self._extract_memories_async(
+                conversation_history=state.conversation_history,
+                trigger=trigger,
+            )
+        )
+
+    async def _extract_memories_async(
+        self,
+        conversation_history: list[dict],
+        trigger: str = "task_complete",
+    ) -> None:
+        """异步提取记忆，异常时只记录日志不抛出。
+
+        在工作流完成后异步调用 memory_gateway.auto_extract()，
+        不阻塞主流程返回。
+
+        Args:
+            conversation_history: 对话历史列表
+            trigger: 触发原因（"task_complete" 或 "task_failed"）
+        """
+        try:
+            await self._memory_gateway.auto_extract(
+                conversation_history=conversation_history,
+                trigger=trigger,
+            )
+        except Exception as e:
+            logger.warning(
+                "Memory extraction failed in ExecutionNode (non-blocking): %s", e
+            )
 
     # ── Rollback 支持 ──────────────────────────────────────────
 

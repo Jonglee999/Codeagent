@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "AI-powered coding assistant with multi-agent orchestration"
 requires-python = ">=3.12"
 dependencies = [
+    "python-frontmatter>=1.1.0",
     "langgraph>=1.1.0",
     "litellm>=1.83.0",
     "lancedb>=0.10.0",

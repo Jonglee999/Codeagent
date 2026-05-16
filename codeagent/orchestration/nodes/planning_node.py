@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
+from codeagent.gateway.memory_gateway import IMemoryGateway
 from codeagent.orchestration.state import AgentState, PlanStep
 
 logger = logging.getLogger(__name__)
@@ -130,6 +131,7 @@ class PlanningNode:
         llm: Callable[..., Any],
         model_name: str = "deepseek/deepseek-v4-flash",
         max_retries: int = _MAX_RETRIES,
+        memory_gateway: Optional[IMemoryGateway] = None,
     ) -> None:
         """初始化 PlanningNode。
 
@@ -137,10 +139,12 @@ class PlanningNode:
             llm: LLM 调用函数
             model_name: 模型名称
             max_retries: JSON 解析失败重试次数
+            memory_gateway: 记忆系统 Gateway，None 时跳过记忆检索
         """
         self._llm = llm
         self._model_name = model_name
         self._max_retries = max_retries
+        self._memory_gateway = memory_gateway
 
     async def __call__(self, state: AgentState) -> dict[str, Any]:
         """执行规划。
@@ -152,6 +156,12 @@ class PlanningNode:
             dict: 包含 plan 或 errors 的状态更新
         """
         prompt = self._build_prompt(state)
+
+        # Phase 6.5: 注入相关记忆到 System Prompt
+        memory_section = await self._assemble_memory_section(state)
+        if memory_section:
+            prompt = f"{prompt}\n\n{memory_section}"
+
         messages: list[dict[str, str]] = [
             {"role": "system", "content": prompt},
         ]
@@ -266,6 +276,34 @@ class PlanningNode:
             user_request=state.user_request,
             context_section=context_section,
         )
+
+    # ── Phase 6.5: 记忆检索 ─────────────────────────────────
+
+    async def _assemble_memory_section(self, state: AgentState) -> str:
+        """检索相关记忆并组装为 System Prompt 的 Memory 层。
+
+        Args:
+            state: Agent 状态（使用 user_request 作为查询）
+
+        Returns:
+            "## Relevant Memories\n{memory_xml}" 或 ""
+        """
+        if not self._memory_gateway:
+            return ""
+
+        try:
+            from codeagent import config
+            token_budget = config.get_memory_token_budget()
+            memory_xml = await self._memory_gateway.recall(
+                query=state.user_request,
+                token_budget=token_budget,
+            )
+            if not memory_xml:
+                return ""
+            return f"## Relevant Memories\n\n{memory_xml}"
+        except Exception as exc:
+            logger.warning("Memory recall failed in PlanningNode (non-blocking): %s", exc)
+            return ""
 
     def _format_tree_for_prompt(
         self, tree: dict[str, Any], prefix: str = ""
