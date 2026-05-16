@@ -115,11 +115,14 @@ class StrategyExtractor:
         recorder: Any,
         store: Any,
         min_confidence: float = 0.5,
+        use_semantic_dedup: bool = True,
     ) -> None:
         self._llm_client = llm_client
         self._recorder = recorder
         self._store = store
         self._min_confidence = min_confidence
+        self._use_semantic_dedup = use_semantic_dedup
+        self._vector_model: Any = None
 
     # ── 公开接口 ──────────────────────────────────────────────
 
@@ -194,7 +197,7 @@ class StrategyExtractor:
             return []
         return await self.extract(trajectories)
 
-    # ── 去重检测 ──────────────────────────────────────────────
+    # ── 去重检测（语义 + 关键词） ─────────────────────────
 
     def _check_duplicate(
         self,
@@ -204,29 +207,74 @@ class StrategyExtractor:
     ) -> tuple[bool, Optional[str]]:
         """检查策略是否与现有策略重复。
 
-        关键词匹配 condition + action 字段。
-        将 condition 分词后计算在每条现有策略中的 keyword_score。
-
-        Args:
-            strategy: 待检查的策略
-            existing: 现有策略列表
-            threshold: 相似度阈值（默认 0.85）
-
-        Returns:
-            (is_duplicate, existing_strategy_id)
+        use_semantic_dedup=True 时优先使用向量余弦相似度；
+        False 或向量模型不可用时回退到关键词匹配。
         """
         if not existing:
             return False, None
 
-        # 用 condition + action 作为查询文本
+        # 标题完全一致始终视为重复（优先于语义/关键词匹配）
+        for ex in existing:
+            if ex.title.strip().lower() == strategy.title.strip().lower():
+                return True, ex.strategy_id
+
         query_text = f"{strategy.condition} {strategy.action}"
+
+        if self._use_semantic_dedup:
+            model = self._get_vector_model()
+            if model is not None:
+                return self._semantic_dedup(query_text, existing, model, threshold)
+
+        return self._keyword_dedup(query_text, existing, strategy, threshold)
+
+    def _semantic_dedup(
+        self,
+        query_text: str,
+        existing: list[Strategy],
+        model: Any,
+        threshold: float,
+    ) -> tuple[bool, Optional[str]]:
+        """使用向量余弦相似度进行语义去重。"""
+        try:
+            import numpy as np
+            query_emb = model.encode([query_text], normalize_embeddings=True)
+            for ex in existing:
+                ex_text = f"{ex.condition} {ex.action}"
+                ex_emb = model.encode([ex_text], normalize_embeddings=True)
+                score = float(np.dot(query_emb[0], ex_emb[0]))
+                if score >= threshold:
+                    return True, ex.strategy_id
+        except Exception as exc:
+            logger.warning("Semantic dedup failed, falling back to keyword: %s", exc)
+            return self._keyword_dedup(query_text, existing, None, threshold)
+        return False, None
+
+    def _get_vector_model(self):
+        """懒加载向量模型，失败时返回 None。"""
+        if self._vector_model is None:
+            try:
+                from sentence_transformers import SentenceTransformer
+                self._vector_model = SentenceTransformer("all-MiniLM-L6-v2")
+            except Exception as exc:
+                logger.warning("Failed to load vector model for dedup: %s", exc)
+                self._vector_model = False
+        return self._vector_model if self._vector_model is not False else None
+
+    def _keyword_dedup(
+        self,
+        query_text: str,
+        existing: list[Strategy],
+        strategy: Strategy | None,
+        threshold: float,
+    ) -> tuple[bool, Optional[str]]:
+        """使用关键词匹配进行去重（降级方案）。"""
         query_words = self._tokenize(query_text)
         if not query_words:
             return False, None
 
         for existing_strategy in existing:
             # 规则 1：title 完全一致视为重复
-            if existing_strategy.title.strip().lower() == strategy.title.strip().lower():
+            if strategy and existing_strategy.title.strip().lower() == strategy.title.strip().lower():
                 return True, existing_strategy.strategy_id
 
             # 规则 2：condition + action 内容高度相似
@@ -236,7 +284,7 @@ class StrategyExtractor:
                 return True, existing_strategy.strategy_id
 
             # 规则 3：同 category + 高 action 相似度
-            if existing_strategy.category == strategy.category:
+            if strategy and existing_strategy.category == strategy.category:
                 action_score = self._keyword_score(
                     self._tokenize(strategy.action),
                     existing_strategy.action,

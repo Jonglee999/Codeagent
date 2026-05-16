@@ -150,7 +150,8 @@ class TestWriteSecurity:
             mode="create",
         )
         assert result.success is False
-        assert result.error_code == "PATH_TRAVERSAL"
+        assert result.error_code == "PERMISSION_DENIED"
+        assert "Absolute paths are not allowed" in (result.error_message or "")
 
     @pytest.mark.asyncio
     async def test_reject_git_directory(self, tool, tmp_path):
@@ -272,6 +273,18 @@ class TestWriteEdgeCasesExtended:
         # 备份目录可写，应正常通过
         assert result.success is True
         assert result.data["backup_path"] is not None
+
+    @pytest.mark.asyncio
+    async def test_project_root_isolation(self, tmp_path):
+        """使用独立 project_root 的 tool 应拒绝访问外部路径。"""
+        tool = WriteFileTool(project_root=tmp_path)
+        result = await tool.execute(
+            file_path="../../etc/passwd",
+            content="hacked",
+            mode="create",
+        )
+        assert result.success is False
+        assert result.error_code == "PATH_TRAVERSAL"
 
     @pytest.mark.asyncio
     async def test_excessively_long_path(self, tool):

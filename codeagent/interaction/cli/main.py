@@ -43,11 +43,7 @@ from codeagent.interaction.cli.formatters import (
 from codeagent.orchestration.orchestrator import Orchestrator
 from codeagent.orchestration.rollback import RollbackManager
 from codeagent.orchestration.state import AgentState
-from codeagent.tools.file.read_file import ReadFileTool
-from codeagent.tools.file.write_file import WriteFileTool
 from codeagent.tools.gateway import ToolGateway
-from codeagent.tools.registry import ToolRegistry
-from codeagent.tools.terminal.run_terminal import RunTerminalTool
 
 logger = logging.getLogger(__name__)
 
@@ -121,15 +117,15 @@ def _build_llm(model_name: str) -> Any:
 
 
 def _build_tool_gateway(project_root: str) -> ToolGateway:
-    """构建工具 Gateway，注册 ReadFileTool、WriteFileTool 和 RunTerminalTool。"""
-    registry = ToolRegistry()
-    registry.register(ReadFileTool(project_root=project_root))
-    registry.register(WriteFileTool(project_root=project_root))
+    """构建工具 Gateway，注册默认工具（ReadFileTool、WriteFileTool、RunTerminalTool）。"""
+    from codeagent.tools.terminal.run_terminal import RunTerminalTool
+
+    gateway = ToolGateway(project_root=project_root)
     try:
-        registry.register(RunTerminalTool(project_root=project_root))
+        gateway._registry.register(RunTerminalTool(project_root=project_root))
     except Exception:
         logger.warning("RunTerminalTool not available (Docker may not be installed)")
-    return ToolGateway(registry)
+    return gateway
 
 
 def _build_validation_gateway(project_root: str = "") -> _ValidationGateway:

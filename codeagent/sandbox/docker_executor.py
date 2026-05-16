@@ -241,19 +241,25 @@ class DockerExecutor:
     async def run_tests(
         self,
         project_root: str,
-        test_command: str,
+        test_command: str = "pytest",
+        timeout_s: int | None = None,
     ) -> ExecutionResult:
-        """在容器内执行测试命令。
+        """在容器内执行测试命令，自动安装 pytest（如未预装）。
 
         挂载项目目录为读写卷（测试可能需要写临时文件）。
 
         Args:
             project_root: 项目根目录路径
-            test_command: 测试命令（如 "pytest -x --tb=short"）
+            test_command: 测试命令（如 "pytest -x --tb=short"），默认 "pytest"
+            timeout_s: 超时秒数，默认使用 self._timeout_s
 
         Returns:
             ExecutionResult: 执行结果
         """
+        # 先确保 pytest 可用
+        install_cmd = "pip install pytest -q --break-system-packages 2>/dev/null || pip install pytest -q"
+        full_cmd = f"({install_cmd}) && {test_command}"
+
         start = time.monotonic()
         client = self._get_client()
 
@@ -279,7 +285,7 @@ class DockerExecutor:
             result = await asyncio.to_thread(
                 self._run_in_container_sync,
                 client,
-                test_command,
+                full_cmd,
                 container_workdir,
                 volumes,
                 {},

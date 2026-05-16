@@ -69,15 +69,33 @@ class ToolGateway(IToolGateway):
     通过 ToolRegistry 获取工具实例，执行参数校验、超时控制、日志记录和 Metrics 收集。
     """
 
-    def __init__(self, registry: ToolRegistry) -> None:
+    def __init__(
+        self,
+        registry: ToolRegistry | None = None,
+        project_root: str = ".",
+    ) -> None:
         """初始化 ToolGateway。
 
         Args:
-            registry: 工具注册中心实例
+            registry: 工具注册中心实例（如不提供则自动创建并注册默认工具）
+            project_root: 项目根目录（用于传递给读写文件工具进行路径安全校验）
         """
-        self._registry = registry
+        self._project_root = project_root
+        if registry is not None:
+            self._registry = registry
+        else:
+            self._registry = ToolRegistry()
+            self._register_default_tools()
         self._metrics: dict[str, ToolMetrics] = {}
         self._execution_log: list[ExecutionLogEntry] = []
+
+    def _register_default_tools(self) -> None:
+        """注册默认工具集（ReadFileTool、WriteFileTool）并传入 project_root。"""
+        from codeagent.tools.file.read_file import ReadFileTool
+        from codeagent.tools.file.write_file import WriteFileTool
+
+        self._registry.register(ReadFileTool(project_root=self._project_root))
+        self._registry.register(WriteFileTool(project_root=self._project_root))
 
     async def execute_tool(self, tool_name: str, params: dict[str, Any]) -> ToolResult:
         """执行指定工具。

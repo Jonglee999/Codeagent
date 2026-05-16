@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from unittest.mock import MagicMock, PropertyMock, patch
 
@@ -80,12 +81,20 @@ class TestSandboxCreateContainer:
         assert kwargs["volumes"] == volumes
         assert kwargs["network"] == "none"
 
-    def test_create_container_with_network_limited(self, sandbox: TerminalSandbox) -> None:
-        cid = sandbox.create_container(network="limited")
+    def test_create_container_with_network_bridge(self, sandbox: TerminalSandbox) -> None:
+        cid = sandbox.create_container(network="bridge")
         assert cid == "container_id_001"
         args, kwargs = sandbox.client.containers.create.call_args
-        # "limited" 映射为 Docker 的 "bridge" 网络
         assert kwargs["network"] == "bridge"
+
+    def test_create_container_with_unknown_network_falls_back_to_none(self, sandbox: TerminalSandbox, caplog) -> None:
+        """未知网络模式应回退 'none' 并记录 warning。"""
+        with caplog.at_level(logging.WARNING):
+            cid = sandbox.create_container(network="limited")
+        assert cid == "container_id_001"
+        args, kwargs = sandbox.client.containers.create.call_args
+        assert kwargs["network"] == "none"
+        assert "Unknown network mode" in caplog.text
 
     def test_create_container_resource_limits(self, sandbox: TerminalSandbox) -> None:
         cid = sandbox.create_container(mem_limit="256m", cpu_count=0.5)

@@ -60,8 +60,8 @@ class RunTerminalTool(BaseTool):
             },
             "network": {
                 "type": "string",
-                "enum": ["none", "limited"],
-                "description": "网络模式：none（默认，无网络）、limited（仅白名单域名）",
+                "enum": ["none", "bridge"],
+                "description": "网络模式：none（默认，完全隔离，容器内无法访问任何网络）、bridge（完整网络访问）",
                 "default": "none",
             },
         },

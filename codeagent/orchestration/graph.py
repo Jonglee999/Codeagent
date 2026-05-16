@@ -9,7 +9,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -17,18 +16,17 @@ from typing import Any, Callable, Optional
 
 from langgraph.graph import END, StateGraph
 
+from codeagent import config
+
 logger = logging.getLogger(__name__)
 
 
 def _build_checkpointer() -> Any:
     """构建 Checkpointer — 优先 SqliteSaver（持久化），回退 MemorySaver（开发模式）。
 
-    环境变量 CHECKPOINT_DB_PATH 控制存储路径，默认 ~/.codeagent/checkpoints.db。
+    CHECKPOINT_DB_PATH 控制存储路径（由 config 统一管理），默认 ~/.codeagent/checkpoints.db。
     """
-    db_path = os.environ.get(
-        "CHECKPOINT_DB_PATH",
-        str(Path.home() / ".codeagent" / "checkpoints.db"),
-    )
+    db_path = config.get_checkpoint_db_path()
     try:
         from langgraph.checkpoint.sqlite import SqliteSaver
 

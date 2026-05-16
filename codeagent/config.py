@@ -151,3 +151,16 @@ def get_trajectory_base_path() -> str:
 def get_strategy_base_path() -> str:
     """策略存储路径，默认 .codeagent/strategies/。"""
     return get_env("STRATEGY_BASE_PATH", ".codeagent/strategies")
+
+
+def get_memory_use_vector() -> bool:
+    """记忆检索是否启用向量语义检索，默认 True（需要 sentence-transformers）。"""
+    return get_env("MEMORY_USE_VECTOR", "true").lower() == "true"
+
+
+def get_checkpoint_db_path() -> str:
+    """Checkpoint SQLite 数据库路径，默认 ~/.codeagent/checkpoints.db。"""
+    return get_env(
+        "CHECKPOINT_DB_PATH",
+        str(Path.home() / ".codeagent" / "checkpoints.db"),
+    )

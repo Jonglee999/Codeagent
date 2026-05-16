@@ -134,6 +134,7 @@ BUG_TYPES: list[tuple[str, str, str]] = [
 
 
 @pytest.mark.e2e
+@pytest.mark.slow
 @requires_api_key
 class TestSceneM_StrategyAccumulation:
     """Scene M: 策略积累——执行多次 bug 修复任务，验证自进化管道完整运行。
@@ -288,6 +289,7 @@ class TestSceneM_StrategyAccumulation:
 
 
 @pytest.mark.e2e
+@pytest.mark.slow
 @requires_api_key
 class TestSceneN_StrategyPersistence:
     """Scene N: 策略持久化——策略在会话间持续存在。"""

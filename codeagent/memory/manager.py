@@ -268,7 +268,8 @@ class MemoryManager(IMemoryGateway):
             project_root = config.get_memory_project_root(project_path)
 
         store = MemoryStore(global_root=global_root, project_root=project_root)
-        retriever = MemoryRetriever(store=store)
+        use_vector = config.get_memory_use_vector()
+        retriever = MemoryRetriever(store=store, use_vector=use_vector)
         extractor = MemoryExtractor(
             store=store,
             retriever=retriever,

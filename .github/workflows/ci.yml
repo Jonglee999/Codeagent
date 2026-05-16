@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          python-version: "3.12"
+      - run: uv sync --group dev
+      - run: uv run ruff check codeagent/
+      - run: uv run ruff format --check codeagent/
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          python-version: "3.12"
+      - run: uv sync --group dev
+      - run: uv run mypy codeagent/ --ignore-missing-imports
+
+  test-unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          python-version: "3.12"
+      - run: uv sync --group dev
+      - name: Run unit tests
+        run: uv run pytest tests/unit/ -q --tb=short --cov=codeagent --cov-report=xml
+      - uses: codecov/codecov-action@v4
+        with:
+          fail_ci_if_error: false
+
+  test-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          python-version: "3.12"
+      - run: uv sync --group dev
+      - name: Run integration tests (skip docker & network tests)
+        run: uv run pytest tests/integration/ -q --tb=short -m "not docker and not requires_network"

@@ -1,0 +1,23 @@
+name: E2E Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "LLM model to use"
+        default: "deepseek/deepseek-v4-flash"
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          python-version: "3.12"
+      - run: uv sync --group dev
+      - name: Run E2E tests
+        run: uv run pytest tests/e2e/ -v -m e2e
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_MODEL: ${{ inputs.model }}

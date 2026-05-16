@@ -337,6 +337,21 @@ class TestEdgeCases:
         assert result.error_code == "TOOL_NOT_FOUND"
         assert gw.list_tools() == []
 
+
+class TestToolGatewayProjectRoot:
+    """验证 ToolGateway 的 project_root 参数。"""
+
+    def test_create_with_project_root(self) -> None:
+        gw = ToolGateway(project_root="/tmp/test_proj")
+        assert gw._project_root == "/tmp/test_proj"
+
+    def test_create_without_registry_has_default_tools(self) -> None:
+        gw = ToolGateway(project_root="/tmp/test_proj")
+        tools = gw.list_tools()
+        names = {t.name for t in tools}
+        assert "read_file" in names
+        assert "write_file" in names
+
     @pytest.mark.asyncio
     async def test_execute_with_empty_params(self, gateway: ToolGateway) -> None:
         """空参数调用无参工具应成功。"""

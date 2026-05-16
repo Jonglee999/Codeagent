@@ -131,11 +131,19 @@ class TerminalSandbox:
     def _resolve_network(self, network: str) -> str:
         """将逻辑网络模式映射为 Docker 网络模式。
 
-        - "none" → "none"（无网络）
-        - "limited" → "bridge"（使用默认 bridge 网络，后续可通过 iptables 限制）
+        支持的模式：
+        - "none"   → 完全隔离，容器内无法访问任何网络（推荐用于代码执行）
+        - "bridge" → 使用宿主机默认 bridge 网络，容器内可访问外网
+
+        注意：当前不支持细粒度的网络访问控制（如白名单域名）。
+        如需限制网络访问，请使用 "none" 模式。
         """
-        if network == "limited":
-            return "bridge"
+        if network not in ("none", "bridge"):
+            logger.warning(
+                "Unknown network mode '%s', falling back to 'none' for safety.",
+                network,
+            )
+            return "none"
         return network
 
     def create_container(
@@ -150,7 +158,7 @@ class TerminalSandbox:
 
         Args:
             volumes: 挂载卷映射
-            network: 网络模式（"none" 或 "limited"）
+            network: 网络模式 — "none"（完全隔离，默认）或 "bridge"（完整网络访问）
             mem_limit: 内存限制
             cpu_count: CPU 核心数
             working_dir: 容器内工作目录

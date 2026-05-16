@@ -53,6 +53,7 @@ markers = [
     "e2e: marks end-to-end integration tests (requires LLM API key)",
     "requires_network: marks integration tests that require network access",
     "docker: marks integration tests that require Docker daemon",
+    "slow: marks slow tests excluded from main CI",
 ]
 
 [tool.ruff]

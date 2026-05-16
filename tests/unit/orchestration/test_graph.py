@@ -203,3 +203,40 @@ class TestRunWorkflow:
         # Should not raise
         result = await run_workflow(graph=graph, initial_state=state)
         assert result is not None
+
+
+class TestBuildCheckpointerConfig:
+    """_build_checkpointer 的 config 集成测试。"""
+
+    def test_checkpointer_uses_config_function(self, monkeypatch) -> None:
+        """_build_checkpointer 应调用 config.get_checkpoint_db_path()。"""
+        from codeagent.orchestration.graph import _build_checkpointer
+        from codeagent import config
+
+        custom_path = "/custom/path/checkpoints.db"
+        monkeypatch.setenv("CHECKPOINT_DB_PATH", custom_path)
+        result = config.get_checkpoint_db_path()
+        assert result == custom_path, (
+            f"config.get_checkpoint_db_path() should return the env var value, "
+            f"got {result!r}"
+        )
+
+    def test_checkpointer_default_path(self) -> None:
+        """未设置环境变量时应使用默认路径。"""
+        from codeagent import config
+
+        # 验证默认值中包含 .codeagent/checkpoints.db
+        result = config.get_checkpoint_db_path()
+        assert ".codeagent" in result
+        assert "checkpoints.db" in result
+
+    def test_graph_no_bare_osenviron_get(self) -> None:
+        """graph.py 中不应有裸 os.environ.get('CHECKPOINT_DB_PATH')。"""
+        import inspect
+        from codeagent.orchestration import graph as graph_module
+
+        source = inspect.getsource(graph_module)
+        # 允许 import os 和 os.environ 的其他用法，但不允许 CHECKPOINT_DB_PATH
+        assert "CHECKPOINT_DB_PATH" not in source or "config.get_checkpoint_db_path" in source, (
+            "graph.py should use config.get_checkpoint_db_path() instead of bare CHECKPOINT_DB_PATH"
+        )

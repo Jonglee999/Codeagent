@@ -112,8 +112,22 @@ class WriteFileTool(BaseTool):
             )
 
         # ── 路径安全校验 ──────────────────────────────────
+        raw = Path(file_path)
+        # 拒绝绝对路径：is_absolute() 覆盖 POSIX 和带驱动器的 Windows 路径，
+        # raw.root 覆盖仅以 / 或 \ 开头的路径（在 Windows 上 is_absolute 可能为 False）
+        if raw.is_absolute() or raw.root:
+            return ToolResult(
+                success=False,
+                error_message=(
+                    f"Absolute paths are not allowed: {file_path}. "
+                    "Use paths relative to the project root."
+                ),
+                error_code="PERMISSION_DENIED",
+                duration_ms=(time.monotonic() - start_time) * 1000,
+            )
+
         try:
-            target = (self._project_root / file_path).resolve()
+            target = (self._project_root / raw).resolve()
         except (OSError, RuntimeError, ValueError):
             return ToolResult(
                 success=False,
