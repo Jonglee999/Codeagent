@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import time
 from typing import Any, Awaitable, Callable
@@ -40,15 +42,19 @@ class HumanReviewNode:
     def __init__(
         self,
         review_callback: Callable[[dict], Awaitable[str]] | None = None,
+        redis_url: str | None = None,
+        review_timeout: int = 300,
     ) -> None:
         """初始化 Human Review 节点。
 
         Args:
-            review_callback: 外部注入的审核回调函数。
-                接收 review_request dict，返回 human_decision str。
-                为 None 时使用默认控制台交互（input()）。
+            review_callback: 外部注入的审核回调函数（CLI 模式）。
+            redis_url: Web 模式的 Redis 连接 URL，提供后通过 Redis 轮询获取决策。
+            review_timeout: 等待用户决策的超时秒数，默认 300（5 分钟）。
         """
         self._review_callback = review_callback
+        self._redis_url = redis_url
+        self._timeout = review_timeout
 
     async def __call__(self, state: AgentState) -> dict[str, Any]:
         """执行 Human Review。
@@ -74,10 +80,13 @@ class HumanReviewNode:
         try:
             if self._review_callback:
                 decision = await self._review_callback(review_request)
+            elif self._redis_url:
+                decision = await self._wait_for_web_decision(state, review_request)
             else:
-                decision = await self._console_review(review_request)
+                logger.info("No review callback or Redis URL, auto-approving")
+                decision = "approve"
         except Exception as exc:
-            logger.error("Human review callback failed: %s", exc)
+            logger.error("Human review failed: %s", exc)
             decision = "abort"
 
         if decision not in _DECISION_OPTIONS:
@@ -228,6 +237,51 @@ class HumanReviewNode:
         except (EOFError, KeyboardInterrupt):
             print(file=sys.stderr)
             return "abort"
+
+    async def _wait_for_web_decision(
+        self, state: AgentState, review_request: dict
+    ) -> str:
+        """Web 模式：通过 Redis 等待前端决策。
+
+        1. 向 Redis 发布 human_review_required 事件（WebSocket 转发给前端）
+        2. 轮询 Redis task:{task_id}:decision 键（每 1 秒检查一次）
+        3. 超时 self._timeout 秒后返回 "abort"
+        4. 读取到 decision 后删除该键（防止重复消费）
+        """
+        import redis as sync_redis
+
+        r = sync_redis.from_url(self._redis_url)
+        task_id = state.task_id
+
+        # 发布 review_required 事件
+        event = {
+            "type": "human_review_required",
+            "review_type": review_request.get("review_type", "unknown"),
+            "details": review_request.get("details", {}),
+        }
+        try:
+            r.publish(f"task:{task_id}:events", json.dumps(event))
+        except Exception as exc:
+            logger.warning("Failed to publish human_review_required event: %s", exc)
+
+        # 轮询等待决策
+        deadline = time.time() + self._timeout
+        while time.time() < deadline:
+            try:
+                decision_raw = r.get(f"task:{task_id}:decision")
+                if decision_raw:
+                    r.delete(f"task:{task_id}:decision")
+                    decision_data = json.loads(decision_raw)
+                    return decision_data.get("decision", "abort")
+            except Exception as exc:
+                logger.warning("Error polling human review decision: %s", exc)
+            await asyncio.sleep(1.0)
+
+        logger.warning(
+            "Human review timed out for task %s after %ds",
+            task_id, self._timeout,
+        )
+        return "abort"
 
     def _make_result(
         self, state: AgentState, decision: str, review_request: dict

@@ -172,18 +172,20 @@ class ExecutionNode:
         ]
         completed_steps_summary = "; ".join(completed_descriptions) if completed_descriptions else ""
 
+        # 上报 node_start 事件
+        self._report_progress({
+            "type": "node_start",
+            "node": "execution/plan",
+            "data": {
+                "step_count": len(remaining_steps),
+                "steps": [s.description for s in remaining_steps],
+            },
+        })
+
         for i, step in enumerate(remaining_steps):
             # 如果偏离触发 Human Review，停止执行
             if human_review_required:
                 break
-
-            self._report_progress({
-                "step_id": step.step_id,
-                "status": "running",
-                "file_path": step.target_file,
-                "operation": step.action,
-                "message": step.description,
-            })
 
             # 计算剩余步骤描述（不含当前步骤）
             remaining_descriptions = [
@@ -226,14 +228,6 @@ class ExecutionNode:
             # 更新完成摘要
             completed_descriptions.append(step.description)
             completed_steps_summary = "; ".join(completed_descriptions)
-
-            self._report_progress({
-                "step_id": step.step_id,
-                "status": "completed",
-                "file_path": step.target_file,
-                "operation": step.action,
-                "message": f"Step {step.step_id} completed",
-            })
 
             # 如果偏离触发 Human Review，停止执行
             if human_review_required:
@@ -548,6 +542,23 @@ class ExecutionNode:
 
                 execution_log.append(log_entry)
 
+                # 上报 tool_call 和 tool_result 事件
+                self._report_progress({
+                    "type": "tool_call",
+                    "tool": tool_name,
+                    "params": tool_args,
+                })
+                summary = (
+                    f"{'Succeeded' if tool_result.success else 'Failed'}: "
+                    f"{tool_name}({json.dumps(tool_args, ensure_ascii=False)[:200]})"
+                )
+                self._report_progress({
+                    "type": "tool_result",
+                    "tool": tool_name,
+                    "success": tool_result.success,
+                    "summary": summary,
+                })
+
                 # Phase 7.6: 记录工具调用到轨迹
                 trajectory_steps.append({
                     "node_name": "execution",
@@ -705,6 +716,13 @@ class ExecutionNode:
         accumulated_changes: list[dict] = list(state.accumulated_changes)
         trajectory_steps: list[dict] = list(state.trajectory_steps)
 
+        # 上报 node_start 事件
+        self._report_progress({
+            "type": "node_start",
+            "node": "execution/repair",
+            "data": {"retry_count": state.retry_count + 1},
+        })
+
         # ── Phase 5.4: 构建修复上下文 ──────────────────────────
         new_errors, pre_existing = self._extract_structured_errors(state.validation_results)
         attempt_number = state.retry_count + 1
@@ -847,6 +865,23 @@ class ExecutionNode:
                     )
 
                 execution_log.append(log_entry)
+
+                # 上报 tool_call 和 tool_result 事件
+                self._report_progress({
+                    "type": "tool_call",
+                    "tool": tool_name,
+                    "params": tool_args,
+                })
+                summary = (
+                    f"{'Succeeded' if tool_result.success else 'Failed'}: "
+                    f"{tool_name}({json.dumps(tool_args, ensure_ascii=False)[:200]})"
+                )
+                self._report_progress({
+                    "type": "tool_result",
+                    "tool": tool_name,
+                    "success": tool_result.success,
+                    "summary": summary,
+                })
 
                 # Phase 7.6: 记录修复工具调用到轨迹
                 trajectory_steps.append({
@@ -1095,6 +1130,13 @@ class ExecutionNode:
         errors: list[str] = list(state.errors)
         trajectory_steps: list[dict] = list(state.trajectory_steps)
 
+        # 上报 node_start 事件
+        self._report_progress({
+            "type": "node_start",
+            "node": "execution/direct",
+            "data": {"query": state.user_request[:200]},
+        })
+
         tool_definitions = self._tool_gateway.list_tools()
         memory_section = await self._assemble_memory_section(state)
         system_prompt = self._build_system_prompt(
@@ -1212,6 +1254,23 @@ class ExecutionNode:
                     )
 
                 execution_log.append(log_entry)
+
+                # 上报 tool_call 和 tool_result 事件
+                self._report_progress({
+                    "type": "tool_call",
+                    "tool": tool_name,
+                    "params": tool_args,
+                })
+                summary = (
+                    f"{'Succeeded' if tool_result.success else 'Failed'}: "
+                    f"{tool_name}({json.dumps(tool_args, ensure_ascii=False)[:200]})"
+                )
+                self._report_progress({
+                    "type": "tool_result",
+                    "tool": tool_name,
+                    "success": tool_result.success,
+                    "summary": summary,
+                })
 
                 # Phase 7.6: 记录工具调用到轨迹
                 trajectory_steps.append({

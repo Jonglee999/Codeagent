@@ -174,7 +174,14 @@ class Orchestrator:
 
         # 继续执行
         try:
-            final_state = await self._graph.ainvoke(None, config)
+            result = await self._graph.ainvoke(None, config)
+            # LangGraph 1.2.0 返回 dict 而非 AgentState
+            if isinstance(result, dict):
+                valid_fields = AgentState.__dataclass_fields__
+                filtered = {k: v for k, v in result.items() if k in valid_fields}
+                final_state = AgentState(**filtered)
+            else:
+                final_state = result
             logger.info("Orchestrator.resume completed (thread=%s)", thread_id)
             return final_state
         except Exception as e:
@@ -182,9 +189,14 @@ class Orchestrator:
                 "Orchestrator.resume failed (thread=%s): %s", thread_id, e
             )
             current = await self._graph.aget_state(config)
-            state: AgentState = current.values if hasattr(current, "values") else AgentState(user_request="", project_root="")  # type: ignore[assignment]
-            if hasattr(state, "errors"):
-                state.errors.append(f"Orchestrator resume failed: {e}")
+            raw = current.values if hasattr(current, "values") else {}
+            if isinstance(raw, dict):
+                valid_fields = AgentState.__dataclass_fields__
+                filtered = {k: v for k, v in raw.items() if k in valid_fields}
+                state = AgentState(**filtered)
+            else:
+                state = raw
+            state.errors.append(f"Orchestrator resume failed: {e}")
             return state
 
     def get_checkpoints(self) -> list[dict[str, Any]]:

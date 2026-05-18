@@ -164,3 +164,16 @@ def get_checkpoint_db_path() -> str:
         "CHECKPOINT_DB_PATH",
         str(Path.home() / ".codeagent" / "checkpoints.db"),
     )
+
+
+# ── Phase 8: Celery / Redis 配置 ──────────────────────────────────
+
+
+def get_redis_url() -> str:
+    """获取 Redis 连接 URL，默认 redis://localhost:6379。"""
+    return get_env("REDIS_URL", "redis://127.0.0.1:6379")
+
+
+def get_celery_task_timeout() -> int:
+    """Agent 任务超时秒数，默认 600（10 分钟）。"""
+    return int(get_env("CELERY_TASK_TIMEOUT", "600"))

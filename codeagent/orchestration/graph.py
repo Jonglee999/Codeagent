@@ -22,25 +22,15 @@ logger = logging.getLogger(__name__)
 
 
 def _build_checkpointer() -> Any:
-    """构建 Checkpointer — 优先 SqliteSaver（持久化），回退 MemorySaver（开发模式）。
+    """构建 Checkpointer。
 
-    CHECKPOINT_DB_PATH 控制存储路径（由 config 统一管理），默认 ~/.codeagent/checkpoints.db。
+    使用 MemorySaver（内存级，CLI/开发模式适用）。
+    AsyncSqliteSaver（持久化）需要运行中的事件循环，在 CLI 同步初始化时不可用，
+    适用于 FastAPI 服务端模式。
     """
-    db_path = config.get_checkpoint_db_path()
-    try:
-        from langgraph.checkpoint.sqlite import SqliteSaver
+    from langgraph.checkpoint.memory import MemorySaver
 
-        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-        logger.info("Using SqliteSaver checkpointer: %s", db_path)
-        return SqliteSaver.from_conn_string(db_path)
-    except ImportError:
-        from langgraph.checkpoint.memory import MemorySaver
-
-        logger.warning(
-            "langgraph-checkpoint-sqlite not installed, using MemorySaver (non-persistent). "
-            "Install with: pip install langgraph-checkpoint-sqlite"
-        )
-        return MemorySaver()
+    return MemorySaver()
 
 
 from codeagent.context_engine.evolution import (
@@ -179,6 +169,19 @@ def _wrap_node_with_recording(
     return wrapped
 
 
+def _ensure_agent_state(state: dict | AgentState) -> AgentState:
+    """将 LangGraph 返回的 dict 转换回 AgentState。
+
+    LangGraph 1.2.0 的 graph.ainvoke() 即使传入 dataclass schema，
+    返回值也是 plain dict 而非 AgentState 实例。
+    """
+    if isinstance(state, AgentState):
+        return state
+    valid_fields = AgentState.__dataclass_fields__
+    filtered = {k: v for k, v in state.items() if k in valid_fields}
+    return AgentState(**filtered)
+
+
 def _all_validations_passed(state: AgentState) -> bool:
     """检查所有验证是否通过。
 
@@ -224,22 +227,19 @@ async def run_workflow(
             user_request=initial_state.user_request,
         )
 
-    # 执行工作流
-    final_state = await graph.ainvoke(initial_state, config)
+    # 执行工作流（LangGraph 1.2.0 返回 dict，需转回 AgentState）
+    final_state_dict = await graph.ainvoke(initial_state, config)
+    final_state = _ensure_agent_state(final_state_dict)
 
     # 任务完成时
     if evolution_manager and initial_state.evolution_enabled:
-        success = True
-        if hasattr(final_state, "workflow_status"):
-            success = final_state.workflow_status == "COMPLETED"
-        elif hasattr(final_state, "errors"):
-            success = len(final_state.errors) == 0
+        success = len(final_state.errors) == 0
         await evolution_manager.on_task_complete(
-            task_id=final_state.task_id if hasattr(final_state, "task_id") else initial_state.task_id,
+            task_id=final_state.task_id or initial_state.task_id,
             success=success,
-            repair_rounds=final_state.repair_rounds if hasattr(final_state, "repair_rounds") else 0,
-            validation_passed=_all_validations_passed(final_state) if hasattr(final_state, "validation_results") else True,
-            applied_strategy_ids=final_state.applied_strategy_ids if hasattr(final_state, "applied_strategy_ids") else [],
+            repair_rounds=final_state.repair_rounds,
+            validation_passed=_all_validations_passed(final_state),
+            applied_strategy_ids=final_state.applied_strategy_ids,
         )
 
     return final_state
