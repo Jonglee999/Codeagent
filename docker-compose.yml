@@ -3,6 +3,7 @@
 #
 # 服务组成:
 #   redis   — Celery 消息队列 + WebSocket 事件总线
+#   jaeger  — 分布式追踪（OpenTelemetry OTLP）
 #   api     — FastAPI 服务（REST + WebSocket）
 #   worker  — Celery Worker（Agent 任务执行）
 #   nginx   — 反向代理 + 前端静态文件托管
@@ -29,6 +30,16 @@ services:
     volumes:
       - redis_data:/data
 
+  # ── Jaeger 分布式追踪 ──────────────────────────────────────────
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    ports:
+      - "16686:16686"   # Jaeger UI
+      - "4317:4317"     # OTLP gRPC
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    restart: unless-stopped
+
   # ── FastAPI 服务 ────────────────────────────────────────────────────
   api:
     build:
@@ -47,6 +58,8 @@ services:
       - MAX_LLM_CALLS_PER_TASK=${MAX_LLM_CALLS_PER_TASK:-50}
       - MAX_TOKENS_PER_TASK=${MAX_TOKENS_PER_TASK:-100000}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
+      - OTEL_SERVICE_NAME=codeagent-api
     depends_on:
       redis:
         condition: service_healthy
@@ -72,6 +85,8 @@ services:
       - MAX_LLM_CALLS_PER_TASK=${MAX_LLM_CALLS_PER_TASK:-50}
       - MAX_TOKENS_PER_TASK=${MAX_TOKENS_PER_TASK:-100000}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
+      - OTEL_SERVICE_NAME=codeagent-worker
     depends_on:
       redis:
         condition: service_healthy

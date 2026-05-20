@@ -13,6 +13,7 @@ from typing import Any, Callable, Optional
 from codeagent.context_engine.evolution.strategy_applier import StrategyApplier
 from codeagent.gateway.memory_gateway import IMemoryGateway
 from codeagent.orchestration.state import AgentState, PlanStep
+from codeagent.tracing import trace_node
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +152,7 @@ class PlanningNode:
         self._strategy_applier = strategy_applier
         self._current_strategy_ids: list[str] = []
 
+    @trace_node("planning")
     async def __call__(self, state: AgentState) -> dict[str, Any]:
         """执行规划。
 

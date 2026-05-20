@@ -17,6 +17,7 @@ import time
 from typing import Any, Awaitable, Callable
 
 from codeagent.orchestration.state import AgentState
+from codeagent.tracing import trace_node
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,7 @@ class HumanReviewNode:
         self._redis_url = redis_url
         self._timeout = review_timeout
 
+    @trace_node("human_review")
     async def __call__(self, state: AgentState) -> dict[str, Any]:
         """执行 Human Review。
 

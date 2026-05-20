@@ -24,9 +24,8 @@ logger = logging.getLogger(__name__)
 def _build_checkpointer() -> Any:
     """构建 Checkpointer。
 
-    使用 MemorySaver（内存级，CLI/开发模式适用）。
-    AsyncSqliteSaver（持久化）需要运行中的事件循环，在 CLI 同步初始化时不可用，
-    适用于 FastAPI 服务端模式。
+    默认返回 MemorySaver（内存级，CLI/开发模式适用）。
+    生产环境通过 build_workflow 的 checkpointer 参数注入 AsyncSqliteSaver。
     """
     from langgraph.checkpoint.memory import MemorySaver
 
@@ -253,6 +252,7 @@ def build_workflow(
     human_review_node: Any | None = None,
     trajectory_recorder: Optional[TrajectoryRecorder] = None,
     evolution_manager: Optional[SelfEvolutionManager] = None,
+    checkpointer: Any | None = None,
 ) -> StateGraph:
     """构建完整的 LangGraph StateGraph 工作流。
 
@@ -263,6 +263,7 @@ def build_workflow(
         validation_node: Validation Node 实例
         human_review_node: Human Review 节点（默认使用 _default_human_review）
         trajectory_recorder: TrajectoryRecorder 实例，None 时不记录轨迹
+        checkpointer: 持久化 Checkpointer（默认使用 SqliteSaver，可通过 get_checkpointer 创建）
 
     Returns:
         编译后的 StateGraph（可 ainvoke）
@@ -345,7 +346,8 @@ def build_workflow(
     )
 
     # 编译图，在 human_review 前设置中断点
-    checkpointer = _build_checkpointer()
+    if checkpointer is None:
+        checkpointer = _build_checkpointer()
     return workflow.compile(
         checkpointer=checkpointer,
         interrupt_before=["human_review"],

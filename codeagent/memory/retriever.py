@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from dataclasses import dataclass
 from typing import Optional
 
+from codeagent.interaction.api.metrics import observe_memory_retrieval
 from codeagent.memory.store import MemoryEntry, MemoryStore, MemoryType
 
 logger = logging.getLogger(__name__)
@@ -85,6 +87,17 @@ class MemoryRetriever:
         Returns:
             按分数降序排列的 RetrievalResult 列表
         """
+        t0 = time.monotonic()
+        try:
+            return self._retrieve_impl(query, token_budget)
+        finally:
+            observe_memory_retrieval(time.monotonic() - t0)
+
+    def _retrieve_impl(
+        self,
+        query: str,
+        token_budget: int = 800,
+    ) -> list[RetrievalResult]:
         if not query or not query.strip():
             return []
 

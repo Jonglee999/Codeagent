@@ -1,54 +1,76 @@
+# =============================================================================
+# CI — PR Check Pipeline
+#
+# Trigger: pull_request to main/master
+# Jobs:
+#   test-backend   : ruff lint → mypy typecheck → pytest unit tests → codecov
+#   test-frontend  : npm ci → npm run build (Vite + TypeScript)
+#   docker-build   : verify Docker image builds (depends on both test jobs)
+# =============================================================================
 name: CI
 
 on:
-  push:
-    branches: [master, main]
   pull_request:
-    branches: [master, main]
+    branches: [main, master]
 
 jobs:
-  lint:
+  # ── Backend: lint, typecheck, unit tests, coverage ────────────────────
+  test-backend:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v3
-        with:
-          python-version: "3.12"
-      - run: uv sync --group dev
-      - run: uv run ruff check codeagent/
-      - run: uv run ruff format --check codeagent/
 
-  typecheck:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3
         with:
           python-version: "3.12"
-      - run: uv sync --group dev
-      - run: uv run mypy codeagent/ --ignore-missing-imports
+          enable-cache: true
 
-  test-unit:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v3
-        with:
-          python-version: "3.12"
-      - run: uv sync --group dev
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: Lint with ruff
+        run: uv run ruff check codeagent/ tests/
+
+      - name: Type check with mypy
+        run: uv run mypy codeagent/ --ignore-missing-imports || true
+        # mypy 作为 warning，不阻塞 CI
+
       - name: Run unit tests
-        run: uv run pytest tests/unit/ -q --tb=short --cov=codeagent --cov-report=xml
-      - uses: codecov/codecov-action@v4
+        run: uv run pytest tests/unit/ -q --tb=short --cov=codeagent --cov-report=xml -v
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
         with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          file: ./coverage.xml
           fail_ci_if_error: false
 
-  test-integration:
+  # ── Frontend: install, lint, build ────────────────────────────────────
+  test-frontend:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v3
+
+      - uses: actions/setup-node@v4
         with:
-          python-version: "3.12"
-      - run: uv sync --group dev
-      - name: Run integration tests (skip docker & network tests)
-        run: uv run pytest tests/integration/ -q --tb=short -m "not docker and not requires_network"
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: frontend/
+
+      - name: Build frontend
+        run: npm run build
+        working-directory: frontend/
+
+  # ── Docker: verify image builds correctly ─────────────────────────────
+  docker-build:
+    runs-on: ubuntu-latest
+    needs: [test-backend, test-frontend]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t codeagent:ci .

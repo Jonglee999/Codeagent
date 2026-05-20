@@ -25,6 +25,7 @@ from codeagent.gateway.memory_gateway import IMemoryGateway
 from codeagent.gateway.tool_gateway import IToolGateway
 from codeagent.gateway.validation_gateway import IValidationGateway
 from codeagent.orchestration.state import AgentState, PlanStep, RepairContext, StructuredError
+from codeagent.tracing import trace_node
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +114,7 @@ class ExecutionNode:
         self._progress_callback = progress_callback
         self._memory_gateway = memory_gateway
 
+    @trace_node("execution")
     async def __call__(self, state: AgentState) -> dict[str, Any]:
         """执行主入口。
 

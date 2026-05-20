@@ -21,6 +21,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from codeagent.config import get_env, get_redis_url, load_env_file
+from codeagent.interaction.api.metrics import get_metrics_endpoint, wrap_llm_call
 
 load_env_file(Path.cwd() / ".env")
 logger = logging.getLogger(__name__)
@@ -148,7 +149,7 @@ async def _run_inline(task_id: str, request_dict: dict, redis_url: str) -> None:
             context_gateway=context_gateway,
             tool_gateway=tool_gateway,
             validation_gateway=validation_gateway,
-            llm=llm_call,
+            llm=wrap_llm_call(model_name, llm_call),
             model_name=model_name,
             progress_callback=progress_callback,
         )
@@ -249,6 +250,13 @@ async def health():
         "inline_mode": _INLINE_MODE,
         "redis": get_redis_url().split("@")[-1] if "@" in get_redis_url() else get_redis_url(),
     }
+
+
+@app.get("/metrics")
+async def metrics():
+    """Prometheus metrics endpoint (text/plain; charset=utf-8)."""
+    from starlette.responses import Response
+    return Response(content=get_metrics_endpoint(), media_type="text/plain; charset=utf-8")
 
 
 from .routes import router as api_router

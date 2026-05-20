@@ -15,6 +15,8 @@ from codeagent.gateway.validation_gateway import (
     ValidationError,
     ValidationResult,
 )
+from codeagent.tracing import trace_node
+from codeagent.interaction.api.metrics import observe_validation
 from codeagent.orchestration.state import AgentState
 from codeagent.validation.error_analyzer import ErrorAnalyzer, FixSuggestion
 from codeagent.validation.runtime_validator import RuntimeValidator
@@ -58,6 +60,7 @@ class ValidationNode:
 
     # ── 主入口 ─────────────────────────────────────────────────────
 
+    @trace_node("validation")
     async def __call__(self, state: AgentState) -> dict[str, Any]:
         start_time = time.monotonic()
         file_paths = self._collect_file_paths(state)
@@ -73,6 +76,11 @@ class ValidationNode:
             file_paths, state
         )
         layers.append(("runtime", runtime_result))
+
+        # Prometheus 验证指标记录 (non-blocking)
+        _layer_short = {"syntax": "syntax", "static_analysis": "static", "runtime": "runtime"}
+        for layer_name, result in layers:
+            observe_validation(_layer_short.get(layer_name, layer_name), result.passed)
 
         validation_results = [r for _, r in layers]
         layers_status = {k: r.passed for k, r in layers}

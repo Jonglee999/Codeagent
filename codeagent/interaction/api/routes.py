@@ -14,6 +14,7 @@ from codeagent.gateway.orchestration_gateway import (
 )
 from codeagent.gateway.orchestration_gateway_impl import OrchestrationGatewayImpl
 
+from .auth import verify_api_key
 from .models import (
     ApiResponse,
     DecisionRequest,
@@ -21,6 +22,7 @@ from .models import (
     TaskReportResponse,
     TaskStatusResponse,
 )
+from .rate_limit import RateLimiter
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +39,10 @@ def _get_gateway(request: Request) -> OrchestrationGatewayImpl:
     return gateway
 
 
+# 速率限制器（单例，使用 Redis URL）
+_rate_limiter = RateLimiter()
+
+
 @router.post(
     "/tasks", response_model=ApiResponse, status_code=status.HTTP_202_ACCEPTED
 )
@@ -44,6 +50,8 @@ async def create_task(
     req: TaskCreateRequest,
     request: Request,
     gateway: OrchestrationGatewayImpl = Depends(_get_gateway),
+    _auth: str = Depends(verify_api_key),
+    _rl: None = Depends(_rate_limiter.check_rate_limit),
 ) -> ApiResponse:
     """提交新 Agent 任务。
 
@@ -88,6 +96,8 @@ async def create_task(
 async def get_task_status(
     task_id: str,
     gateway: OrchestrationGatewayImpl = Depends(_get_gateway),
+    _auth: str = Depends(verify_api_key),
+    _rl: None = Depends(_rate_limiter.check_rate_limit),
 ) -> ApiResponse:
     """查询任务状态。"""
     try:
@@ -120,6 +130,8 @@ async def submit_decision(
     task_id: str,
     body: DecisionRequest,
     gateway: OrchestrationGatewayImpl = Depends(_get_gateway),
+    _auth: str = Depends(verify_api_key),
+    _rl: None = Depends(_rate_limiter.check_rate_limit),
 ) -> ApiResponse:
     """提交 Human Review 决策。"""
     try:
@@ -145,6 +157,8 @@ async def submit_decision(
 async def cancel_task(
     task_id: str,
     gateway: OrchestrationGatewayImpl = Depends(_get_gateway),
+    _auth: str = Depends(verify_api_key),
+    _rl: None = Depends(_rate_limiter.check_rate_limit),
 ) -> ApiResponse:
     """取消任务。"""
     try:
@@ -162,6 +176,8 @@ async def cancel_task(
 async def get_report(
     task_id: str,
     gateway: OrchestrationGatewayImpl = Depends(_get_gateway),
+    _auth: str = Depends(verify_api_key),
+    _rl: None = Depends(_rate_limiter.check_rate_limit),
 ) -> ApiResponse:
     """获取任务完整报告。"""
     try:

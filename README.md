@@ -45,37 +45,64 @@
 
 CodeAgent uses a **gateway-based microkernel architecture** built on LangGraph's state machine:
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         User Interface                              │
-│  ┌──────────┐  ┌──────────────────┐  ┌──────────────────────────┐  │
-│  │   CLI    │  │  REST API / WS   │  │       Web UI (React)     │  │
-│  └────┬─────┘  └────────┬─────────┘  └────────────┬─────────────┘  │
-└───────┼─────────────────┼──────────────────────────┼────────────────┘
-        │                 │                          │
-┌───────┴─────────────────┴──────────────────────────┴────────────────┐
-│                    Orchestration Layer                               │
-│  ┌────────────────────────────────────────────────────────────────┐  │
-│  │                    LangGraph StateGraph                        │  │
-│  │                                                               │  │
-│  │  Context ──▶ Planning ──▶ Execution ──▶ Validation ──▶ Done  │  │
-│  │    ▲              │              │              │              │  │
-│  │    │              ▼              ▼              ▼              │  │
-│  │    └────────── Re-plan ──── Repair Loop ── Human Review        │  │
-│  └────────────────────────────────────────────────────────────────┘  │
-└──────────────────────────────────────────────────────────────────────┘
+```mermaid
+graph TB
+    subgraph UI["User Interface"]
+        CLI["CLI (Click + Rich)"]
+        REST["REST API / WebSocket"]
+        WEB["Web UI (React)"]
+    end
 
-┌──────────┬──────────┬──────────┬──────────┬──────────┬──────────┐
-│ Context  │  Tool    │Validation│ Memory   │Evolution │ Sandbox  │
-│ Engine   │ Gateway  │ Gateway  │ Gateway  │ Manager  │  (Docker)│
-├──────────┼──────────┼──────────┼──────────┼──────────┼──────────┤
-│ FileTree │ Registry │ Syntax   │ Store    │Trajectory│ Container│
-│ CodeAna  │  File    │ Static   │Retriever │ Strategy │ Executor │
-│ Semantic │  Search  │ Runtime  │Extractor │ Applier  │ Resource │
-│ Assembly │  Git/LSP │ Auto-    │ Confidence│ Decay   │  Limits  │
-│          │  Terminal│ repair   │          │          │          │
-└──────────┴──────────┴──────────┴──────────┴──────────┴──────────┘
+    subgraph ORCH["Orchestration Layer"]
+        direction LR
+        CTX["Context"] --> PLN["Planning"]
+        PLN --> EXEC["Execution"]
+        EXEC --> VAL["Validation"]
+        VAL --> DONE["Done"]
+        PLN -.->|Re-plan| CTX
+        EXEC -.->|Repair Loop| EXEC
+        VAL -.->|Human Review| PLN
+    end
+
+    subgraph GATEWAYS["Gateway Layer"]
+        CG["Context Engine"]
+        TG["Tool Gateway"]
+        VG["Validation Gateway"]
+        MG["Memory Gateway"]
+        EVO["Evolution Manager"]
+        SB["Docker Sandbox"]
+    end
+
+    UI --> ORCH
+    ORCH --> GATEWAYS
+
+    subgraph DETAILS["Capabilities"]
+        FT["File Tree / Code Analysis / Semantic Search"]
+        TR["Tool Registry: File, Search, Git, LSP, Terminal"]
+        SYNTAX["Syntax / Static / Runtime Validation + Auto-Repair"]
+        MEM["Memory Store / Retriever / Extractor / Confidence Decay"]
+        TRAJ["Trajectory Recording / Strategy Extraction & Application"]
+        CONT["Container Execution / Resource Limits"]
+    end
+
+    CG --> FT
+    TG --> TR
+    VG --> SYNTAX
+    MG --> MEM
+    EVO --> TRAJ
+    SB --> CONT
 ```
+
+### Component Overview
+
+| Gateway | Responsibilities |
+|---------|-----------------|
+| **Context Engine** | File tree scanning, AST-based code analysis, dependency graph, semantic search, token-budgeted context assembly |
+| **Tool Gateway** | Tool registry (file I/O, code search, Git, LSP diagnostics, terminal), execution with sandbox support |
+| **Validation Gateway** | Three-layer validation: syntax (tree-sitter) → static analysis → runtime (test execution), with auto-repair |
+| **Memory Gateway** | Persistent memory with 4 types (user/feedback/project/reference), vector-based retrieval, confidence decay |
+| **Evolution Manager** | Trajectory recording, strategy extraction from successful tasks, strategy injection into future prompts |
+| **Docker Sandbox** | Isolated code execution with configurable memory/time limits, auto-degrades to local execution |
 
 ### Orchestrator Workflow
 
@@ -206,6 +233,8 @@ The Web UI provides:
 - **Task History** — Browse and re-run previous tasks
 
 ### REST API
+
+Detailed API documentation is available at [docs/api.md](docs/api.md).
 
 When the API server is running:
 
@@ -447,6 +476,10 @@ codeagent/
 │   ├── start_dev.bat                   #   Windows dev startup
 │   ├── start_dev.sh                    #   Unix dev startup
 │   └── cleanup.ps1                     #   Cleanup utility
+├── CONTRIBUTING.md                     # Contributor guide
+├── docs/
+│   ├── api.md                          # API reference documentation
+│   └── deployment.md                   # Deployment & operations guide
 ├── Dockerfile                          # Multi-stage build
 ├── docker-compose.yml                  # Production deployment
 ├── nginx.conf                          # Nginx reverse proxy config
@@ -481,6 +514,15 @@ python -m pytest tests/e2e/ -q --tb=short -m "e2e"
 # Run linter and type checker
 uv run ruff check codeagent/
 uv run mypy codeagent/ --ignore-missing-imports
+
+# Run performance benchmarks (requires LLM API key and Docker Redis for some tests)
+python -m pytest tests/benchmarks/ -m benchmark -v --tb=short
+
+# Run specific benchmark categories
+python -m pytest tests/benchmarks/ -m benchmark -k "context" --tb=short   # Context engine
+python -m pytest tests/benchmarks/ -m benchmark -k "search" --tb=short    # Semantic search
+python -m pytest tests/benchmarks/ -m benchmark -k "e2e" --tb=short       # End-to-end
+python -m pytest tests/benchmarks/ -m benchmark -k "websocket" --tb=short # WebSocket latency
 ```
 
 ### Test Organization
@@ -529,23 +571,13 @@ The evolution subsystem records execution trajectories, extracts reusable strate
 
 ## 🤝 Contributing
 
-Contributions are welcome! Please follow these steps:
+Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for the full contributor guide, including:
 
-1. Fork the repository
-2. Create a feature branch: `git checkout -b feat/my-feature`
-3. Make your changes and ensure tests pass: `python -m pytest tests/ -x -q`
-4. Run the linter: `uv run ruff check codeagent/`
-5. Run the type checker: `uv run mypy codeagent/ --ignore-missing-imports`
-6. Commit your changes: `git commit -am 'feat: add my feature'`
-7. Push to the branch: `git push origin feat/my-feature`
-8. Open a Pull Request
-
-### Development Conventions
-
-- **Code style**: Ruff (line length 100), with strict mypy type checking
-- **Commit style**: Conventional commits (`feat:`, `fix:`, `refactor:`, etc.)
-- **Python**: 3.12+ with modern type annotations (`list[str]`, `| None`)
-- **Testing**: pytest with `asyncio_mode = auto`
+- Development environment setup
+- Coding standards (Ruff, mypy)
+- Testing requirements
+- PR submission checklist
+- Commit message conventions
 
 <br>
 

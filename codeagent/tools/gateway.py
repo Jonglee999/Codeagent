@@ -17,7 +17,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from codeagent.gateway.tool_gateway import IToolGateway, ToolDefinition, ToolResult
+from codeagent.interaction.api.metrics import observe_tool_call
 from codeagent.tools.registry import ToolNotFoundError, ToolRegistry
+from codeagent.tracing import get_tracer
 
 logger = logging.getLogger(__name__)
 
@@ -151,13 +153,17 @@ class ToolGateway(IToolGateway):
                 duration_ms=(time.monotonic() - start_time) * 1000,
             )
 
-        # ── 执行（带超时） ────────────────────────────────
+        # ── 执行（带超时 + 追踪 Span） ─────────────────────
         try:
             timeout = tool.max_timeout_seconds
-            result = await asyncio.wait_for(
-                tool.execute(**params),
-                timeout=timeout,
-            )
+            with get_tracer().start_as_current_span("tool.call") as span:
+                span.set_attribute("tool_name", tool_name)
+                span.set_attribute("span.kind", "client")
+                result = await asyncio.wait_for(
+                    tool.execute(**params),
+                    timeout=timeout,
+                )
+                span.set_attribute("success", result.success)
         except asyncio.TimeoutError:
             duration = (time.monotonic() - start_time) * 1000
             self._record_execution(tool_name, params, False, duration, "TIMEOUT")
@@ -269,3 +275,6 @@ class ToolGateway(IToolGateway):
         if success:
             metric.success_count += 1
         metric.total_duration_ms += duration_ms
+
+        # Prometheus metrics (non-blocking)
+        observe_tool_call(tool_name, duration_ms / 1000.0, success)

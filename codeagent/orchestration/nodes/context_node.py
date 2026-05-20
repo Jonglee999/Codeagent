@@ -12,6 +12,7 @@ from typing import Any
 from codeagent.context_engine.context_assembler import ContextAssembler
 from codeagent.gateway.context_gateway import IContextGateway
 from codeagent.orchestration.state import AgentState
+from codeagent.tracing import trace_node
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,7 @@ class ContextNode:
         self._gateway = context_gateway
         self._assembler = context_assembler or ContextAssembler()
 
+    @trace_node("context")
     async def __call__(self, state: AgentState) -> dict[str, Any]:
         """执行上下文收集。
 

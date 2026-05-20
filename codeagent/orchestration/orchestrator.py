@@ -13,7 +13,9 @@ from typing import Any, Optional
 from codeagent.context_engine.evolution import SelfEvolutionManager
 from codeagent.gateway.tool_gateway import IToolGateway
 from codeagent.gateway.validation_gateway import IValidationGateway
+from codeagent.interaction.api.metrics import active_tasks, observe_task_duration
 from codeagent.orchestration.graph import build_workflow, run_workflow
+from codeagent.tracing import trace_llm_call
 from codeagent.orchestration.nodes.context_node import ContextNode
 from codeagent.orchestration.nodes.execution_node import ExecutionNode
 from codeagent.orchestration.nodes.human_review_node import HumanReviewNode
@@ -55,11 +57,14 @@ class Orchestrator:
         self._llm = llm
         self._model_name = model_name
 
+        # 为 LLM 调用添加 OpenTelemetry 追踪包装
+        traced_llm = trace_llm_call(model_name)(llm)
+
         # 创建节点
         self._context_node = ContextNode(context_gateway)
-        self._planning_node = PlanningNode(llm, model_name)
+        self._planning_node = PlanningNode(traced_llm, model_name)
         self._execution_node = ExecutionNode(
-            llm=llm,
+            llm=traced_llm,
             tool_gateway=tool_gateway,
             validation_gateway=validation_gateway,
             model_name=model_name,
@@ -129,6 +134,9 @@ class Orchestrator:
             thread_id, auto_mode,
         )
 
+        run_start = time.monotonic()
+        active_tasks.inc()
+
         try:
             final_state = await run_workflow(
                 graph=self._graph,
@@ -136,9 +144,17 @@ class Orchestrator:
                 config=config,
                 evolution_manager=self._evolution_manager,
             )
+            duration = time.monotonic() - run_start
+            has_errors = bool(final_state.errors)
+            status = "failed" if has_errors else "completed"
+            observe_task_duration(duration, status)
+            active_tasks.dec()
             logger.info("Orchestrator.run completed (thread=%s)", thread_id)
             return final_state
         except Exception as e:
+            duration = time.monotonic() - run_start
+            observe_task_duration(duration, "failed")
+            active_tasks.dec()
             logger.error("Orchestrator.run failed (thread=%s): %s", thread_id, e)
             initial_state.errors.append(f"Orchestrator run failed: {e}")
             return initial_state

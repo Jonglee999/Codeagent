@@ -22,6 +22,7 @@ from codeagent.config import (
     get_redis_url,
     load_env_file,
 )
+from codeagent.interaction.api.metrics import wrap_llm_call
 
 # 在模块加载时加载 .env 文件
 from pathlib import Path
@@ -130,7 +131,7 @@ def _build_llm(model_name: str) -> Any:
                     await asyncio.sleep(1.5 * (attempt + 1))
         raise last_exc  # type: ignore[misc]
 
-    return llm_call
+    return wrap_llm_call(model_name, llm_call)
 
 
 def _build_tool_gateway(project_root: str) -> Any:
