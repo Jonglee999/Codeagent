@@ -16,6 +16,9 @@ on:
     - cron: "0 9 * * 1"   # 每周一 UTC 09:00
   workflow_dispatch:
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   dependency-audit:
     runs-on: ubuntu-latest
