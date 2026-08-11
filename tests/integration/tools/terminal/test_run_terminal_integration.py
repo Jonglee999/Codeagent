@@ -154,8 +154,8 @@ class TestIntegrationSandboxCleanup:
     @pytest.mark.asyncio
     async def test_cleanup_all(self, sandbox: TerminalSandbox) -> None:
         """验证 cleanup_all 清理所有容器。"""
-        cid1 = sandbox.create_container()
-        cid2 = sandbox.create_container()
+        sandbox.create_container()
+        sandbox.create_container()
         sandbox.cleanup_all()
         assert sandbox.total_containers == 0
 

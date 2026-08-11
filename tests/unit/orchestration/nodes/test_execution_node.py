@@ -6,6 +6,7 @@ Mock IToolGateway、IValidationGateway 和 LLM，验证调度逻辑。
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -14,8 +15,189 @@ import pytest
 
 from codeagent.gateway.tool_gateway import IToolGateway, ToolDefinition, ToolResult
 from codeagent.gateway.validation_gateway import IValidationGateway, ValidationError, ValidationResult
-from codeagent.orchestration.nodes.execution_node import ExecutionNode
+from codeagent.orchestration.nodes.execution_node import (
+    _ALLOWED_TOOLS_BY_ACTION,
+    _MAX_PRESERVED_REASONING_CHARS,
+    _MAX_TOOL_OBSERVATION_CHARS,
+    ExecutionNode,
+    _assistant_retry_message,
+    _provider_response_diagnostic,
+    _recover_dsml_tool_calls,
+    _is_test_command,
+    _mentioned_source_paths,
+    _tool_result_message,
+)
 from codeagent.orchestration.state import AgentState, PlanStep, RepairContext, StructuredError
+
+
+def test_provider_diagnostic_does_not_persist_private_reasoning_text() -> None:
+    diagnostic = _provider_response_diagnostic(
+        type(
+            "Message",
+            (),
+            {"content": "visible", "reasoning_content": "private chain of thought"},
+        )(),
+        finish_reason="length",
+    )
+
+    assert diagnostic["content_present"] is True
+    assert diagnostic["reasoning_present"] is True
+    assert diagnostic["reasoning_chars"] == len("private chain of thought")
+    assert diagnostic["finish_reason"] == "length"
+    assert "private chain of thought" not in str(diagnostic)
+
+
+def test_tool_result_message_preserves_failure_recovery_details() -> None:
+    result = ToolResult(
+        success=False,
+        error_message="unsafe command",
+        error_code="SAFETY_BLOCKED",
+        data={"retry_guidance": "run a direct relative command"},
+    )
+
+    message = _tool_result_message(result)
+
+    assert "SAFETY_BLOCKED" in message
+    assert "run a direct relative command" in message
+
+
+def test_tool_result_message_bounds_large_observations_and_keeps_tail() -> None:
+    result = ToolResult(
+        success=True,
+        data={"stdout": "A" * 20_000 + "FINAL_TEST_FAILURE"},
+    )
+
+    message = _tool_result_message(result)
+
+    assert len(message) == _MAX_TOOL_OBSERVATION_CHARS
+    assert "TOOL_OBSERVATION_TRUNCATED" in message
+    assert "FINAL_TEST_FAILURE" in message
+
+
+def test_recovers_provider_dsml_tool_call_from_plain_text() -> None:
+    message = MockChoiceMessage(content="""<｜｜DSML｜｜tool_calls>
+<｜｜DSML｜｜invoke name="apply_patch">
+<｜｜DSML｜｜parameter name="file_path" string="true">django/admin.py</｜｜DSML｜｜parameter>
+<｜｜DSML｜｜parameter name="patch" string="true">*** Begin Patch
++value = &quot;fixed&quot;
+*** End Patch</｜｜DSML｜｜parameter>
+</｜｜DSML｜｜invoke>
+</｜｜DSML｜｜tool_calls>""")
+
+    calls = _recover_dsml_tool_calls(message)
+
+    assert len(calls) == 1
+    assert calls[0].function.name == "apply_patch"
+    assert json.loads(calls[0].function.arguments) == {
+        "file_path": "django/admin.py",
+        "patch": '*** Begin Patch\n+value = "fixed"\n*** End Patch',
+    }
+
+
+def test_does_not_parse_dsml_example_embedded_in_prose() -> None:
+    message = MockChoiceMessage(
+        content="For example: <｜｜DSML｜｜tool_calls></｜｜DSML｜｜tool_calls>"
+    )
+
+    assert _recover_dsml_tool_calls(message) == []
+
+
+def test_recovers_dsml_tool_call_from_reasoning_content() -> None:
+    message = MockChoiceMessage(content="")
+    message.reasoning_content = """<|DSML|tool_calls>
+<|DSML|invoke name="write_file">
+<|DSML|parameter name="file_path">fix.py</|DSML|parameter>
+<|DSML|parameter name="content">value = 2</|DSML|parameter>
+</|DSML|invoke>
+</|DSML|tool_calls>"""
+
+    calls = _recover_dsml_tool_calls(message)
+
+    assert len(calls) == 1
+    assert calls[0].function.name == "write_file"
+    assert json.loads(calls[0].function.arguments) == {
+        "file_path": "fix.py",
+        "content": "value = 2",
+    }
+
+
+def test_retry_message_preserves_reasoning_only_provider_response() -> None:
+    message = MockChoiceMessage(content="")
+    message.reasoning_content = "I found the target and will patch it next."
+
+    retry = _assistant_retry_message(message, "fallback")
+
+    assert retry == {
+        "role": "assistant",
+        "content": "",
+        "reasoning_content": "I found the target and will patch it next.",
+    }
+
+
+def test_retry_message_bounds_preserved_reasoning() -> None:
+    message = MockChoiceMessage(content="")
+    message.reasoning_content = "A" * (_MAX_PRESERVED_REASONING_CHARS + 500)
+
+    retry = _assistant_retry_message(message, "fallback")
+
+    assert len(retry["reasoning_content"]) == _MAX_PRESERVED_REASONING_CHARS
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("pytest -q tests/test_case.py::test_it", True),
+        ("python -m pytest -q", True),
+        ("python tests/runtests.py admin_views", True),
+        ("python manage.py test app.tests", True),
+        ('grep -rn "has_add_permission" tests | head -30', False),
+        ("find tests -name '*.py'", False),
+    ],
+)
+def test_test_command_evidence_requires_a_test_runner(
+    command: str, expected: bool
+) -> None:
+    assert _is_test_command(command) is expected
+
+
+def test_extracts_explicit_source_paths_from_issue() -> None:
+    assert _mentioned_source_paths(
+        'At "django/contrib/admin/templatetags/admin_modify.py" add a check.'
+    ) == {"django/contrib/admin/templatetags/admin_modify.py"}
+
+
+@pytest.mark.asyncio
+async def test_token_budget_stops_llm_before_another_call(mocker) -> None:
+    mocker.patch(
+        "codeagent.orchestration.nodes.execution_node.codeagent_config.get_max_llm_calls_per_task",
+        return_value=50,
+    )
+    mocker.patch(
+        "codeagent.orchestration.nodes.execution_node.codeagent_config.get_max_tokens_per_task",
+        return_value=100,
+    )
+    state = AgentState(
+        user_request="test",
+        project_root="/root",
+        estimated_tokens=100,
+    )
+    llm = AsyncMock()
+    node = ExecutionNode(
+        llm=llm,
+        tool_gateway=make_gateway(),
+        validation_gateway=make_validation_gateway(),
+    )
+
+    result = await node._call_llm_with_limit(
+        state=state,
+        messages=[{"role": "user", "content": "hello"}],
+        tools=None,
+        tool_choice=None,
+    )
+
+    assert result is None
+    assert state.review_type == "token_budget_exhausted"
+    llm.assert_not_called()
 
 
 # ── Mock helpers ──────────────────────────────────────────────────────────
@@ -188,8 +370,283 @@ class TestNormalFlow:
         assert len(result["execution_log"]) >= 1
         tool_calls = [e for e in result["execution_log"] if e["type"] == "tool_call"]
         assert len(tool_calls) == 1
-        assert tool_calls[0]["tool_name"] == "read_file"
-        assert tool_calls[0]["success"] is True
+
+    async def test_planned_mutation_requires_provider_tool_call(self) -> None:
+        state = AgentState(
+            user_request="Fix benchmark issue",
+            project_root="/test/project",
+            benchmark_instance_id="owner__repo-1",
+            plan=[PlanStep(
+                step_id=1,
+                description="Implement fix",
+                action="modify",
+                acceptance_criteria="Apply a source patch",
+            )],
+        )
+        llm = AsyncMock(return_value=MockLLMResponse(choices=[MockChoice(
+            message=MockChoiceMessage(
+                tool_calls=[MockToolCall(function=MockToolCall.Function(
+                    name="write_file",
+                    arguments=(
+                        '{"file_path": "fix.py", "content": "fixed = True", '
+                        '"mode": "modify"}'
+                    ),
+                ))],
+            )
+        )]))
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=make_gateway(tool_results=[
+                ToolResult(success=True, data={"file_path": "fix.py"}),
+            ]),
+            validation_gateway=make_validation_gateway(),
+        )
+
+        result = await node(state)
+
+        assert result["accumulated_changes"][0]["file_path"] == "fix.py"
+        assert llm.await_args.kwargs["tool_choice"] == "auto"
+
+    async def test_direct_benchmark_requires_test_attempt_after_mutation(self) -> None:
+        state = AgentState(
+            user_request="Fix benchmark issue",
+            project_root="/test/project",
+            benchmark_instance_id="owner__repo-1",
+            benchmark_fail_to_pass=["tests/test_regression.py::test_case"],
+        )
+        write_call = MockToolCall(function=MockToolCall.Function(
+            name="write_file",
+            arguments=(
+                '{"file_path": "fix.py", "content": "fixed = True", '
+                '"mode": "modify"}'
+            ),
+        ))
+        test_call = MockToolCall(
+            id="run_target_test",
+            function=MockToolCall.Function(
+                name="run_terminal",
+                arguments=(
+                    '{"command": "pytest -q '
+                    'tests/test_regression.py::test_case"}'
+                ),
+            ),
+        )
+        llm = AsyncMock(side_effect=[
+            MockLLMResponse(choices=[MockChoice(
+                message=MockChoiceMessage(tool_calls=[write_call])
+            )]),
+            MockLLMResponse(choices=[MockChoice(
+                message=MockChoiceMessage(content="Implemented")
+            )]),
+            MockLLMResponse(choices=[MockChoice(
+                message=MockChoiceMessage(tool_calls=[test_call])
+            )]),
+            MockLLMResponse(choices=[MockChoice(
+                message=MockChoiceMessage(content="Tested")
+            )]),
+        ])
+        gateway = make_gateway(tool_results=[
+            ToolResult(success=True, data={"file_path": "fix.py"}),
+            ToolResult(success=True, data={"exit_code": 0, "stdout": "1 passed"}),
+        ])
+        gateway.list_tools.return_value.append(ToolDefinition(
+            name="run_terminal",
+            description="Run a command",
+            parameters_schema={
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+            },
+        ))
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=gateway,
+            validation_gateway=make_validation_gateway(),
+        )
+
+        result = await node(state)
+
+        assert gateway.execute_tool.await_count == 2
+        assert any(
+            "has not been tested" in str(message.get("content", ""))
+            for message in llm.await_args_list[2].kwargs["messages"]
+        )
+        stages = [
+            entry["stage"]
+            for entry in result["execution_log"]
+            if entry["type"] == "benchmark_stage"
+        ]
+        assert stages == ["locate", "target_test", "regression_test"]
+
+    async def test_direct_benchmark_forces_mutation_after_explicit_target_stagnates(
+        self,
+    ) -> None:
+        target = "pkg/target.py"
+        state = AgentState(
+            user_request=f'At "{target}" add the missing permission check.',
+            project_root="/test/project",
+            benchmark_instance_id="owner__repo-2",
+        )
+
+        def read_call(index: int, path: str) -> MockLLMResponse:
+            return MockLLMResponse(choices=[MockChoice(message=MockChoiceMessage(
+                tool_calls=[MockToolCall(
+                    id=f"read_{index}",
+                    function=MockToolCall.Function(
+                        name="read_file",
+                        arguments=json.dumps({"file_path": path}),
+                    ),
+                )]
+            ))])
+
+        write_call = MockLLMResponse(choices=[MockChoice(message=MockChoiceMessage(
+            tool_calls=[MockToolCall(
+                id="write_fix",
+                function=MockToolCall.Function(
+                    name="write_file",
+                    arguments=json.dumps({
+                        "file_path": target,
+                        "content": "fixed = True\n",
+                        "mode": "modify",
+                    }),
+                ),
+            )]
+        ))])
+        disallowed_read = read_call(5, "pkg/another_helper.py")
+        reasoning_only = MockLLMResponse(choices=[MockChoice(
+            message=MockChoiceMessage(content="I should make the change now.")
+        )])
+        recovery_read = read_call(6, target)
+        test_call = MockLLMResponse(choices=[MockChoice(message=MockChoiceMessage(
+            tool_calls=[MockToolCall(
+                id="test_fix",
+                function=MockToolCall.Function(
+                    name="run_terminal",
+                    arguments='{"command": "pytest -q tests/test_target.py"}',
+                ),
+            )]
+        ))])
+        llm = AsyncMock(side_effect=[
+            read_call(1, target),
+            read_call(2, "tests/test_target.py"),
+            read_call(3, "pkg/helper.py"),
+            read_call(4, "pkg/config.py"),
+            disallowed_read,
+            reasoning_only,
+            write_call,
+            recovery_read,
+            write_call,
+            test_call,
+            MockLLMResponse(choices=[MockChoice(
+                message=MockChoiceMessage(content="Fixed and tested")
+            )]),
+        ])
+        gateway = make_gateway(tool_results=[
+            *[
+                ToolResult(success=True, data={"content": "source\n"})
+                for _ in range(5)
+            ],
+            ToolResult(
+                success=False,
+                error_message="Patch conflict",
+                error_code="PATCH_CONFLICT",
+                retryable=True,
+            ),
+            ToolResult(success=True, data={"content": "current source\n"}),
+            ToolResult(success=True, data={"file_path": target}),
+            ToolResult(success=True, data={"exit_code": 0, "stdout": "1 passed"}),
+        ])
+        gateway.list_tools.return_value.append(ToolDefinition(
+            name="run_terminal",
+            description="Run a command",
+            parameters_schema={"type": "object"},
+        ))
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=gateway,
+            validation_gateway=make_validation_gateway(),
+        )
+
+        result = await node(state)
+
+        fifth_tool_names = {
+            tool["function"]["name"]
+            for tool in llm.await_args_list[4].kwargs["tools"]
+        }
+        assert fifth_tool_names == {"read_file", "write_file"}
+        assert llm.await_args_list[4].kwargs["tool_choice"] == "auto"
+        assert llm.await_args_list[5].kwargs["tool_choice"] == "auto"
+        recovery_tool_names = {
+            tool["function"]["name"]
+            for tool in llm.await_args_list[7].kwargs["tools"]
+        }
+        assert recovery_tool_names == {"read_file", "write_file"}
+        assert gateway.execute_tool.await_count == 9
+        rejected = [
+            entry
+            for entry in result["execution_log"]
+            if entry.get("error_code") == "CAPABILITY_NOT_EXPOSED"
+        ]
+        assert rejected == []
+        assert not any("Exceeded max tool calls" in error for error in result["errors"])
+        guards = [
+            entry
+            for entry in result["execution_log"]
+            if entry["type"] == "benchmark_stagnation_guard"
+        ]
+        assert guards == [
+            {
+                "type": "benchmark_stagnation_guard",
+                "discovery_calls": 4,
+                "explicit_target_inspected": True,
+                "timestamp": guards[0]["timestamp"],
+            }
+        ]
+        assert any(
+            entry["type"] == "benchmark_patch_conflict_recovery"
+            for entry in result["execution_log"]
+        )
+
+    async def test_action_follow_up_reprompts_instead_of_repeating_prior_answer(self) -> None:
+        state = AgentState(
+            user_request="Run it again and return the result",
+            project_root="/test/project",
+            conversation_history=[
+                {"role": "user", "content": "Create hello.py"},
+                {"role": "assistant", "content": "Created it. Output: hello"},
+                {"role": "user", "content": "Run it again and return the result"},
+            ],
+        )
+        responses = [
+            MockLLMResponse(choices=[MockChoice(
+                message=MockChoiceMessage(content="Created it. Output: hello")
+            )]),
+            MockLLMResponse(choices=[MockChoice(
+                message=MockChoiceMessage(
+                    content="I will verify it now",
+                    tool_calls=[MockToolCall()],
+                )
+            )]),
+            MockLLMResponse(choices=[MockChoice(
+                message=MockChoiceMessage(content="Fresh result: hello")
+            )]),
+        ]
+        llm = AsyncMock(side_effect=responses)
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=make_gateway(),
+            validation_gateway=make_validation_gateway(),
+        )
+
+        result = await node(state)
+
+        assert llm.await_count == 3
+        assert any(entry["type"] == "tool_call" for entry in result["execution_log"])
+        second_messages = llm.await_args_list[1].kwargs["messages"]
+        assert any(
+            "Do not repeat the previous answer" in str(message.get("content", ""))
+            for message in second_messages
+        )
 
     async def test_multiple_tool_calls(self, state: AgentState) -> None:
         """LLM 依次调用多个工具。"""
@@ -442,6 +899,81 @@ class TestToolFailure:
         assert len(tool_calls) == 1
         assert tool_calls[0]["success"] is False
         assert "error" in tool_calls[0]
+        assert tool_calls[0]["error_code"] == "FILE_NOT_FOUND"
+        retry_messages = llm.call_args_list[1].kwargs["messages"]
+        tool_message = next(item for item in retry_messages if item["role"] == "tool")
+        assert '"error_code": "FILE_NOT_FOUND"' in tool_message["content"]
+        assert '"retryable": false' in tool_message["content"]
+        assert '"suggested_recovery"' in tool_message["content"]
+        assert '"bounded_output": true' in tool_message["content"]
+
+    async def test_benchmark_direct_mode_reprompts_until_file_change(self) -> None:
+        state = AgentState(
+            user_request="fix benchmark issue",
+            project_root="/root",
+            direct_execution=True,
+            benchmark_instance_id="owner__repo-1",
+        )
+        llm = AsyncMock(side_effect=[
+            MockLLMResponse(choices=[MockChoice(
+                message=MockChoiceMessage(content="The fix should be small")
+            )]),
+            MockLLMResponse(choices=[MockChoice(
+                message=MockChoiceMessage(
+                    content="Applying fix",
+                    tool_calls=[MockToolCall(
+                        id="call_fix",
+                        function=MockToolCall.Function(
+                            name="write_file",
+                            arguments=(
+                                '{"file_path": "fix.py", "content": "fixed = True", '
+                                '"mode": "create"}'
+                            ),
+                        ),
+                    )],
+                )
+            )]),
+            MockLLMResponse(choices=[MockChoice(
+                message=MockChoiceMessage(content="Implemented")
+            )]),
+            MockLLMResponse(choices=[MockChoice(
+                message=MockChoiceMessage(tool_calls=[MockToolCall(
+                    id="call_test",
+                    function=MockToolCall.Function(
+                        name="run_terminal",
+                        arguments='{"command": "pytest -q"}',
+                    ),
+                )])
+            )]),
+            MockLLMResponse(choices=[MockChoice(
+                message=MockChoiceMessage(content="Implemented and tested")
+            )]),
+        ])
+        gateway = make_gateway(tool_results=[
+            ToolResult(success=True, data={"file_path": "fix.py"}),
+            ToolResult(success=True, data={"exit_code": 0, "stdout": "1 passed"}),
+        ])
+        gateway.list_tools.return_value.append(ToolDefinition(
+            name="run_terminal",
+            description="Run a command",
+            parameters_schema={"type": "object"},
+        ))
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=gateway,
+            validation_gateway=make_validation_gateway(),
+        )
+
+        result = await node(state)
+
+        assert llm.await_count == 5
+        assert result["accumulated_changes"][0]["file_path"] == "fix.py"
+        second_messages = llm.call_args_list[1].kwargs["messages"]
+        assert any(
+            "no successful file mutation" in item.get("content", "")
+            for item in second_messages
+            if item["role"] == "user"
+        )
 
 
 # ── Tests: Max tool calls exceeded ───────────────────────────────────────
@@ -583,10 +1115,19 @@ class TestPlanAwareExecution:
         step1_resp = MockLLMResponse(choices=[MockChoice(
             message=MockChoiceMessage(content="Read main.py")
         )])
-        step2_resp = MockLLMResponse(choices=[MockChoice(
+        step2_tool_resp = MockLLMResponse(choices=[MockChoice(
+            message=MockChoiceMessage(
+                content="Creating app.py",
+                tool_calls=[MockToolCall(function=MockToolCall.Function(
+                    name="write_file",
+                    arguments='{"file_path": "app.py", "content": "app = 1", "mode": "create"}',
+                ))],
+            )
+        )])
+        step2_done_resp = MockLLMResponse(choices=[MockChoice(
             message=MockChoiceMessage(content="Created app.py")
         )])
-        llm = AsyncMock(side_effect=[step1_resp, step2_resp])
+        llm = AsyncMock(side_effect=[step1_resp, step2_tool_resp, step2_done_resp])
 
         node = ExecutionNode(
             llm=llm,
@@ -597,7 +1138,7 @@ class TestPlanAwareExecution:
         assert result["current_step_index"] == 2  # 两步都完成
         assert "execution_log" in result
 
-    async def test_updates_step_index(self) -> None:
+    async def test_missing_mutation_evidence_does_not_advance_step(self) -> None:
         """current_step_index 应正确更新。"""
         state = self._make_plan_state()
         llm = AsyncMock(return_value=MockLLMResponse(choices=[MockChoice(
@@ -610,7 +1151,33 @@ class TestPlanAwareExecution:
             validation_gateway=make_validation_gateway(),
         )
         result = await node(state)
-        assert result["current_step_index"] == 2
+        assert result["current_step_index"] == 1
+        assert any("Step evidence missing" in error for error in result["errors"])
+
+    async def test_read_with_acceptance_requires_tool_evidence(self) -> None:
+        state = AgentState(
+            user_request="inspect file",
+            project_root="/root",
+            plan=[PlanStep(
+                step_id=1,
+                description="Read main.py",
+                action="read",
+                target_file="main.py",
+                acceptance_criteria="read_file returns the relevant source",
+            )],
+        )
+        node = ExecutionNode(
+            llm=AsyncMock(return_value=MockLLMResponse(choices=[MockChoice(
+                message=MockChoiceMessage(content="Done without reading")
+            )])),
+            tool_gateway=make_gateway(),
+            validation_gateway=make_validation_gateway(),
+        )
+
+        result = await node(state)
+
+        assert result["current_step_index"] == 0
+        assert any("Step evidence missing" in error for error in result["errors"])
 
     async def test_partial_execution_from_mid_plan(self) -> None:
         """从中间步骤开始执行。"""
@@ -860,6 +1427,169 @@ class TestAccumulatedChanges:
         assert changes[0]["file_path"] == "hello.py"
         assert changes[0]["step_id"] == 1
 
+    async def test_tracks_apply_patch_as_modify_evidence(self, tmp_path) -> None:
+        target = tmp_path / "hello.py"
+        target.write_text("value = 1\n", encoding="utf-8")
+        plan = [PlanStep(
+            step_id=1,
+            description="Patch file",
+            action="modify",
+            target_file="hello.py",
+        )]
+        state = AgentState(
+            user_request="modify file",
+            project_root=str(tmp_path),
+            plan=plan,
+        )
+        responses = [MockLLMResponse(choices=[MockChoice(
+            message=MockChoiceMessage(
+                content="Patching",
+                tool_calls=[MockToolCall(
+                    id="call_patch",
+                    function=MockToolCall.Function(
+                        name="apply_patch",
+                        arguments=(
+                            '{"file_path": "hello.py", "old_text": "value = 1", '
+                            '"new_text": "value = 2"}'
+                        ),
+                    ),
+                )],
+            )
+        )])]
+        gateway = make_gateway(tool_results=[
+            ToolResult(success=True, data={"file_path": "hello.py", "replacements": 1}),
+        ])
+        node = ExecutionNode(
+            llm=AsyncMock(side_effect=responses),
+            tool_gateway=gateway,
+            validation_gateway=make_validation_gateway(),
+        )
+
+        result = await node(state)
+
+        assert result["current_step_index"] == 1
+        assert result["accumulated_changes"][0]["file_path"] == "hello.py"
+        assert result["accumulated_changes"][0]["action"] == "modify"
+        assert state.plan[0].evidence[0]["tool_name"] == "apply_patch"
+
+    async def test_modify_step_forces_mutation_tools_after_discovery_budget(
+        self, tmp_path
+    ) -> None:
+        target = tmp_path / "main.py"
+        target.write_text("value = 1\n", encoding="utf-8")
+        state = AgentState(
+            user_request="modify file",
+            project_root=str(tmp_path),
+            plan=[PlanStep(
+                step_id=1,
+                description="Modify main.py",
+                action="modify",
+                target_file="main.py",
+            )],
+        )
+        read_responses = [
+            MockLLMResponse(choices=[MockChoice(message=MockChoiceMessage(
+                tool_calls=[MockToolCall(
+                    id=f"read_{index}",
+                    function=MockToolCall.Function(
+                        name="read_file",
+                        arguments='{"file_path": "main.py"}',
+                    ),
+                )]
+            ))])
+            for index in range(3)
+        ]
+        write_response = MockLLMResponse(choices=[MockChoice(
+            message=MockChoiceMessage(tool_calls=[MockToolCall(
+                id="write_1",
+                function=MockToolCall.Function(
+                    name="write_file",
+                    arguments=(
+                        '{"file_path": "main.py", "content": "value = 2\\n", '
+                        '"mode": "modify"}'
+                    ),
+                ),
+            )])
+        )])
+        llm = AsyncMock(side_effect=[*read_responses, write_response])
+        gateway = make_gateway(tool_results=[
+            ToolResult(success=True, data={"content": "value = 1\n"}),
+            ToolResult(success=True, data={"content": "value = 1\n"}),
+            ToolResult(success=True, data={"content": "value = 1\n"}),
+            ToolResult(success=True, data={"file_path": "main.py"}),
+        ])
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=gateway,
+            validation_gateway=make_validation_gateway(),
+        )
+
+        result = await node(state)
+
+        fourth_tools = llm.await_args_list[3].kwargs["tools"]
+        fourth_names = {tool["function"]["name"] for tool in fourth_tools}
+        assert fourth_names == {"write_file"}
+        assert result["current_step_index"] == 1
+
+    async def test_modify_retry_keeps_reasoning_before_forcing_mutation(
+        self, tmp_path
+    ) -> None:
+        target = tmp_path / "main.py"
+        target.write_text("value = 1\n", encoding="utf-8")
+        state = AgentState(
+            user_request="modify file",
+            project_root=str(tmp_path),
+            plan=[PlanStep(
+                step_id=1,
+                description="Modify main.py",
+                action="modify",
+                target_file="main.py",
+            )],
+        )
+        thinking = MockChoiceMessage(content="")
+        thinking.reasoning_content = "The exact replacement is value = 2."
+        patch_response = MockLLMResponse(choices=[MockChoice(
+            message=MockChoiceMessage(tool_calls=[MockToolCall(
+                id="write_after_reasoning",
+                function=MockToolCall.Function(
+                    name="write_file",
+                    arguments=(
+                        '{"file_path": "main.py", "content": "value = 2\\n", '
+                        '"mode": "modify"}'
+                    ),
+                ),
+            )])
+        )])
+        llm = AsyncMock(side_effect=[
+            MockLLMResponse(choices=[MockChoice(message=thinking)]),
+            patch_response,
+        ])
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=make_gateway(tool_results=[
+                ToolResult(success=True, data={"file_path": "main.py"}),
+            ]),
+            validation_gateway=make_validation_gateway(),
+        )
+
+        result = await node(state)
+
+        retry_messages = llm.await_args_list[1].kwargs["messages"]
+        preserved = next(
+            message for message in retry_messages
+            if message.get("reasoning_content")
+        )
+        reprompt = next(
+            message for message in retry_messages
+            if message.get("role") == "user"
+            and "do not restart" in message.get("content", "")
+        )
+        assert preserved["reasoning_content"] == (
+            "The exact replacement is value = 2."
+        )
+        assert "do not restart" in reprompt["content"]
+        assert result["current_step_index"] == 1
+
     async def test_preserves_existing_changes(self) -> None:
         """应保留 state 中已有的 accumulated_changes。"""
         plan = [PlanStep(step_id=1, description="Write", action="create",
@@ -958,6 +1688,24 @@ class TestDeviationDetection:
         # 不应有偏离检测标记
         deviations = [e for e in result["execution_log"] if e["type"] == "deviation_detected"]
         assert len(deviations) == 0
+
+    async def test_list_files_and_apply_patch_are_valid_for_modify(self) -> None:
+        step = PlanStep(
+            step_id=1,
+            description="Inspect and patch main.py",
+            action="modify",
+            target_file="main.py",
+        )
+        node = ExecutionNode(
+            llm=make_llm(),
+            tool_gateway=make_gateway(),
+            validation_gateway=make_validation_gateway(),
+        )
+
+        assert node._check_deviation(step, "list_files", {"path": "."}) is False
+        assert node._check_deviation(
+            step, "apply_patch", {"file_path": "main.py"}
+        ) is False
 
     async def test_write_outside_plan_triggers_deviation(self) -> None:
         """写入计划外的文件应触发偏离。"""
@@ -1419,9 +2167,23 @@ class TestProgressTracking:
             project_root="/root",
             plan=plan,
         )
-        llm = AsyncMock(return_value=MockLLMResponse(choices=[MockChoice(
-            message=MockChoiceMessage(content="Done")
-        )]))
+        llm = AsyncMock(side_effect=[
+            MockLLMResponse(choices=[MockChoice(
+                message=MockChoiceMessage(content="Read complete")
+            )]),
+            MockLLMResponse(choices=[MockChoice(
+                message=MockChoiceMessage(
+                    content="Creating app.py",
+                    tool_calls=[MockToolCall(function=MockToolCall.Function(
+                        name="write_file",
+                        arguments='{"file_path": "app.py", "content": "app = 1", "mode": "create"}',
+                    ))],
+                )
+            )]),
+            MockLLMResponse(choices=[MockChoice(
+                message=MockChoiceMessage(content="Done")
+            )]),
+        ])
         node = ExecutionNode(
             llm=llm,
             tool_gateway=make_gateway(),
@@ -1438,9 +2200,9 @@ class TestProgressTracking:
         plan = [
             PlanStep(step_id=1, description="Read", action="read",
                      target_file="a.py"),
-            PlanStep(step_id=2, description="Modify", action="modify",
+            PlanStep(step_id=2, description="Read second", action="read",
                      target_file="b.py"),
-            PlanStep(step_id=3, description="Delete", action="delete",
+            PlanStep(step_id=3, description="Read third", action="read",
                      target_file="c.py"),
         ]
         state = AgentState(
@@ -2001,6 +2763,22 @@ class TestOriginalContentSaving:
         assert file_path == str(new_file)
         assert content is None  # 文件不存在
 
+    async def test_save_resolves_tool_relative_path_from_workspace(self, tmp_path: Path) -> None:
+        test_file = tmp_path / "relative.py"
+        test_file.write_text("# existing", encoding="utf-8")
+        node = ExecutionNode(
+            llm=make_llm(),
+            tool_gateway=make_gateway(),
+            validation_gateway=make_validation_gateway(),
+        )
+
+        file_path, content = node._save_original_content_before_tool(
+            "write_file", {"file_path": "relative.py"}, str(tmp_path)
+        )
+
+        assert file_path == "relative.py"
+        assert content == "# existing"
+
     async def test_save_before_delete_file(self, tmp_path: Path) -> None:
         """delete_file 前保存原始内容。"""
         test_file = tmp_path / "to_delete.py"
@@ -2324,6 +3102,10 @@ class TestLLMCostControl:
             "codeagent.orchestration.nodes.execution_node.codeagent_config.get_max_llm_calls_per_task",
             return_value=50,
         )
+        mocker.patch(
+            "codeagent.orchestration.nodes.execution_node.codeagent_config.get_max_completion_tokens_per_call",
+            return_value=4096,
+        )
         state = AgentState(
             user_request="test", project_root="/root",
             llm_call_count=0,
@@ -2345,6 +3127,7 @@ class TestLLMCostControl:
         assert result is not None
         assert state.llm_call_count == 1
         llm.assert_called_once()
+        assert llm.call_args.kwargs["max_tokens"] == 4096
 
     async def test_cross_round_accumulation(self, mocker) -> None:
         """llm_call_count 跨多轮累计。"""
@@ -2427,3 +3210,183 @@ class TestLLMCostControl:
         assert state.human_review_required is True
         llm.assert_not_called()
         assert "execution_log" in result
+
+    async def test_runtime_steering_is_injected_before_next_llm_call(self) -> None:
+        events: list[dict] = []
+        provider = AsyncMock(return_value=["Keep the public API backward compatible"])
+        llm = AsyncMock(return_value=MagicMock(usage=None))
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=make_gateway(),
+            validation_gateway=make_validation_gateway(),
+            progress_callback=events.append,
+            steering_provider=provider,
+        )
+        state = AgentState(user_request="refactor the API", project_root="/root")
+        messages = [{"role": "user", "content": state.user_request}]
+
+        await node._call_llm_with_limit(
+            state=state, messages=messages, tools=None, tool_choice=None,
+        )
+
+        assert provider.await_count == 1
+        assert state.steering_instructions == ["Keep the public API backward compatible"]
+        assert "Runtime steering update" in messages[-1]["content"]
+        assert llm.await_args.kwargs["messages"][-1] == messages[-1]
+        assert events[-1]["type"] == "steering_applied"
+
+
+# ── P0-1: Action-scoped tool pruning ───────────────────────────────────────
+
+
+def _make_multi_tool_gateway() -> AsyncMock:
+    """A gateway exposing core write/read/explore tools plus MCP and a shell tool."""
+    names = [
+        "read_file", "list_files", "search_code", "get_diagnostics",
+        "write_file", "apply_patch", "delete_file", "run_terminal", "git",
+        "mcp__github",  # MCP tool bypasses _check_deviation by name
+    ]
+    mock = AsyncMock(spec=IToolGateway)
+    mock.list_tools.return_value = [
+        ToolDefinition(
+            name=name,
+            description=f"{name} description",
+            parameters_schema={"type": "object", "properties": {}, "required": []},
+        )
+        for name in names
+    ]
+    mock.execute_tool = AsyncMock(
+        return_value=ToolResult(success=True, data={"content": ""})
+    )
+    return mock
+
+
+class TestActionScopedToolPruning:
+    """P0-1: plan steps only carry the tools their action allows (+ MCP)."""
+
+    def _node(self, gateway: AsyncMock) -> ExecutionNode:
+        return ExecutionNode(
+            llm=AsyncMock(),
+            tool_gateway=gateway,
+            validation_gateway=make_validation_gateway(),
+        )
+
+    def test_modify_step_prunes_to_modify_set_plus_mcp(self) -> None:
+        node = self._node(_make_multi_tool_gateway())
+        state = AgentState(user_request="t", project_root="/root")
+        names = {t.name for t in node._available_tools(state, "modify")}
+        expected = _ALLOWED_TOOLS_BY_ACTION["modify"] | {"mcp__github"}
+        assert names == expected
+        # Shell/git/delete are already blocked by _check_deviation at call time.
+        assert "run_terminal" not in names
+        assert "git" not in names
+        assert "delete_file" not in names
+
+    def test_read_step_prunes_write_tools(self) -> None:
+        node = self._node(_make_multi_tool_gateway())
+        state = AgentState(user_request="t", project_root="/root")
+        names = {t.name for t in node._available_tools(state, "read")}
+        assert "write_file" not in names
+        assert "run_terminal" not in names
+        assert "mcp__github" in names
+
+    def test_no_action_returns_all_tools(self) -> None:
+        node = self._node(_make_multi_tool_gateway())
+        state = AgentState(user_request="t", project_root="/root")
+        names = {t.name for t in node._available_tools(state)}
+        assert names == {
+            "read_file", "list_files", "search_code", "get_diagnostics",
+            "write_file", "apply_patch", "delete_file", "run_terminal", "git",
+            "mcp__github",
+        }
+
+    def test_unknown_action_defaults_to_no_tools(self) -> None:
+        node = self._node(_make_multi_tool_gateway())
+        state = AgentState(user_request="t", project_root="/root")
+        names = {t.name for t in node._available_tools(state, "no_such_action")}
+        assert names == set()
+
+    def test_skill_allowlist_intersects_action_policy(self) -> None:
+        node = self._node(_make_multi_tool_gateway())
+        state = AgentState(
+            user_request="t", project_root="/root", allowed_tools=["git", "read_file"],
+        )
+        names = {t.name for t in node._available_tools(state, "modify")}
+        assert names == {"read_file"}
+
+    def test_skill_allowlist_cannot_restore_manifest_pruned_tool(self) -> None:
+        node = self._node(_make_multi_tool_gateway())
+        state = AgentState(
+            user_request="t",
+            project_root="/root",
+            allowed_tools=["git", "read_file"],
+            tool_manifest={"selected_names": ["read_file"]},
+        )
+        names = {t.name for t in node._available_tools(state, "read")}
+        assert names == {"read_file"}
+
+    async def test_plan_execution_passes_pruned_schema_to_llm(self) -> None:
+        """End-to-end: a modify step's tools= payload excludes shell/git/delete."""
+        gateway = _make_multi_tool_gateway()
+        # Model first calls write_file (valid for modify), then finishes.
+        llm = AsyncMock(side_effect=[
+            MockLLMResponse(choices=[MockChoice(message=MockChoiceMessage(
+                content="modifying",
+                tool_calls=[MockToolCall(function=MockToolCall.Function(
+                    name="write_file",
+                    arguments='{"file_path": "a.py", "content": "x = 1", "mode": "create"}',
+                ))],
+            ))]),
+            MockLLMResponse(choices=[MockChoice(message=MockChoiceMessage(content="done"))]),
+        ])
+        node = ExecutionNode(
+            llm=llm,
+            tool_gateway=gateway,
+            validation_gateway=make_validation_gateway(),
+        )
+        state = AgentState(
+            user_request="add a file",
+            project_root="/root",
+            plan=[PlanStep(step_id=1, description="create a.py", action="create", target_file="a.py")],
+        )
+        await node(state)
+
+        # The first (and only) LLM call that carried tools= must exclude
+        # run_terminal / git / delete_file for a create step.
+        tool_names = {
+            t["function"]["name"]
+            for call in llm.await_args_list
+            if call.kwargs.get("tools")
+            for t in call.kwargs["tools"]
+        }
+        assert "write_file" in tool_names
+        assert "read_file" in tool_names
+        assert "run_terminal" not in tool_names
+        assert "git" not in tool_names
+        assert "delete_file" not in tool_names
+        assert "mcp__github" in tool_names
+
+
+@pytest.mark.asyncio
+async def test_planned_execution_preserves_prior_execution_log() -> None:
+    prior = {
+        "type": "tool_call",
+        "tool_name": "apply_patch",
+        "success": True,
+    }
+    node = ExecutionNode(
+        llm=AsyncMock(),
+        tool_gateway=_make_multi_tool_gateway(),
+        validation_gateway=make_validation_gateway(),
+    )
+    state = AgentState(
+        user_request="fix it",
+        project_root="/root",
+        plan=[PlanStep(step_id=1, description="done", action="modify")],
+        current_step_index=1,
+        execution_log=[prior],
+    )
+
+    result = await node._execute_with_plan(state)
+
+    assert result["execution_log"] == [prior]

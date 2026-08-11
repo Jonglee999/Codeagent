@@ -11,11 +11,13 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+import asyncio
+import threading
+from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
-from codeagent.gateway.tool_gateway import ToolResult
 from codeagent.tools.terminal.run_terminal import RunTerminalTool
 from codeagent.tools.terminal.safety_checker import SafetyResult
 
@@ -82,16 +84,17 @@ class TestRunTerminalToolSuccess:
     async def test_non_zero_exit(self, tool: RunTerminalTool, mock_sandbox: MagicMock) -> None:
         mock_sandbox.exec_command.return_value = ("", "file not found", 1)
         result = await tool.execute(command="python nonexistent.py")
-        assert result.success is True  # 非零退出码不算工具失败，交由 LLM 判断
+        assert result.success is False
         assert result.data["exit_code"] == 1
         assert result.data["stderr"] == "file not found"
+        assert result.error_code == "NON_ZERO_EXIT"
 
     @pytest.mark.asyncio
     async def test_project_root_mounted(self, tool: RunTerminalTool, mock_sandbox: MagicMock) -> None:
         await tool.execute(command="ls -la")
         # 验证 project_root 被正确传递为 volume
         call_kwargs = mock_sandbox.acquire_container.call_args.kwargs
-        assert call_kwargs["volumes"] == {"/test/project": {"bind": "/project", "mode": "ro"}}
+        assert call_kwargs["volumes"] == {"/test/project": {"bind": "/workspace", "mode": "rw"}}
 
 
 class TestRunTerminalToolSafetyBlock:
@@ -135,6 +138,7 @@ class TestRunTerminalToolSafetyBlock:
         result = await tool.execute(command="sudo something")
         assert result.data["risk_level"] == "dangerous"
         assert "sudo" in result.data["matched_patterns"]
+        assert "workspace root" in result.data["retry_guidance"]
 
 
 class TestRunTerminalToolSandboxErrors:
@@ -148,6 +152,15 @@ class TestRunTerminalToolSandboxErrors:
         result = await tool.execute(command="echo test")
         assert result.success is False
         assert result.error_code == "DOCKER_DAEMON_ERROR"
+
+    @pytest.mark.asyncio
+    async def test_docker_timeout_is_classified(self, tool: RunTerminalTool, mock_sandbox: MagicMock) -> None:
+        from codeagent.tools.terminal.sandbox import DockerDaemonError
+
+        mock_sandbox.exec_command.side_effect = DockerDaemonError("Command timed out after 2s")
+        result = await tool.execute(command="python slow.py", timeout=2)
+        assert result.success is False
+        assert result.error_code == "DOCKER_TIMEOUT"
 
     @pytest.mark.asyncio
     async def test_docker_not_available(self, mock_safety_checker: MagicMock) -> None:
@@ -223,3 +236,83 @@ class TestRunTerminalToolEdgeCases:
         result = await tool.execute(command="echo hello")
         assert result.success is False
         mock_sandbox.release_container.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_local_process_is_killed_when_task_is_cancelled(
+        self, mock_safety_checker: MagicMock, monkeypatch,
+    ) -> None:
+        started = asyncio.Event()
+        released = asyncio.Event()
+
+        class FakeProcess:
+            returncode = None
+
+            async def communicate(self):
+                started.set()
+                await released.wait()
+                return b"", b""
+
+            def kill(self):
+                self.returncode = -9
+                released.set()
+
+        process = FakeProcess()
+
+        async def create_process(*_args, **_kwargs):
+            return process
+
+        monkeypatch.setattr(
+            "codeagent.tools.terminal.run_terminal.codeagent_config.get_sandbox_enabled",
+            lambda: False,
+        )
+        monkeypatch.setattr(asyncio, "create_subprocess_shell", create_process)
+        local_tool = RunTerminalTool(
+            safety_checker=mock_safety_checker,
+            project_root=str(Path.cwd()),
+        )
+        running = asyncio.create_task(local_tool.execute(command="python slow.py"))
+        await asyncio.wait_for(started.wait(), timeout=1)
+
+        running.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await running
+
+        assert process.returncode == -9
+
+    @pytest.mark.asyncio
+    async def test_cancellation_destroys_active_sandbox(
+        self, tool: RunTerminalTool, mock_sandbox: MagicMock,
+    ) -> None:
+        started = threading.Event()
+        unblock = threading.Event()
+
+        def blocking_exec(**_kwargs):
+            started.set()
+            unblock.wait(timeout=2)
+            return "", "", 0
+
+        mock_sandbox.exec_command.side_effect = blocking_exec
+        running = asyncio.create_task(tool.execute(command="python slow.py"))
+        await asyncio.wait_for(asyncio.to_thread(started.wait), timeout=1)
+
+        running.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await running
+        unblock.set()
+
+        mock_sandbox.cleanup.assert_called_once_with("sandbox_container_123")
+        mock_sandbox.release_container.assert_not_called()
+
+    def test_close_destroys_task_sandbox(
+        self, tool: RunTerminalTool, mock_sandbox: MagicMock
+    ) -> None:
+        tool.close()
+        mock_sandbox.cleanup_all.assert_called_once_with()
+        assert tool._sandbox is None
+
+    def test_close_is_idempotent(
+        self, tool: RunTerminalTool, mock_sandbox: MagicMock
+    ) -> None:
+        tool.close()
+        tool.close()
+        mock_sandbox.cleanup_all.assert_called_once_with()

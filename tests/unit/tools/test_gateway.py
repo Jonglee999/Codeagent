@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import time
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -11,6 +11,65 @@ from codeagent.gateway.tool_gateway import ToolDefinition, ToolResult
 from codeagent.tools.base import BaseTool
 from codeagent.tools.gateway import ToolGateway, ToolMetrics
 from codeagent.tools.registry import ToolRegistry
+
+
+@pytest.mark.asyncio
+async def test_extension_initialization_skips_discovery_without_matching_server(
+    tmp_path, monkeypatch,
+) -> None:
+    from codeagent.extensions.mcp import MCPConfigResolution, MCPServerConfig
+
+    server = MCPServerConfig(
+        name="github",
+        source="workspace",
+        source_root=tmp_path,
+        command="unused-command",
+    )
+    monkeypatch.setattr(
+        "codeagent.extensions.mcp.resolve_mcp_config",
+        lambda _root: MCPConfigResolution(servers={"github": server}),
+    )
+    monkeypatch.setattr("codeagent.config.get_mcp_enabled", lambda: True)
+    discovery = AsyncMock()
+    monkeypatch.setattr("codeagent.tools.mcp.discover_mcp_tools", discovery)
+    gateway = ToolGateway(project_root=str(tmp_path))
+
+    status = await gateway.initialize_extensions(query="Run the local script again")
+
+    discovery.assert_not_awaited()
+    assert status["mcp"]["available"] is False
+    assert status["mcp"]["servers"][0]["deferred"] is True
+
+
+@pytest.mark.asyncio
+async def test_benchmark_extension_initialization_never_starts_matching_server(
+    tmp_path, monkeypatch,
+) -> None:
+    from codeagent.extensions.mcp import MCPConfigResolution, MCPServerConfig
+
+    server = MCPServerConfig(
+        name="fetch",
+        source="workspace",
+        source_root=tmp_path,
+        command="must-not-be-started",
+    )
+    monkeypatch.setattr(
+        "codeagent.extensions.mcp.resolve_mcp_config",
+        lambda _root: MCPConfigResolution(servers={"fetch": server}),
+    )
+    monkeypatch.setattr("codeagent.config.get_mcp_enabled", lambda: True)
+    discovery = AsyncMock()
+    monkeypatch.setattr("codeagent.tools.mcp.discover_mcp_tools", discovery)
+    gateway = ToolGateway(project_root=str(tmp_path))
+
+    status = await gateway.initialize_extensions(
+        query="See https://example.invalid/spec",
+        external_enabled=False,
+    )
+
+    discovery.assert_not_awaited()
+    assert status["mcp"]["servers"][0]["deferred"] is True
+    assert not any(tool.external for tool in gateway.list_tools())
 
 
 # ── Helper Mock Tools ─────────────────────────────────────────────────────
@@ -80,6 +139,22 @@ class NoParamsTool(BaseTool):
         return ToolResult(success=True, data={})
 
 
+class BoundedIntegerTool(BaseTool):
+    name = "bounded_integer"
+    description = "Accept a bounded integer"
+    parameters = {
+        "type": "object",
+        "properties": {
+            "limit": {"type": "integer", "minimum": 1, "maximum": 20},
+        },
+        "required": ["limit"],
+        "additionalProperties": False,
+    }
+
+    async def execute(self, **kwargs: object) -> ToolResult:
+        return ToolResult(success=True, data={"limit": kwargs["limit"]})
+
+
 # ── Fixtures ──────────────────────────────────────────────────────────────
 
 
@@ -138,6 +213,8 @@ class TestExecuteTool:
         result = await gateway.execute_tool("slow", {"delay": 10})
         assert result.success is False
         assert result.error_code == "TIMEOUT"
+        assert result.retryable is True
+        assert "Retry" in (result.suggested_recovery or "")
 
     @pytest.mark.asyncio
     async def test_execute_runtime_error(self, gateway: ToolGateway) -> None:
@@ -146,6 +223,7 @@ class TestExecuteTool:
         assert result.success is False
         assert result.error_code == "EXECUTION_ERROR"
         assert "boom" in (result.error_message or "")
+        assert result.retryable is True
 
     @pytest.mark.asyncio
     async def test_execute_no_params_tool(self, gateway: ToolGateway) -> None:
@@ -307,6 +385,20 @@ class TestExecutionLog:
         log = gateway.get_execution_log()
         assert len(log) == 3
 
+    @pytest.mark.asyncio
+    async def test_log_redacts_credentials_and_bounds_large_values(
+        self, gateway: ToolGateway
+    ) -> None:
+        await gateway.execute_tool(
+            "success",
+            {"msg": "x" * 1200, "api_token": "do-not-log"},
+        )
+
+        params = gateway.get_execution_log()[0].params
+        assert params["api_token"] == "[REDACTED]"
+        assert "do-not-log" not in str(params)
+        assert params["msg"].endswith("…[TRUNCATED]")
+
 
 class TestClearMetrics:
     """验证清空功能。"""
@@ -364,3 +456,115 @@ class TestToolGatewayProjectRoot:
         result = await gateway.execute_tool("success", {"msg": "hi", "extra": 1})
         assert result.success is True
         assert result.data == {"echo": "hi"}
+
+    @pytest.mark.asyncio
+    async def test_lossless_integer_string_is_normalized_before_validation(self) -> None:
+        registry = ToolRegistry()
+        registry.register(BoundedIntegerTool())
+        gateway = ToolGateway(registry)
+        params = {"limit": "5"}
+
+        result = await gateway.execute_tool("bounded_integer", params)
+
+        assert result.success is True
+        assert result.data == {"limit": 5}
+        assert params == {"limit": 5}
+
+    @pytest.mark.asyncio
+    async def test_non_integer_string_remains_a_schema_error(self) -> None:
+        registry = ToolRegistry()
+        registry.register(BoundedIntegerTool())
+        gateway = ToolGateway(registry)
+
+        result = await gateway.execute_tool("bounded_integer", {"limit": "5.5"})
+
+        assert result.success is False
+        assert result.error_code == "INVALID_PARAMS"
+
+    @pytest.mark.asyncio
+    async def test_aclose_closes_default_terminal_tool(self) -> None:
+        gw = ToolGateway(project_root="/tmp/test_proj")
+        terminal = gw._registry.get("run_terminal")
+        terminal.close = MagicMock()
+
+        await gw.aclose()
+
+        terminal.close.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_resilience_status_preserves_tool_timeout_code(registry: ToolRegistry) -> None:
+    class TimeoutResultTool(BaseTool):
+        name = "timeout_result"
+        description = "returns a timeout result"
+        parameters = {}
+
+        async def execute(self, **kwargs: object) -> ToolResult:
+            return ToolResult(success=False, error_code="DOCKER_TIMEOUT", error_message="timed out")
+
+    registry.register(TimeoutResultTool())
+    gateway = ToolGateway(registry)
+
+    result = await gateway.execute_tool("timeout_result", {})
+    status = gateway.resilience_status()
+
+    assert result.error_code == "DOCKER_TIMEOUT"
+    assert status["timeout_count"] == 1
+    assert status["error_counts"] == {"DOCKER_TIMEOUT": 1}
+
+
+@pytest.mark.asyncio
+async def test_task_working_set_reuses_unchanged_file_reads(tmp_path) -> None:
+    (tmp_path / "module.py").write_text("value = 1\n", encoding="utf-8")
+    gateway = ToolGateway(project_root=str(tmp_path))
+
+    first = await gateway.execute_tool("read_file", {"file_path": "module.py"})
+    second = await gateway.execute_tool("read_file", {"file_path": "module.py"})
+    status = gateway.working_set_status()
+
+    assert first.success and second.success
+    assert "working_set" not in first.data
+    assert second.data["working_set"] == {"cache_hit": True}
+    assert status["read_requests"] == 2
+    assert status["cache_hits"] == 1
+    assert status["cache_misses"] == 1
+    assert status["tracked_files"] == 1
+
+
+@pytest.mark.asyncio
+async def test_task_working_set_precisely_invalidates_changed_file(tmp_path) -> None:
+    (tmp_path / "a.py").write_text("a = 1\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("b = 1\n", encoding="utf-8")
+    gateway = ToolGateway(project_root=str(tmp_path))
+    await gateway.execute_tool("read_file", {"file_path": "a.py"})
+    await gateway.execute_tool("read_file", {"file_path": "b.py"})
+
+    changed = await gateway.execute_tool(
+        "write_file",
+        {"file_path": "a.py", "content": "a = 2\n", "mode": "modify"},
+    )
+    reread_a = await gateway.execute_tool("read_file", {"file_path": "a.py"})
+    reread_b = await gateway.execute_tool("read_file", {"file_path": "b.py"})
+    status = gateway.working_set_status()
+
+    assert changed.success
+    assert reread_a.data["content"] == "a = 2\n"
+    assert "working_set" not in reread_a.data
+    assert reread_b.data["working_set"] == {"cache_hit": True}
+    assert status["invalidation_count"] == 1
+    assert status["broad_invalidation_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_task_working_set_detects_external_file_changes(tmp_path) -> None:
+    target = tmp_path / "module.py"
+    target.write_text("old\n", encoding="utf-8")
+    gateway = ToolGateway(project_root=str(tmp_path))
+    await gateway.execute_tool("read_file", {"file_path": "module.py"})
+
+    target.write_text("new content\n", encoding="utf-8")
+    reread = await gateway.execute_tool("read_file", {"file_path": "module.py"})
+
+    assert reread.data["content"] == "new content\n"
+    assert "working_set" not in reread.data
+    assert gateway.working_set_status()["recent_invalidations"][-1]["reason"] == "external_change"

@@ -10,8 +10,10 @@ import json
 import logging
 from typing import Any, Callable, Optional
 
+from codeagent import config as codeagent_config
 from codeagent.context_engine.evolution.strategy_applier import StrategyApplier
 from codeagent.gateway.memory_gateway import IMemoryGateway
+from codeagent.orchestration.budget import preflight_model_call
 from codeagent.orchestration.state import AgentState, PlanStep
 from codeagent.tracing import trace_node
 
@@ -26,6 +28,15 @@ _SYSTEM_PROMPT = """You are a planning agent for a coding assistant. Analyze the
 
 Each step should be a JSON object. Respond with ONLY a JSON array of steps, no other text.
 
+All target_file values MUST be relative to the workspace root. Never prefix a target with
+the workspace directory name, an absolute path, or "./". For example use "src/app.py".
+
+Keep the plan to the smallest set of steps that can implement and prove the request,
+normally 2-5 steps. Combine closely related inspection and modification in one modify
+step, followed by targeted validation. Do not add changelog or documentation work unless
+the user or repository instructions explicitly require it. A regression test may be part
+of the same modification step when it targets the same behavior.
+
 ## JSON Schema for each step
 
 {{
@@ -34,7 +45,8 @@ Each step should be a JSON object. Respond with ONLY a JSON array of steps, no o
   "action": "create" | "modify" | "delete" | "read" | "command",
   "target_file": str | null (file path, null for "command" actions),
   "risk": "low" | "high" (high = modifies/deletes files or runs commands),
-  "dependencies": [int] (step_ids that must be completed before this one)
+  "dependencies": [int] (step_ids that must be completed before this one),
+  "acceptance_criteria": str (observable tool or command evidence required to finish)
 }}
 
 ## Examples
@@ -135,6 +147,7 @@ class PlanningNode:
         max_retries: int = _MAX_RETRIES,
         memory_gateway: Optional[IMemoryGateway] = None,
         strategy_applier: Optional[StrategyApplier] = None,
+        progress_callback: Any | None = None,
     ) -> None:
         """初始化 PlanningNode。
 
@@ -151,6 +164,7 @@ class PlanningNode:
         self._memory_gateway = memory_gateway
         self._strategy_applier = strategy_applier
         self._current_strategy_ids: list[str] = []
+        self._progress_callback = progress_callback
 
     @trace_node("planning")
     async def __call__(self, state: AgentState) -> dict[str, Any]:
@@ -162,6 +176,66 @@ class PlanningNode:
         Returns:
             dict: 包含 plan 或 errors 的状态更新
         """
+        if state.direct_execution:
+            return {
+                "plan": [],
+                "original_goal_summary": state.user_request,
+                "execution_log": [
+                    *state.execution_log,
+                    {"type": "planning_skipped", "reason": "follow_up_direct_execution"},
+                ],
+                "llm_call_count": state.llm_call_count,
+                "estimated_tokens": state.estimated_tokens,
+            }
+
+        if state.benchmark_instance_id:
+            # The benchmark workflow is intentionally fixed and does not benefit from
+            # spending a model call restating it as JSON. File discovery remains inside
+            # the modify step, where the coding model has repository tools and context.
+            steps = [
+                PlanStep(
+                    step_id=1,
+                    description=(
+                        "Inspect the relevant production code and implement the smallest "
+                        "fix for the benchmark issue without modifying tests"
+                    ),
+                    action="modify",
+                    target_file=None,
+                    risk="low",
+                    dependencies=[],
+                    acceptance_criteria=(
+                        "A successful write_file or apply_patch call changes production code"
+                    ),
+                ),
+                PlanStep(
+                    step_id=2,
+                    description="Run the supplied benchmark target tests",
+                    action="command",
+                    target_file=None,
+                    risk="low",
+                    dependencies=[1],
+                    acceptance_criteria="A successful run_terminal call records test evidence",
+                ),
+            ]
+            return {
+                "plan": steps,
+                "original_goal_summary": state.user_request,
+                "applied_strategy_ids": [],
+                "llm_call_count": state.llm_call_count,
+                "estimated_tokens": state.estimated_tokens,
+                "memory_hits": list(state.memory_hits),
+                "memory_recalled": state.memory_recalled,
+                "memory_context": state.memory_context,
+                "execution_log": [{
+                    "type": "plan_generated",
+                    "source": "deterministic_benchmark_policy",
+                    "steps": len(steps),
+                    "conflicts": None,
+                    "original_goal_summary": state.user_request,
+                    "strategy_ids": None,
+                }],
+            }
+
         prompt = self._build_prompt(state)
 
         # Phase 6.5: 注入相关记忆到 System Prompt
@@ -179,14 +253,64 @@ class PlanningNode:
         ]
 
         last_error: str | None = None
+        llm_call_count = state.llm_call_count
+        estimated_tokens = state.estimated_tokens
 
-        for attempt in range(self._max_retries + 1):
+        max_attempts = min(self._max_retries + 1, 2) if state.benchmark_instance_id else (
+            self._max_retries + 1
+        )
+        for attempt in range(max_attempts):
             try:
                 try:
+                    max_task_tokens = codeagent_config.get_max_tokens_per_task()
+                    budget = preflight_model_call(
+                        consumed_tokens=estimated_tokens,
+                        max_task_tokens=max_task_tokens,
+                        max_completion_tokens=(
+                            codeagent_config.get_max_completion_tokens_per_call()
+                        ),
+                        messages=messages,
+                    )
+                    if (
+                        llm_call_count >= codeagent_config.get_max_llm_calls_per_task()
+                        or not budget.allowed
+                    ):
+                        return {
+                            "errors": [
+                                "Plan generation stopped by the task model budget "
+                                f"({budget.reason or 'call_limit_reached'}; "
+                                f"remaining={budget.remaining_tokens}, "
+                                f"estimated_input={budget.estimated_input_tokens})"
+                            ],
+                            "plan": None,
+                            "original_goal_summary": "",
+                            "llm_call_count": llm_call_count,
+                            "estimated_tokens": estimated_tokens,
+                        }
                     response = await self._llm(
                         model=self._model_name,
                         messages=messages,
+                        max_tokens=budget.max_completion_tokens,
+                        model_role="planning",
+                        routing_context={
+                            "request": state.user_request,
+                            "retry_count": state.retry_count,
+                            "validation_failures": sum(
+                                1 for item in state.validation_results
+                                if not getattr(item, "success", False)
+                            ),
+                        },
                     )
+                    llm_call_count += 1
+                    usage = getattr(response, "usage", None)
+                    if usage is not None:
+                        estimated_tokens += int(
+                            getattr(usage, "total_tokens", 0)
+                            or (
+                                getattr(usage, "prompt_tokens", 0)
+                                + getattr(usage, "completion_tokens", 0)
+                            )
+                        )
                 except Exception as exc:
                     logger.error("LLM call failed: %s", exc)
                     return {
@@ -195,9 +319,17 @@ class PlanningNode:
                         ],
                         "plan": None,
                         "original_goal_summary": "",
+                        "llm_call_count": llm_call_count,
+                        "estimated_tokens": estimated_tokens,
                     }
 
-                content = response.choices[0].message.content or ""
+                message = response.choices[0].message
+                content = message.content or ""
+                if not content.strip():
+                    # Thinking-capable OpenAI-compatible providers sometimes put the
+                    # entire structured answer in reasoning_content and leave content
+                    # empty. Recover it before spending another paid planning call.
+                    content = getattr(message, "reasoning_content", "") or ""
 
                 # 清理可能存在的 markdown 包装
                 plan_json = self._clean_json(content)
@@ -235,6 +367,11 @@ class PlanningNode:
                     "plan": steps,
                     "original_goal_summary": original_goal_summary,
                     "applied_strategy_ids": list(self._current_strategy_ids),
+                    "llm_call_count": llm_call_count,
+                    "estimated_tokens": estimated_tokens,
+                    "memory_hits": list(state.memory_hits),
+                    "memory_recalled": state.memory_recalled,
+                    "memory_context": state.memory_context,
                     "execution_log": [{
                         "type": "plan_generated",
                         "steps": len(steps),
@@ -248,26 +385,29 @@ class PlanningNode:
                 last_error = str(exc)
                 logger.warning(
                     "Plan parse failed (attempt %d/%d): %s",
-                    attempt + 1, self._max_retries + 1, last_error,
+                    attempt + 1, max_attempts, last_error,
                 )
 
-                if attempt < self._max_retries:
+                if attempt + 1 < max_attempts:
                     messages.append({
                         "role": "user",
                         "content": (
                             f"JSON parse error: {last_error}\n\n"
-                            "Please respond with ONLY a valid JSON array. "
+                            "Please respond with ONLY a valid JSON object containing "
+                            "a plan array and original_goal_summary. "
                             "No markdown, no explanation."
                         ),
                     })
 
         return {
             "errors": [
-                f"Plan generation failed after {self._max_retries + 1} "
+                f"Plan generation failed after {max_attempts} "
                 f"attempts: {last_error}"
             ],
             "plan": None,
             "original_goal_summary": "",
+            "llm_call_count": llm_call_count,
+            "estimated_tokens": estimated_tokens,
         }
 
     def _build_prompt(self, state: AgentState) -> str:
@@ -276,12 +416,23 @@ class PlanningNode:
 
         if state.file_tree:
             if isinstance(state.file_tree, dict):
-                tree_text = self._format_tree_for_prompt(state.file_tree)
+                tree_text = self._format_tree_for_prompt(state.file_tree, is_root=True)
                 context_lines.append(f"## Project Structure\n{tree_text}\n")
 
         if state.semantic_context:
             context_lines.append(
                 f"## Context\n{state.semantic_context}\n"
+            )
+
+        if state.benchmark_instance_id:
+            context_lines.append(
+                "## Benchmark Planning Policy\n"
+                f"Instance: {state.benchmark_instance_id}\n"
+                "Prefer exactly two steps: (1) inspect as needed and modify the "
+                "production target in one modify step; (2) run the supplied target "
+                "tests in one command step. Do not add or modify tests unless the "
+                "issue cannot be fixed without doing so. Keep exploration inside the "
+                "modify step instead of creating a separate read step.\n"
             )
 
         context_section = "\n".join(context_lines) if context_lines else ""
@@ -302,8 +453,10 @@ class PlanningNode:
         Returns:
             "## Relevant Memories\n{memory_xml}" 或 ""
         """
-        if not self._memory_gateway:
+        if state.memory_mode == "off" or not self._memory_gateway:
             return ""
+        if state.memory_recalled:
+            return state.memory_context
 
         try:
             from codeagent import config
@@ -312,12 +465,33 @@ class PlanningNode:
                 query=state.user_request,
                 token_budget=token_budget,
             )
+            state.memory_recalled = True
             if not memory_xml:
+                state.memory_context = ""
                 return ""
-            return f"## Relevant Memories\n\n{memory_xml}"
+            from codeagent.memory.audit import parse_memory_hits
+
+            hits = parse_memory_hits(memory_xml, token_budget)
+            state.memory_hits = hits
+            state.memory_context = f"## Relevant Memories\n\n{memory_xml}"
+            self._report_progress({
+                "type": "memory_recalled",
+                "visibility": "internal",
+                "summary": f"Recalled {len(hits)} relevant memory item(s)",
+                "data": {"hits": hits, "token_budget": token_budget},
+            })
+            return state.memory_context
         except Exception as exc:
             logger.warning("Memory recall failed in PlanningNode (non-blocking): %s", exc)
             return ""
+
+    def _report_progress(self, event: dict[str, Any]) -> None:
+        if self._progress_callback is None:
+            return
+        try:
+            self._progress_callback(event)
+        except Exception as exc:
+            logger.warning("Planning progress callback failed: %s", exc)
 
     # ── Phase 7.4: 策略注入 ─────────────────────────────────
 
@@ -333,7 +507,7 @@ class PlanningNode:
         Returns:
             "## Relevant Strategies\n\n{strategy_xml}" 或 ""
         """
-        if not self._strategy_applier:
+        if not state.evolution_enabled or not self._strategy_applier:
             return ""
 
         try:
@@ -345,13 +519,19 @@ class PlanningNode:
 
             strategy_xml = self._strategy_applier.format_for_prompt(strategies)
             self._current_strategy_ids = [s.strategy_id for s in strategies]
+            self._report_progress({
+                "type": "strategy_recalled",
+                "visibility": "internal",
+                "summary": f"Applied {len(strategies)} procedural strategy item(s)",
+                "data": {"strategy_ids": list(self._current_strategy_ids)},
+            })
             return f"## Relevant Strategies\n\n{strategy_xml}"
         except Exception as exc:
             logger.warning("Strategy assembly failed in PlanningNode (non-blocking): %s", exc)
             return ""
 
     def _format_tree_for_prompt(
-        self, tree: dict[str, Any], prefix: str = ""
+        self, tree: dict[str, Any], prefix: str = "", is_root: bool = False,
     ) -> str:
         """将文件树字典格式化为文本。"""
         lines: list[str] = []
@@ -360,9 +540,12 @@ class PlanningNode:
 
         if node_type == "directory":
             children = tree.get("children", [])
-            lines.append(f"{prefix}{name}/")
+            if not is_root:
+                lines.append(f"{prefix}{name}/")
             for child in children:
-                child_text = self._format_tree_for_prompt(child, prefix + "  ")
+                child_text = self._format_tree_for_prompt(
+                    child, prefix if is_root else prefix + "  "
+                )
                 if child_text:
                     lines.append(child_text)
         elif node_type == "file":
@@ -461,6 +644,16 @@ class PlanningNode:
                     f"Step {step_id}: 'dependencies' must be integers"
                 )
 
+            acceptance_criteria = item.get("acceptance_criteria", "")
+            if not isinstance(acceptance_criteria, str):
+                raise ValueError(
+                    f"Step {step_id}: 'acceptance_criteria' must be a string"
+                )
+            if not acceptance_criteria.strip():
+                acceptance_criteria = (
+                    f"A successful {action} tool call records evidence for this step"
+                )
+
             steps.append(
                 PlanStep(
                     step_id=step_id,
@@ -469,6 +662,7 @@ class PlanningNode:
                     target_file=target_file,
                     risk=risk,  # type: ignore[arg-type]
                     dependencies=dependencies,
+                    acceptance_criteria=acceptance_criteria,
                 )
             )
 

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 from codeagent.tools.base import BaseTool, ToolResult
@@ -24,6 +23,7 @@ _SENSITIVE_PATTERNS = [
 
 # 最大行数限制
 _MAX_LINES = 2000
+_DEFAULT_LINES = 500
 
 # 扩展名 → 语言映射
 _EXTENSION_MAP: dict[str, str] = {
@@ -71,7 +71,7 @@ _EXTENSION_MAP: dict[str, str] = {
 }
 
 # fnmatch 风格的全局匹配（不使用额外的库，简单实现）
-import fnmatch
+import fnmatch  # noqa: E402
 
 
 def _is_sensitive(file_name: str) -> bool:
@@ -101,6 +101,8 @@ class ReadFileTool(BaseTool):
     """读取文件内容，支持指定行范围和安全限制。"""
 
     name = "read_file"
+    category = "exploration"
+    read_only = True
     description = "读取文件内容，支持指定行范围"
     parameters = {
         "type": "object",
@@ -151,6 +153,14 @@ class ReadFileTool(BaseTool):
         import time
 
         start_time = time.monotonic()
+
+        if "\0" in file_path:
+            return ToolResult(
+                success=False,
+                error_message="Invalid file path: path contains a null character",
+                error_code="INVALID_PATH",
+                duration_ms=(time.monotonic() - start_time) * 1000,
+            )
 
         # ── 路径安全校验 ──────────────────────────────────
         try:
@@ -226,9 +236,12 @@ class ReadFileTool(BaseTool):
         total_lines = len(lines)
 
         # ── 行范围处理 ────────────────────────────────────
+        implicit_end = end_line is None
         if start_line is None:
             start_line = 1
-        if end_line is None or end_line > total_lines:
+        if end_line is None:
+            end_line = min(total_lines, start_line + _DEFAULT_LINES - 1)
+        elif end_line > total_lines:
             end_line = total_lines
 
         if start_line < 1:
@@ -246,13 +259,13 @@ class ReadFileTool(BaseTool):
             )
 
         # 行数限制
-        if end_line - start_line + 1 > _MAX_LINES:
+        hard_truncated = end_line - start_line + 1 > _MAX_LINES
+        if hard_truncated:
             end_line = start_line + _MAX_LINES - 1
             content = "".join(lines[start_line - 1 : end_line])
-            truncated = True
         else:
             content = "".join(lines[start_line - 1 : end_line])
-            truncated = False
+        truncated = hard_truncated or (implicit_end and end_line < total_lines)
 
         language = _detect_language(str(target))
 
@@ -266,9 +279,10 @@ class ReadFileTool(BaseTool):
 
         if truncated:
             result_data["warning"] = (
-                f"File truncated to {_MAX_LINES} lines. "
-                f"Total lines: {total_lines}."
+                f"Partial file read ({start_line}-{end_line} of {total_lines} lines). "
+                "Request an explicit line range to continue."
             )
+            result_data["next_start_line"] = end_line + 1
 
         return ToolResult(
             success=True,

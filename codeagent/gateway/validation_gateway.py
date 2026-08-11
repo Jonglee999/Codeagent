@@ -42,6 +42,7 @@ class ValidationResult:
     warnings: list[ValidationError] = field(default_factory=list)
     duration_ms: float = 0.0
     sandboxed: bool = False
+    output: str = ""
 
 
 class IValidationGateway(ABC):

@@ -33,8 +33,12 @@ def _generate_diff(
     diff_str = "".join(diff_lines)
 
     # 统计增删行数
-    lines_added = sum(1 for l in diff_lines if l.startswith("+") and not l.startswith("+++"))
-    lines_removed = sum(1 for l in diff_lines if l.startswith("-") and not l.startswith("---"))
+    lines_added = sum(
+        1 for line in diff_lines if line.startswith("+") and not line.startswith("+++")
+    )
+    lines_removed = sum(
+        1 for line in diff_lines if line.startswith("-") and not line.startswith("---")
+    )
 
     return diff_str, lines_added, lines_removed
 
@@ -58,6 +62,8 @@ class WriteFileTool(BaseTool):
     """创建或修改文件，写入前自动备份、写入后生成 diff。"""
 
     name = "write_file"
+    category = "mutation"
+    risk_level = "medium"
     description = "创建或修改文件，写入前自动备份、写入后生成 diff"
     parameters = {
         "type": "object",
@@ -76,7 +82,7 @@ class WriteFileTool(BaseTool):
                 "description": "create: 创建新文件（父目录自动创建）；modify: 修改已有文件",
             },
         },
-        "required": ["file_path", "content", "mode"],
+        "required": ["file_path", "content"],
     }
 
     def __init__(self, project_root: str | Path = ".") -> None:
@@ -88,7 +94,7 @@ class WriteFileTool(BaseTool):
         self,
         file_path: str,
         content: str,
-        mode: str = "create",
+        mode: str | None = None,
     ) -> ToolResult:
         """创建或修改文件。
 
@@ -102,8 +108,16 @@ class WriteFileTool(BaseTool):
         """
         start_time = time.monotonic()
 
+        if "\0" in file_path:
+            return ToolResult(
+                success=False,
+                error_message="Invalid file path: path contains a null character",
+                error_code="INVALID_PATH",
+                duration_ms=(time.monotonic() - start_time) * 1000,
+            )
+
         # ── 参数校验 ──────────────────────────────────────
-        if mode not in ("create", "modify"):
+        if mode not in (None, "create", "modify"):
             return ToolResult(
                 success=False,
                 error_message=f"Invalid mode '{mode}'. Use 'create' or 'modify'.",
@@ -155,6 +169,9 @@ class WriteFileTool(BaseTool):
 
         # ── 模式检查 ──────────────────────────────────────
         target_exists = target.exists()
+
+        if mode is None:
+            mode = "modify" if target_exists else "create"
 
         if mode == "create" and target_exists:
             return ToolResult(

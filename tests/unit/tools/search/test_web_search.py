@@ -6,12 +6,10 @@ Mock 搜索后端，测试搜索逻辑、缓存、域名过滤、错误处理和
 from __future__ import annotations
 
 import base64
-import time
-from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from codeagent.gateway.tool_gateway import ToolResult
 from codeagent.tools.search.web_search import (
     _extract_domain,
     _parse_bing_html,
@@ -80,7 +78,6 @@ def _make_mock_httpx_client(
 
 def _make_bing_html_results(count: int = 3, domain: str = "example.com") -> str:
     """构造模拟 Bing HTML 搜索结果页面。"""
-    import urllib.parse
 
     items = ""
     for i in range(count):

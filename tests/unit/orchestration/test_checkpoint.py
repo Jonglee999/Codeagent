@@ -108,6 +108,25 @@ class TestGetAsyncCheckpointer:
         assert isinstance(cp, MemorySaver)
         assert not Path("/tmp/should_not_create_async.db").exists()
 
+    @pytest.mark.asyncio
+    async def test_persists_schema_and_task_thread_mapping(self):
+        from codeagent.orchestration.checkpoint import (
+            get_async_checkpointer,
+            register_checkpoint_thread,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cp = await get_async_checkpointer(db_path=str(Path(tmpdir) / "mapping.db"))
+            await register_checkpoint_thread(
+                cp, thread_id="task-1", task_id="task-1", status="waiting_review"
+            )
+            cursor = await cp.conn.execute(
+                "SELECT task_id, status FROM codeagent_checkpoint_threads WHERE thread_id=?",
+                ("task-1",),
+            )
+            assert await cursor.fetchone() == ("task-1", "waiting_review")
+            await cp.conn.close()
+
 
 class TestBuildWorkflowWithCheckpointer:
     """build_workflow 与 checkpointer 集成测试。"""

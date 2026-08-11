@@ -15,6 +15,9 @@ class GetDiagnosticsTool(BaseTool):
     """获取文件的 LSP 诊断信息（错误、警告、提示）。"""
 
     name = "get_diagnostics"
+    category = "analysis"
+    read_only = True
+    latency_hint = "medium"
     description = "获取文件的 LSP 诊断信息（错误、警告、提示）"
     parameters = {
         "type": "object",

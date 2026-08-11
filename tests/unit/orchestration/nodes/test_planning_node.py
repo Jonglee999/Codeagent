@@ -70,6 +70,7 @@ def make_llm(response: str | None = None) -> AsyncMock:
     mock = AsyncMock()
     message = MagicMock()
     message.content = response or json.dumps(_VALID_PLAN)
+    message.reasoning_content = ""
     choice = MagicMock()
     choice.message = message
     mock_response = MagicMock()
@@ -117,6 +118,7 @@ def make_response(content: str | None) -> MagicMock:
     """创建模拟 LLM 响应。"""
     message = MagicMock()
     message.content = content
+    message.reasoning_content = ""
     choice = MagicMock()
     choice.message = message
     resp = MagicMock()
@@ -128,6 +130,40 @@ def make_response(content: str | None) -> MagicMock:
 
 
 class TestPlanningNodeNormalFlow:
+    @pytest.mark.asyncio
+    async def test_uses_reasoning_content_when_provider_content_is_empty(self, state) -> None:
+        message = MagicMock()
+        message.content = ""
+        message.reasoning_content = json.dumps({
+            "plan": _VALID_PLAN,
+            "original_goal_summary": "Create the requested app",
+        })
+        response = MagicMock()
+        response.choices = [MagicMock(message=message)]
+        llm = AsyncMock(return_value=response)
+
+        result = await PlanningNode(llm=llm)(state)
+
+        assert len(result["plan"]) == 3
+        assert result["original_goal_summary"] == "Create the requested app"
+        assert llm.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_benchmark_uses_deterministic_two_step_plan_without_llm(self) -> None:
+        llm = AsyncMock()
+        benchmark_state = AgentState(
+            user_request="Fix it",
+            project_root="/test/project",
+            benchmark_instance_id="owner__repo-1",
+        )
+
+        result = await PlanningNode(llm=llm)(benchmark_state)
+
+        assert [step.action for step in result["plan"]] == ["modify", "command"]
+        assert result["execution_log"][0]["source"] == "deterministic_benchmark_policy"
+        assert result["llm_call_count"] == 0
+        llm.assert_not_awaited()
+
     """正常执行流程。"""
 
     @pytest.mark.asyncio
@@ -148,6 +184,8 @@ class TestPlanningNodeNormalFlow:
             assert isinstance(step.description, str)
             assert step.action in ("create", "modify", "delete", "read", "command")
             assert step.risk in ("low", "high")
+            assert step.acceptance_criteria
+            assert step.evidence == []
 
     @pytest.mark.asyncio
     async def test_returns_execution_log(
@@ -207,7 +245,8 @@ class TestPlanningNodeWithContext:
 
         call_kwargs = llm.call_args[1]
         system_msg = call_kwargs["messages"][0]["content"]
-        assert "root/" in system_msg
+        # The workspace root name is context, not part of tool-relative paths.
+        assert "root/" not in system_msg
         assert "src/" in system_msg
         assert "main.py" in system_msg
         assert "Flask app" in system_msg
@@ -632,3 +671,15 @@ class TestPlanningNodeGoalSummary:
         result = await node(state)
         log = result["execution_log"][0]
         assert log["original_goal_summary"] == "Read and analyze config"
+
+
+def test_benchmark_prompt_requests_minimal_two_step_plan() -> None:
+    benchmark_state = AgentState(
+        user_request="Fix regression",
+        project_root="/test/project",
+        benchmark_instance_id="owner__repo-1",
+    )
+    prompt = PlanningNode(llm=make_llm())._build_prompt(benchmark_state)
+
+    assert "Prefer exactly two steps" in prompt
+    assert "Do not add or modify tests" in prompt

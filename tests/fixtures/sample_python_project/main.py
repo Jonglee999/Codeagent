@@ -8,8 +8,8 @@ from config.settings import Settings
 
 def main() -> None:
     """Run the application."""
-    settings = Settings()
-    user = User(name="test_user", email="test@example.com")
-    svc = UserService(settings)
-    token = authenticate_user(svc, user)
+    settings: Settings = Settings()
+    user: User = User(name="test_user", email="test@example.com")
+    svc: UserService = UserService(settings)
+    token: str = authenticate_user(svc, user)
     print(f"Authenticated: {token}")

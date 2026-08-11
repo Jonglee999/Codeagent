@@ -4,13 +4,11 @@ from __future__ import annotations
 
 import os
 import tempfile
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from codeagent.context_engine.code_analyzer import CodeAnalyzer
-from codeagent.context_engine.dependency_graph import DependencyGraph
-from codeagent.context_engine.symbol_table import Symbol, SymbolTable
+from codeagent.context_engine.symbol_table import Symbol
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────

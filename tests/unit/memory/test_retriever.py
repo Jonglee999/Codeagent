@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -179,6 +180,20 @@ class TestRetrieve:
                    description="Python coding", body="Python tips")
         results = retriever.retrieve("quantum physics cosmology")
         assert results == []
+
+    def test_expired_memory_is_not_recalled(
+        self, retriever: MemoryRetriever, store: MemoryStore
+    ) -> None:
+        entry = make_entry(
+            name="expired-python",
+            memory_type=MemoryType.SESSION,
+            description="Python programming tips",
+        )
+        entry.expires_at = datetime.now() - timedelta(seconds=1)
+        store.save(entry, scope="project")
+
+        assert retriever.retrieve("python programming") == []
+        assert store.load("expired-python") is None
 
     def test_retrieve_project_bonus(self, retriever: MemoryRetriever, store: MemoryStore, global_root: Path) -> None:
         """项目层记忆应获得 +0.05 bonus。"""

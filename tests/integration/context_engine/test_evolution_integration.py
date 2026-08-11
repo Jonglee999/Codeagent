@@ -13,9 +13,7 @@ import json
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
 
-import pytest
 
 from codeagent.context_engine.evolution.manager import SelfEvolutionManager
 from codeagent.context_engine.evolution.strategy_applier import StrategyApplier

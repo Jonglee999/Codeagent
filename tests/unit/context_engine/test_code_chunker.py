@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import tempfile
-from pathlib import Path
 
 import pytest
 
@@ -250,7 +249,7 @@ class TestCodeChunkerEdgeCases:
 
         chunks = chunker.chunk_code(code, "python", max_chunk_size=50)
         # 应被拆分为多个块
-        large_chunks = [c for c in chunks if c.symbol_name == "large_func"]
+        [c for c in chunks if c.symbol_name == "large_func"]
         # 大的函数可能会被拆分为多个块
         assert len(chunks) >= 1
 

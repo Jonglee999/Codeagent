@@ -50,7 +50,7 @@ class TestGraphStructure:
     def test_has_all_nodes(self, graph) -> None:
         """应包含所有 5 个工作流节点（不含 __start__）。"""
         node_names = {n for n in graph.nodes if not n.startswith("__")}
-        expected = {"context", "planning", "execution", "validation", "human_review"}
+        expected = {"context", "planning", "execution", "validation", "reflection", "human_review"}
         assert node_names == expected
 
     def test_entry_point_is_context(self, graph) -> None:
@@ -63,34 +63,11 @@ class TestGraphStructure:
         ]
         assert any(e[1] == "context" for e in start_edges)
 
-    def test_context_to_planning_edge(self, graph) -> None:
-        """context → planning 应为普通边。"""
-        assert graph.builder is not None
-        has_edge = any(
-            isinstance(e, tuple) and e[0] == "context" and e[1] == "planning"
-            for e in graph.builder.edges
-        )
-        assert has_edge
-
-    def test_planning_has_conditional_edges(self, graph) -> None:
-        """planning 节点应有条件路由。"""
-        assert graph.builder is not None
-        assert "planning" in graph.builder.branches
-
-    def test_execution_has_conditional_edges(self, graph) -> None:
-        """execution 节点应有条件路由。"""
-        assert graph.builder is not None
-        assert "execution" in graph.builder.branches
-
-    def test_validation_has_conditional_edges(self, graph) -> None:
-        """validation 节点应有条件路由。"""
-        assert graph.builder is not None
-        assert "validation" in graph.builder.branches
-
-    def test_human_review_has_conditional_edges(self, graph) -> None:
-        """human_review 节点应有条件路由。"""
-        assert graph.builder is not None
-        assert "human_review" in graph.builder.branches
+    def test_workflow_nodes_have_conditional_routes(self, graph) -> None:
+        """All state-dependent nodes must remain connected through a branch."""
+        assert set(graph.builder.branches) >= {
+            "context", "planning", "execution", "validation", "reflection", "human_review",
+        }
 
     def test_planning_branch_ends_include_end(self, graph) -> None:
         """planning 条件分支应包含 END。"""
@@ -126,7 +103,6 @@ class TestGraphEdgeCases:
 
     def test_compiled_graph_is_callable(self, graph) -> None:
         """编译后的图应可调用（ainvoke）。"""
-        import inspect
         assert hasattr(graph, "ainvoke")
         assert callable(graph.ainvoke)
 
@@ -176,7 +152,7 @@ class TestRunWorkflow:
             task_id="task-123",
             evolution_enabled=True,
         )
-        result = await run_workflow(graph=graph, initial_state=state, evolution_manager=ev)
+        await run_workflow(graph=graph, initial_state=state, evolution_manager=ev)
         ev.on_task_complete.assert_called_once()
 
     async def test_run_workflow_skipped_when_disabled(self, graph) -> None:
@@ -204,13 +180,58 @@ class TestRunWorkflow:
         result = await run_workflow(graph=graph, initial_state=state)
         assert result is not None
 
+    async def test_node_lifecycle_events_are_emitted_from_real_graph_execution(self) -> None:
+        progress = MagicMock()
+        graph = build_workflow(
+            context_node=FakeNode(),
+            planning_node=FakeNode(),
+            execution_node=FakeNode(),
+            validation_node=FakeNode(),
+            progress_callback=progress,
+        )
+
+        await run_workflow(
+            graph=graph,
+            initial_state=AgentState(user_request="hello", project_root="/test"),
+        )
+
+        events = [call.args[0] for call in progress.call_args_list]
+        assert [(event["node"], event["type"]) for event in events] == [
+            ("context", "node_start"),
+            ("context", "node_complete"),
+            ("planning", "node_start"),
+            ("planning", "node_complete"),
+        ]
+        assert all(event.get("success", True) for event in events)
+
+    async def test_callable_nodes_are_recorded_with_external_task_id(self) -> None:
+        recorder = MagicMock()
+        graph = build_workflow(
+            context_node=FakeNode(),
+            planning_node=FakeNode(),
+            execution_node=FakeNode(),
+            validation_node=FakeNode(),
+            trajectory_recorder=recorder,
+        )
+
+        await run_workflow(
+            graph=graph,
+            initial_state=AgentState(
+                user_request="hello",
+                project_root="/test",
+                task_id="task-external",
+            ),
+        )
+
+        assert recorder.record_step.call_count == 2
+        assert all(call.args[0] == "task-external" for call in recorder.record_step.call_args_list)
+
 
 class TestBuildCheckpointerConfig:
     """_build_checkpointer 的 config 集成测试。"""
 
     def test_checkpointer_uses_config_function(self, monkeypatch) -> None:
         """_build_checkpointer 应调用 config.get_checkpoint_db_path()。"""
-        from codeagent.orchestration.graph import _build_checkpointer
         from codeagent import config
 
         custom_path = "/custom/path/checkpoints.db"

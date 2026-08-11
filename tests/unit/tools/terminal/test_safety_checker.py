@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import pytest
 
-from codeagent.tools.terminal.safety_checker import SafetyChecker, SafetyResult
+from codeagent.tools.terminal.safety_checker import SafetyChecker
 
 
 @pytest.fixture

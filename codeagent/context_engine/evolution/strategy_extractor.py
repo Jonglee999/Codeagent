@@ -363,9 +363,16 @@ class StrategyExtractor:
             LLM 响应文本，失败时返回 None
         """
         try:
+            routing = (
+                {"model_role": "summary"}
+                if hasattr(self._llm_client, "registry")
+                and hasattr(self._llm_client, "select")
+                else {}
+            )
             response = await self._llm_client(
                 model="deepseek/deepseek-v4-flash",
                 messages=[{"role": "user", "content": prompt}],
+                **routing,
             )
             content = response.choices[0].message.content
             return content

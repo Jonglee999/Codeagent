@@ -1,0 +1,321 @@
+{
+  "schema_version": 1,
+  "selection": "codeagent-verified-50-v1",
+  "warning": "Selection-only gold-derived metadata; never include in Agent prompts.",
+  "tasks_sha256": "f480a764787b8cc940786e460983fbf81311abe27fb738639285e2aad5343d88",
+  "repository_counts": {
+    "astropy/astropy": 4,
+    "django/django": 8,
+    "matplotlib/matplotlib": 3,
+    "mwaskom/seaborn": 1,
+    "psf/requests": 1,
+    "pydata/xarray": 4,
+    "pylint-dev/pylint": 3,
+    "pytest-dev/pytest": 7,
+    "scikit-learn/scikit-learn": 3,
+    "sphinx-doc/sphinx": 8,
+    "sympy/sympy": 8
+  },
+  "tasks": [
+    {
+      "instance_id": "django__django-16527",
+      "tier": "L1",
+      "production_file_count": 1,
+      "gold_patch_changed_lines": 2
+    },
+    {
+      "instance_id": "django__django-15741",
+      "tier": "L1",
+      "production_file_count": 1,
+      "gold_patch_changed_lines": 1
+    },
+    {
+      "instance_id": "astropy__astropy-13453",
+      "tier": "L5",
+      "production_file_count": 1,
+      "gold_patch_changed_lines": 2
+    },
+    {
+      "instance_id": "sympy__sympy-20438",
+      "tier": "L3",
+      "production_file_count": 3,
+      "gold_patch_changed_lines": 20
+    },
+    {
+      "instance_id": "scikit-learn__scikit-learn-12682",
+      "tier": "L5",
+      "production_file_count": 2,
+      "gold_patch_changed_lines": 90
+    },
+    {
+      "instance_id": "sympy__sympy-13852",
+      "tier": "L2",
+      "production_file_count": 1,
+      "gold_patch_changed_lines": 30
+    },
+    {
+      "instance_id": "django__django-13212",
+      "tier": "L3",
+      "production_file_count": 2,
+      "gold_patch_changed_lines": 44
+    },
+    {
+      "instance_id": "pylint-dev__pylint-4661",
+      "tier": "L4",
+      "production_file_count": 2,
+      "gold_patch_changed_lines": 18
+    },
+    {
+      "instance_id": "sphinx-doc__sphinx-7889",
+      "tier": "L4",
+      "production_file_count": 1,
+      "gold_patch_changed_lines": 4
+    },
+    {
+      "instance_id": "pydata__xarray-4075",
+      "tier": "L2",
+      "production_file_count": 1,
+      "gold_patch_changed_lines": 9
+    },
+    {
+      "instance_id": "pytest-dev__pytest-10356",
+      "tier": "L5",
+      "production_file_count": 1,
+      "gold_patch_changed_lines": 37
+    },
+    {
+      "instance_id": "scikit-learn__scikit-learn-25931",
+      "tier": "L4",
+      "production_file_count": 1,
+      "gold_patch_changed_lines": 24
+    },
+    {
+      "instance_id": "sphinx-doc__sphinx-7748",
+      "tier": "L5",
+      "production_file_count": 1,
+      "gold_patch_changed_lines": 90
+    },
+    {
+      "instance_id": "sympy__sympy-13551",
+      "tier": "L1",
+      "production_file_count": 1,
+      "gold_patch_changed_lines": 4
+    },
+    {
+      "instance_id": "django__django-16661",
+      "tier": "L2",
+      "production_file_count": 1,
+      "gold_patch_changed_lines": 10
+    },
+    {
+      "instance_id": "pytest-dev__pytest-5840",
+      "tier": "L3",
+      "production_file_count": 2,
+      "gold_patch_changed_lines": 27
+    },
+    {
+      "instance_id": "astropy__astropy-8872",
+      "tier": "L2",
+      "production_file_count": 1,
+      "gold_patch_changed_lines": 11
+    },
+    {
+      "instance_id": "pytest-dev__pytest-6197",
+      "tier": "L4",
+      "production_file_count": 1,
+      "gold_patch_changed_lines": 24
+    },
+    {
+      "instance_id": "sympy__sympy-24213",
+      "tier": "L1",
+      "production_file_count": 1,
+      "gold_patch_changed_lines": 2
+    },
+    {
+      "instance_id": "pylint-dev__pylint-4604",
+      "tier": "L3",
+      "production_file_count": 2,
+      "gold_patch_changed_lines": 6
+    },
+    {
+      "instance_id": "pylint-dev__pylint-4551",
+      "tier": "L5",
+      "production_file_count": 4,
+      "gold_patch_changed_lines": 126
+    },
+    {
+      "instance_id": "sympy__sympy-11618",
+      "tier": "L2",
+      "production_file_count": 1,
+      "gold_patch_changed_lines": 14
+    },
+    {
+      "instance_id": "sympy__sympy-22914",
+      "tier": "L1",
+      "production_file_count": 1,
+      "gold_patch_changed_lines": 2
+    },
+    {
+      "instance_id": "django__django-13809",
+      "tier": "L2",
+      "production_file_count": 1,
+      "gold_patch_changed_lines": 9
+    },
+    {
+      "instance_id": "matplotlib__matplotlib-14623",
+      "tier": "L3",
+      "production_file_count": 3,
+      "gold_patch_changed_lines": 19
+    },
+    {
+      "instance_id": "pytest-dev__pytest-7490",
+      "tier": "L5",
+      "production_file_count": 1,
+      "gold_patch_changed_lines": 21
+    },
+    {
+      "instance_id": "sphinx-doc__sphinx-9461",
+      "tier": "L3",
+      "production_file_count": 3,
+      "gold_patch_changed_lines": 52
+    },
+    {
+      "instance_id": "sphinx-doc__sphinx-10435",
+      "tier": "L1",
+      "production_file_count": 1,
+      "gold_patch_changed_lines": 6
+    },
+    {
+      "instance_id": "scikit-learn__scikit-learn-13328",
+      "tier": "L4",
+      "production_file_count": 1,
+      "gold_patch_changed_lines": 3
+    },
+    {
+      "instance_id": "psf__requests-2317",
+      "tier": "L4",
+      "production_file_count": 1,
+      "gold_patch_changed_lines": 4
+    },
+    {
+      "instance_id": "pydata__xarray-6992",
+      "tier": "L5",
+      "production_file_count": 2,
+      "gold_patch_changed_lines": 123
+    },
+    {
+      "instance_id": "sphinx-doc__sphinx-8638",
+      "tier": "L4",
+      "production_file_count": 1,
+      "gold_patch_changed_lines": 2
+    },
+    {
+      "instance_id": "sympy__sympy-21930",
+      "tier": "L1",
+      "production_file_count": 1,
+      "gold_patch_changed_lines": 6
+    },
+    {
+      "instance_id": "pytest-dev__pytest-8399",
+      "tier": "L3",
+      "production_file_count": 2,
+      "gold_patch_changed_lines": 10
+    },
+    {
+      "instance_id": "pydata__xarray-3095",
+      "tier": "L3",
+      "production_file_count": 2,
+      "gold_patch_changed_lines": 49
+    },
+    {
+      "instance_id": "sympy__sympy-14711",
+      "tier": "L1",
+      "production_file_count": 1,
+      "gold_patch_changed_lines": 2
+    },
+    {
+      "instance_id": "sphinx-doc__sphinx-8459",
+      "tier": "L4",
+      "production_file_count": 1,
+      "gold_patch_changed_lines": 2
+    },
+    {
+      "instance_id": "astropy__astropy-7671",
+      "tier": "L2",
+      "production_file_count": 1,
+      "gold_patch_changed_lines": 9
+    },
+    {
+      "instance_id": "pytest-dev__pytest-5787",
+      "tier": "L5",
+      "production_file_count": 1,
+      "gold_patch_changed_lines": 232
+    },
+    {
+      "instance_id": "pytest-dev__pytest-7324",
+      "tier": "L2",
+      "production_file_count": 1,
+      "gold_patch_changed_lines": 10
+    },
+    {
+      "instance_id": "django__django-13741",
+      "tier": "L2",
+      "production_file_count": 1,
+      "gold_patch_changed_lines": 15
+    },
+    {
+      "instance_id": "pydata__xarray-7233",
+      "tier": "L4",
+      "production_file_count": 1,
+      "gold_patch_changed_lines": 5
+    },
+    {
+      "instance_id": "astropy__astropy-14369",
+      "tier": "L3",
+      "production_file_count": 2,
+      "gold_patch_changed_lines": 65
+    },
+    {
+      "instance_id": "matplotlib__matplotlib-26208",
+      "tier": "L1",
+      "production_file_count": 1,
+      "gold_patch_changed_lines": 2
+    },
+    {
+      "instance_id": "django__django-16950",
+      "tier": "L1",
+      "production_file_count": 1,
+      "gold_patch_changed_lines": 8
+    },
+    {
+      "instance_id": "mwaskom__seaborn-3187",
+      "tier": "L4",
+      "production_file_count": 2,
+      "gold_patch_changed_lines": 12
+    },
+    {
+      "instance_id": "sphinx-doc__sphinx-7590",
+      "tier": "L5",
+      "production_file_count": 3,
+      "gold_patch_changed_lines": 107
+    },
+    {
+      "instance_id": "sphinx-doc__sphinx-10673",
+      "tier": "L3",
+      "production_file_count": 3,
+      "gold_patch_changed_lines": 26
+    },
+    {
+      "instance_id": "matplotlib__matplotlib-26113",
+      "tier": "L5",
+      "production_file_count": 1,
+      "gold_patch_changed_lines": 2
+    },
+    {
+      "instance_id": "django__django-13315",
+      "tier": "L2",
+      "production_file_count": 1,
+      "gold_patch_changed_lines": 12
+    }
+  ]
+}

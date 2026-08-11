@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -361,7 +360,7 @@ class TestWarnings:
         f = tmp_path / "clean.py"
         f.write_text("x = 1\ny = 2\n")
         result = await validator.check_file(str(f))
-        warnings_without_empty = [w for w in result.warnings if w.code]
+        [w for w in result.warnings if w.code]
         # 只检查实际有意义的警告
         line_too_long = any(w.code == "LINE_TOO_LONG" for w in result.warnings)
         assert not line_too_long

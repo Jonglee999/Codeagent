@@ -6,10 +6,12 @@
 
 from __future__ import annotations
 
+import hashlib
+import asyncio
 import json
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -33,6 +35,7 @@ _SOURCE_EXTENSIONS = {".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}
 
 # 缓存中排除的目录
 _EXCLUDE_CACHE_DIRS = {".git", "node_modules", "__pycache__", ".codeagent", ".claude", ".venv", "venv"}
+_RECENT_FILE_HASH_WINDOW_NS = 2_000_000_000
 
 
 @dataclass
@@ -48,12 +51,54 @@ class ContextConfig:
         use_mock_embeddings: 是否使用 mock 嵌入模型（测试用，默认 False）
     """
 
+    # Direct construction keeps the historical library default. Runtime entry
+    # points use from_env(), whose canonical default is 16000.
     total_budget: int = 8000
     cache_enabled: bool = True
     cache_dir: str = ".codeagent/cache"
     languages: tuple[str, ...] = ("python", "typescript", "javascript")
     search_top_k: int = 10
     use_mock_embeddings: bool = False
+    # Large upstream repositories should start quickly and let the agent narrow
+    # the problem with regex search before paying for a full-project index.
+    # Defaults remain enabled for backwards compatibility; API/CLI runtimes
+    # explicitly opt into the lightweight profile through environment flags.
+    analysis_enabled: bool = True
+    semantic_enabled: bool = True
+    semantic_mode: str = "on"
+    index_background: bool = False
+    auto_file_limit: int = 300
+    min_input_tokens: int = 16000
+    max_input_tokens: int = 80000
+    model_context_window: int = 128000
+    max_output_tokens: int = 32768
+    safety_margin_tokens: int = 8000
+    tool_overhead_tokens: int = 8000
+    model_name: str = ""
+
+    @classmethod
+    def from_env(cls) -> "ContextConfig":
+        """Build one canonical runtime configuration from environment flags."""
+        from codeagent import config
+
+        context_mode = config.get_context_mode()
+        ast_mode = config.get_context_ast_mode()
+        semantic_mode = config.get_context_semantic_mode()
+        return cls(
+            total_budget=config.get_context_budget(),
+            analysis_enabled=context_mode != "off" and ast_mode != "off",
+            semantic_enabled=context_mode != "off" and semantic_mode != "off",
+            semantic_mode=semantic_mode,
+            index_background=config.get_context_index_background(),
+            auto_file_limit=config.get_context_auto_file_limit(),
+            min_input_tokens=config.get_context_min_input_tokens(),
+            max_input_tokens=config.get_context_max_input_tokens(),
+            model_context_window=config.get_model_context_window(),
+            max_output_tokens=config.get_max_completion_tokens_per_call(),
+            safety_margin_tokens=config.get_context_safety_margin_tokens(),
+            tool_overhead_tokens=config.get_context_tool_overhead_tokens(),
+            model_name=config.get_model(),
+        )
 
 
 @dataclass
@@ -100,9 +145,15 @@ class ContextEngine(IContextGateway):
         )
         self.context_assembler = ContextAssembler(
             total_budget=self.config.total_budget,
+            model_name=self.config.model_name,
         )
         self._stats = ContextStats()
         self._project_root: str | None = None
+        self._semantic_index_task: asyncio.Task[dict[str, Any]] | None = None
+        self._semantic_index_lock = asyncio.Lock()
+        self._semantic_index_status = "disabled" if not self.config.semantic_enabled else "not_started"
+        self._semantic_index_error: str | None = None
+        self._last_budget_decision: Any | None = None
 
     # ── IContextGateway 接口实现 ────────────────────────────────────────────
 
@@ -124,17 +175,37 @@ class ContextEngine(IContextGateway):
         start = time.monotonic()
         self._project_root = str(Path(project_root).resolve())
 
+        from codeagent.context_engine.budget import select_context_budget
+
+        self._last_budget_decision = select_context_budget(
+            query,
+            target_tokens=self.config.total_budget,
+            min_tokens=self.config.min_input_tokens,
+            max_tokens=self.config.max_input_tokens,
+            context_window=self.config.model_context_window,
+            max_output_tokens=self.config.max_output_tokens,
+            safety_margin_tokens=self.config.safety_margin_tokens,
+            tool_overhead_tokens=self.config.tool_overhead_tokens,
+        )
+        self.context_assembler.total_budget = self._last_budget_decision.effective_tokens
+
         # ── 确定构建模式 ──────────────────────────────────
         mode = self._determine_build_mode()
         changed_files: list[str] = []
 
         if mode == "quick" and self.config.cache_enabled:
-            changed_files = self._scan_changed_files()
-            if not changed_files:
+            changed_files, deleted_files = self._scan_file_changes()
+            if deleted_files:
+                # Incremental analyzers cannot reliably remove symbols and
+                # embeddings for vanished files. Rebuild to avoid stale context.
+                mode = "full"
+                changed_files = []
+                self._stats.cache_misses += 1
+            elif not changed_files:
                 self._stats.cache_hits += 1
             logger.info(
-                "Quick build for %s (%d changed files)",
-                self._project_root, len(changed_files),
+                "%s build for %s (%d changed, %d deleted files)",
+                mode.title(), self._project_root, len(changed_files), len(deleted_files),
             )
         else:
             self._stats.cache_misses += 1
@@ -144,22 +215,43 @@ class ContextEngine(IContextGateway):
         file_tree = await self.file_tree_indexer.scan(self._project_root)
 
         # ── 2. 代码分析 ───────────────────────────────────
-        if mode == "full" or not self._cache_exists():
-            await self.code_analyzer.build(self._project_root)
-        else:
-            for f in changed_files:
-                await self.code_analyzer.update_file(f)
+        if self.config.analysis_enabled:
+            if mode == "full" or not self._cache_exists():
+                await self.code_analyzer.build(self._project_root)
+            else:
+                for f in changed_files:
+                    await self.code_analyzer.update_file(f)
 
         # ── 3. 语义搜索 ───────────────────────────────────
-        if mode == "full" or not self._cache_exists():
-            await self.semantic_search.index_project(self._project_root)
-        else:
-            for f in changed_files:
-                await self.semantic_search.reindex_file(f)
+        search_results = []
+        if self.config.semantic_enabled:
+            needs_full_index = mode == "full" or not self._cache_exists()
+            if needs_full_index and self._should_build_index_in_background():
+                self._start_background_index(self._project_root)
+            else:
+                try:
+                    self._semantic_index_status = "indexing"
+                    if needs_full_index:
+                        await self.semantic_search.index_project(self._project_root)
+                    else:
+                        for f in changed_files:
+                            await self.semantic_search.reindex_file(f)
+                    self._semantic_index_status = "ready"
+                    self._semantic_index_error = None
+                except Exception as exc:
+                    self._semantic_index_status = "degraded"
+                    self._semantic_index_error = type(exc).__name__
+                    logger.warning("Semantic indexing degraded: %s", exc)
 
-        search_results = await self.semantic_search.search(
-            query, top_k=self.config.search_top_k,
-        )
+            if self._semantic_index_status == "ready":
+                try:
+                    search_results = await self.semantic_search.search(
+                        query, top_k=self.config.search_top_k,
+                    )
+                except Exception as exc:
+                    self._semantic_index_status = "degraded"
+                    self._semantic_index_error = type(exc).__name__
+                    logger.warning("Semantic search degraded: %s", exc)
 
         # ── 4. 组装数据包 ─────────────────────────────────
         related_code = [
@@ -173,8 +265,8 @@ class ContextEngine(IContextGateway):
             for r in search_results
         ]
 
-        symbol_table = self.code_analyzer.symbol_table.to_json()
-        dep_info = self._build_dep_info()
+        symbol_table = self.code_analyzer.symbol_table.to_json() if self.config.analysis_enabled else []
+        dep_info = self._build_dep_info() if self.config.analysis_enabled else {}
 
         package = ContextPackage(
             file_tree=file_tree,
@@ -200,8 +292,10 @@ class ContextEngine(IContextGateway):
             project_root: 项目根目录路径
         """
         self._project_root = str(Path(project_root).resolve())
-        await self.code_analyzer.build(self._project_root)
-        await self.semantic_search.index_project(self._project_root)
+        if self.config.analysis_enabled:
+            await self.code_analyzer.build(self._project_root)
+        if self.config.semantic_enabled:
+            await self._index_semantic_project(self._project_root)
         if self.config.cache_enabled:
             self._save_cache()
 
@@ -217,6 +311,13 @@ class ContextEngine(IContextGateway):
         Returns:
             list[CodeSnippet]: 相关代码片段列表（按相关性降序）
         """
+        if not self.config.semantic_enabled:
+            logger.info("Semantic search requested while semantic indexing is disabled")
+            return []
+        if self._semantic_index_status != "ready" and self.config.semantic_mode == "auto":
+            # Search is a progressive enhancement.  Regex/AST discovery must
+            # remain available while a large repository is being indexed.
+            return []
         results = await self.semantic_search.search(query, top_k=top_k)
         return [
             CodeSnippet(
@@ -228,6 +329,39 @@ class ContextEngine(IContextGateway):
             )
             for r in results
         ]
+
+    async def search_structural(self, query: str, top_k: int = 5) -> list[CodeSnippet]:
+        """Search AST symbols and expand direct dependency neighbors."""
+        if not self.config.analysis_enabled or not self._project_root:
+            return []
+        terms = [term for term in query.replace(".", " ").split() if len(term) >= 3]
+        symbols = []
+        seen_symbols: set[tuple[str, int]] = set()
+        for term in terms[:8]:
+            for symbol in self.code_analyzer.fuzzy_search_symbol(term):
+                key = (symbol.file_path, symbol.start_line)
+                if key not in seen_symbols:
+                    seen_symbols.add(key)
+                    symbols.append(symbol)
+        snippets: list[CodeSnippet] = []
+        for rank, symbol in enumerate(symbols[:top_k], start=1):
+            path = Path(symbol.file_path)
+            if not path.is_absolute():
+                path = Path(self._project_root) / path
+            try:
+                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                continue
+            start = max(1, symbol.start_line)
+            end = min(len(lines), max(start, symbol.end_line))
+            snippets.append(CodeSnippet(
+                file_path=symbol.file_path,
+                start_line=start,
+                end_line=end,
+                code="\n".join(lines[start - 1:end]),
+                score=1.0 / rank,
+            ))
+        return snippets
 
     # ── 查询接口 ───────────────────────────────────────────────────────────
 
@@ -251,6 +385,82 @@ class ContextEngine(IContextGateway):
             },
         }
         return report
+
+    def get_capability_report(self) -> dict[str, Any]:
+        """Return secret-free context runtime capability metadata."""
+        from codeagent import config
+
+        return {
+            "context_mode": config.get_context_mode(),
+            "ast_mode": config.get_context_ast_mode(),
+            "semantic_mode": self.config.semantic_mode,
+            "semantic_index_status": self._semantic_index_status,
+            "semantic_index_error": self._semantic_index_error,
+            "embedding_model_status": (
+                "mock" if self.config.use_mock_embeddings
+                else "loaded" if self.semantic_search.get_index_stats().get("model_loaded")
+                else "deferred"
+            ),
+            "model_context_window": config.get_model_context_window(),
+            "effective_context_budget": self.config.total_budget,
+            "index": self.semantic_search.get_index_stats(),
+        }
+
+    async def notify_workspace_changed(
+        self, file_path: str, *, deleted: bool = False,
+    ) -> None:
+        """Incrementally refresh AST and semantic state after a tool mutation."""
+        if self.config.analysis_enabled:
+            await self.code_analyzer.update_file(file_path)
+        if self.config.semantic_enabled and self._semantic_index_status == "ready":
+            async with self._semantic_index_lock:
+                if deleted:
+                    await self.semantic_search.delete_file(file_path)
+                else:
+                    await self.semantic_search.reindex_file(file_path)
+
+    def _source_file_count(self) -> int:
+        root = Path(self._project_root) if self._project_root else None
+        if root is None:
+            return 0
+        count = 0
+        for path in root.rglob("*"):
+            if path.is_file() and path.suffix.lower() in _SOURCE_EXTENSIONS:
+                if not any(part in _EXCLUDE_CACHE_DIRS for part in path.parts):
+                    count += 1
+                    if count > self.config.auto_file_limit:
+                        break
+        return count
+
+    def _should_build_index_in_background(self) -> bool:
+        return (
+            self.config.semantic_mode == "auto"
+            and self.config.index_background
+            and self._source_file_count() > self.config.auto_file_limit
+        )
+
+    async def _index_semantic_project(self, project_root: str) -> dict[str, Any]:
+        self._semantic_index_status = "indexing"
+        try:
+            async with self._semantic_index_lock:
+                result = await self.semantic_search.index_project(project_root)
+        except Exception as exc:
+            self._semantic_index_status = "degraded"
+            self._semantic_index_error = type(exc).__name__
+            logger.warning("Semantic indexing degraded: %s", exc)
+            return {"error": type(exc).__name__}
+        self._semantic_index_status = "ready"
+        self._semantic_index_error = None
+        return result
+
+    def _start_background_index(self, project_root: str) -> None:
+        if self._semantic_index_task and not self._semantic_index_task.done():
+            return
+        self._semantic_index_status = "indexing"
+        self._semantic_index_task = asyncio.create_task(
+            self._index_semantic_project(project_root),
+            name="codeagent-semantic-index",
+        )
 
     def assemble_context(self, package: ContextPackage) -> str:
         """将 ContextPackage 组装为 LLM-ready XML 格式。
@@ -295,22 +505,28 @@ class ContextEngine(IContextGateway):
         读取 mtime 快照并与当前文件系统对比，返回变更文件的绝对路径列表。
         包括：修改的文件、新增的文件。删除的文件不返回（已由缓存处理）。
         """
+        changed, _deleted = self._scan_file_changes()
+        return changed
+
+    def _scan_file_changes(self) -> tuple[list[str], list[str]]:
+        """Return modified/new absolute paths and deleted relative paths."""
         cache_path = self._get_cache_path()
         if not cache_path or not cache_path.is_file():
-            return []
+            return [], []
 
         try:
             with open(cache_path, encoding="utf-8") as f:
                 cache_data = json.load(f)
         except (OSError, json.JSONDecodeError):
-            return []
+            return [], []
 
         cached_mtimes: dict[str, str] = cache_data.get("files", {})
         root = Path(self._project_root) if self._project_root else None
         if not root:
-            return []
+            return [], []
 
         changed: list[str] = []
+        current_files: set[str] = set()
 
         # 遍历当前文件系统，与缓存对比
         for file_path in root.rglob("*"):
@@ -322,17 +538,24 @@ class ContextEngine(IContextGateway):
                 continue
 
             rel = str(file_path.relative_to(root)).replace("\\", "/")
+            current_files.add(rel)
+            cached_fingerprint = cached_mtimes.get(rel)
             try:
-                current_mtime = _format_timestamp(file_path.stat().st_mtime)
+                current_fingerprint = _file_fingerprint(
+                    file_path,
+                    include_digest=(
+                        isinstance(cached_fingerprint, str)
+                        and cached_fingerprint.count(":") >= 2
+                    ),
+                )
             except OSError:
                 continue
 
-            cached_mtime = cached_mtimes.get(rel)
-
-            if cached_mtime is None or cached_mtime != current_mtime:
+            if cached_fingerprint is None or cached_fingerprint != current_fingerprint:
                 changed.append(str(file_path))
 
-        return changed
+        deleted = sorted(set(cached_mtimes) - current_files)
+        return changed, deleted
 
     # ── 缓存读写 ───────────────────────────────────────────────────────────
 
@@ -378,7 +601,7 @@ class ContextEngine(IContextGateway):
                 continue
             rel = str(file_path.relative_to(root)).replace("\\", "/")
             try:
-                files[rel] = _format_timestamp(file_path.stat().st_mtime)
+                files[rel] = _file_fingerprint(file_path, hash_recent=True)
             except OSError:
                 continue
 
@@ -439,3 +662,27 @@ def _format_timestamp(timestamp: float) -> str:
         return dt.strftime(_ISO_FORMAT)
     except (OSError, ValueError, OverflowError):
         return ""
+
+
+def _file_fingerprint(
+    path: Path,
+    *,
+    include_digest: bool = False,
+    hash_recent: bool = False,
+) -> str:
+    """Fingerprint a source file without hashing every stable repository file.
+
+    Some Windows/filesystem combinations can reuse mtime and size for two rapid
+    same-length writes. Newly modified files therefore carry a short content
+    digest in the cache. Stable older files keep the cheap stat-only fast path.
+    """
+    stat = path.stat()
+    base = f"{stat.st_mtime_ns}:{stat.st_size}"
+    should_hash = include_digest or (
+        hash_recent
+        and abs(time.time_ns() - stat.st_mtime_ns) <= _RECENT_FILE_HASH_WINDOW_NS
+    )
+    if not should_hash:
+        return base
+    digest = hashlib.blake2b(path.read_bytes(), digest_size=8).hexdigest()
+    return f"{base}:{digest}"

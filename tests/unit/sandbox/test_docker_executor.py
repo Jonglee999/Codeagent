@@ -5,8 +5,9 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+import asyncio
+import threading
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -146,6 +147,52 @@ class TestRun:
         # environment 内容正确
         assert create_kwargs["environment"] == {"KEY": "val"}
 
+    async def test_run_labels_and_names_managed_sandbox(self, executor, mock_docker_client):
+        await executor.run(command="echo hello", workdir="/tmp")
+
+        create_kwargs = mock_docker_client.containers.create.call_args.kwargs
+        assert create_kwargs["name"].startswith("codeagent-sandbox-")
+        assert create_kwargs["labels"] == {
+            "com.codeagent.managed": "true",
+            "com.codeagent.kind": "sandbox",
+        }
+
+    async def test_run_always_removes_container_and_volumes(self, executor, mock_docker_client):
+        container = mock_docker_client.containers.create.return_value
+
+        await executor.run(command="echo hello", workdir="/tmp")
+
+        container.remove.assert_called_once_with(force=True, v=True)
+
+    async def test_cancel_kills_active_container(self, executor, mock_docker_client):
+        container = mock_docker_client.containers.create.return_value
+        started = threading.Event()
+        released = threading.Event()
+
+        def blocking_wait():
+            started.set()
+            released.wait(timeout=2)
+            return {"StatusCode": 137}
+
+        container.wait.side_effect = blocking_wait
+        container.kill.side_effect = released.set
+        running = asyncio.create_task(executor.run(command="sleep 30", workdir="/tmp"))
+        await asyncio.wait_for(asyncio.to_thread(started.wait), timeout=1)
+
+        running.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await running
+
+        container.kill.assert_called_once_with()
+
+    async def test_cleanup_retries_transient_docker_error(self, executor):
+        container = MagicMock()
+        container.remove.side_effect = [RuntimeError("busy"), None]
+
+        executor._remove_container(container)
+
+        assert container.remove.call_count == 2
+
     async def test_run_environment_not_none_when_no_env(self, executor, mock_docker_client):
         """R2: 未传 env 时 environment 应为 None。"""
         await executor.run(command="echo hello", workdir="/tmp")
@@ -205,7 +252,7 @@ class TestRun:
         created_kwargs = mock_docker_client.containers.create.call_args.kwargs
         volumes = created_kwargs.get("volumes", {})
         # 路径应包含 posix 转换后的 key
-        posix_keys = [k for k in volumes if "Users" in k or "users" in k.lower()]
+        [k for k in volumes if "Users" in k or "users" in k.lower()]
         # 由于路径可能不存在，至少确认 volumes 被正确传递
         assert len(volumes) > 0
 
@@ -278,14 +325,16 @@ class TestConfigFunctions:
         importlib.reload(config)
         assert config.get_sandbox_enabled() is True
 
-    def test_get_sandbox_timeout_default(self):
+    def test_get_sandbox_timeout_default(self, monkeypatch):
         """SANDBOX_TIMEOUT 默认值为 60。"""
         from codeagent import config
 
+        monkeypatch.delenv("SANDBOX_TIMEOUT", raising=False)
         assert config.get_sandbox_timeout() == 60
 
-    def test_get_sandbox_memory_mb_default(self):
+    def test_get_sandbox_memory_mb_default(self, monkeypatch):
         """SANDBOX_MEMORY_MB 默认值为 512。"""
         from codeagent import config
 
+        monkeypatch.delenv("SANDBOX_MEMORY_MB", raising=False)
         assert config.get_sandbox_memory_mb() == 512

@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from codeagent.orchestration.rollback import RollbackManager, RollbackResult
+from codeagent.orchestration.rollback import RollbackManager
 from codeagent.orchestration.state import AgentState
 
 

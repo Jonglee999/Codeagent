@@ -13,7 +13,6 @@ import json
 from typing import Any
 
 from rich.console import Console, Group
-from rich.highlighter import ReprHighlighter
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
@@ -21,7 +20,6 @@ from rich.rule import Rule
 from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
-from rich.tree import Tree
 
 from codeagent.gateway.tool_gateway import ToolDefinition, ToolResult
 

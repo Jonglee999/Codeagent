@@ -11,6 +11,8 @@ import pytest
 
 from codeagent.orchestration.orchestrator import Orchestrator
 from codeagent.orchestration.state import AgentState
+from codeagent.gateway.memory_gateway import IMemoryGateway
+from codeagent.gateway.validation_gateway import ValidationResult
 
 
 @pytest.fixture
@@ -75,6 +77,31 @@ class TestOrchestratorRun:
         )
         assert result.auto_mode is True
 
+    async def test_run_preserves_external_task_id(self, orchestrator: Orchestrator) -> None:
+        result = await orchestrator.run(
+            user_request="test",
+            project_root="/root",
+            task_id="api-task-123",
+        )
+        assert result.task_id == "api-task-123"
+        assert result.conversation_history == [
+            {"role": "user", "content": "test"},
+        ]
+
+    async def test_run_preserves_benchmark_instance_id(
+        self, orchestrator: Orchestrator, tmp_path
+    ) -> None:
+        result = await orchestrator.run(
+            user_request="fix benchmark",
+            project_root=str(tmp_path),
+            benchmark_instance_id="owner__repo-1",
+        )
+
+        assert result.benchmark_instance_id == "owner__repo-1"
+        assert result.direct_execution is True
+        assert result.run_profile["workflow"] == "direct"
+        assert result.run_profile["benchmark"] is True
+
     async def test_run_multiple_times(self, orchestrator: Orchestrator) -> None:
         await orchestrator.run(user_request="req1", project_root="/root")
         await orchestrator.run(user_request="req2", project_root="/root")
@@ -87,6 +114,105 @@ class TestOrchestratorRun:
             project_root="/root",
         )
         assert any("Orchestrator run failed" in e for e in result.errors)
+
+    async def test_evidence_gated_memory_writeback_runs_only_after_completion(
+        self, tmp_path, mock_gateways: dict,
+    ) -> None:
+        memory = AsyncMock(spec=IMemoryGateway)
+        memory.auto_extract.return_value = []
+        events: list[dict] = []
+        orch = Orchestrator(
+            **mock_gateways,
+            memory_gateway=memory,
+            progress_callback=events.append,
+        )
+        graph = AsyncMock()
+
+        async def completed(state, config=None):
+            state.validation_results = [ValidationResult(passed=True)]
+            state.reflection = {"next_action": "finish"}
+            return state
+
+        graph.ainvoke.side_effect = completed
+        orch._graph = graph
+
+        result = await orch.run(
+            "Remember this project preference: always use the parser fixture",
+            str(tmp_path),
+            task_id="task-memory",
+        )
+
+        memory.auto_extract.assert_not_awaited()
+        assert result.memory_extracted is False
+        assert result.transcript_path is not None
+        assert not any(event["type"] == "memory_extracted" for event in events)
+        assert next(event for event in events if event["type"] == "transcript_saved")["visibility"] == "internal"
+
+        saved = await orch.persist_memory(
+            result,
+            user_request="Remember this project preference: always use the parser fixture",
+            task_id="task-memory",
+            success=True,
+            completion_errors=[],
+        )
+
+        assert saved == 1
+        memory.auto_extract.assert_awaited_once()
+        assert result.memory_extracted is True
+
+    async def test_routine_task_skips_foreground_learning(
+        self, tmp_path, mock_gateways: dict,
+    ) -> None:
+        memory = AsyncMock(spec=IMemoryGateway)
+        events: list[dict] = []
+        orch = Orchestrator(
+            **mock_gateways,
+            memory_gateway=memory,
+            progress_callback=events.append,
+        )
+        graph = AsyncMock()
+
+        async def completed(state, config=None):
+            state.validation_results = [ValidationResult(passed=True)]
+            return state
+
+        graph.ainvoke.side_effect = completed
+        orch._graph = graph
+
+        result = await orch.run("fix parser", str(tmp_path), task_id="task-routine")
+
+        memory.auto_extract.assert_not_awaited()
+        assert result.learning_mode == "off"
+        profile_events = [event for event in events if event["type"] == "run_profile_selected"]
+        assert profile_events[0]["data"]["workflow"] == "direct"
+
+    async def test_recovery_lineage_is_emitted_and_persisted_in_state(
+        self, tmp_path, mock_gateways: dict,
+    ) -> None:
+        events: list[dict] = []
+        orch = Orchestrator(**mock_gateways, progress_callback=events.append)
+        graph = AsyncMock()
+
+        async def completed(state, config=None):
+            state.validation_results = [ValidationResult(passed=True)]
+            return state
+
+        graph.ainvoke.side_effect = completed
+        orch._graph = graph
+
+        result = await orch.run(
+            "continue repair",
+            str(tmp_path),
+            task_id="task-recovery",
+            recovered_from_task_id="task-source",
+        )
+
+        assert result.recovered_from_task_id == "task-source"
+        assert any(
+            event["type"] == "recovery_started"
+            and event["data"]["recovered_from_task_id"] == "task-source"
+            for event in events
+        )
 
 
 class TestOrchestratorResume:

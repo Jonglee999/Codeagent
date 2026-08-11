@@ -5,12 +5,10 @@ Goal: Replace with JWT-based authentication.
 """
 
 import base64
-import hashlib
 import hmac
 from typing import Any
 
 from fastapi import HTTPException, Request
-from fastapi.responses import JSONResponse
 
 
 # Simulated user store

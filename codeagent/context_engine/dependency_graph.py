@@ -8,6 +8,11 @@ from typing import Any
 
 import networkx as nx
 
+from codeagent.context_engine.dependency_parser import (
+    DependencyRecord,
+    TreeSitterDependencyAdapter,
+)
+
 # ── 导入语句匹配模式 ──────────────────────────────────────────────────────────
 
 # Python import 模式
@@ -154,10 +159,14 @@ class DependencyGraph:
             ".mjs": "javascript",
             ".cjs": "javascript",
         }
+        self._ast_adapter = TreeSitterDependencyAdapter()
+        self._last_warnings: list[str] = []
+        self._schema_version = 2
 
     async def build(self, project_root: str) -> None:
         """全量构建依赖图。"""
         self._graph.clear()
+        self._last_warnings.clear()
         root = Path(project_root).resolve()
         if not root.is_dir():
             raise NotADirectoryError(f"Not a directory: {root}")
@@ -180,15 +189,21 @@ class DependencyGraph:
 
         for file_path in source_files:
             rel_path = str(file_path.relative_to(root)).replace("\\", "/")
-            deps = self._extract_dependencies(file_path)
+            deps = self._extract_dependency_records(file_path)
             self._graph.add_node(rel_path)
-            for dep in deps:
-                dep_path = _normalize_module_to_path(dep, str(file_path), self._project_root)
+            for record in deps:
+                dep_path = self._resolve_dependency(record.module, file_path)
                 if dep_path:
                     self._graph.add_node(dep_path)
-                    self._graph.add_edge(rel_path, dep_path)
+                    self._graph.add_edge(
+                        rel_path, dep_path, source=record.source, kind=record.kind,
+                    )
                 else:
-                    self._graph.add_node(f"<external>{dep}")
+                    external = f"<external>{record.module}"
+                    self._graph.add_node(external)
+                    self._graph.add_edge(
+                        rel_path, external, source=record.source, kind=record.kind,
+                    )
 
     async def update_file(self, file_path: str) -> None:
         """增量更新单个文件的依赖。"""
@@ -208,14 +223,21 @@ class DependencyGraph:
             return
 
         # 重新解析
-        deps = self._extract_dependencies(fp)
+        deps = self._extract_dependency_records(fp)
         self._graph.add_node(rel_path)
-        for dep in deps:
-            project_root = getattr(self, '_project_root', None)
-            dep_path = _normalize_module_to_path(dep, str(fp), project_root)
+        for record in deps:
+            dep_path = self._resolve_dependency(record.module, fp)
             if dep_path:
                 self._graph.add_node(dep_path)
-                self._graph.add_edge(rel_path, dep_path)
+                self._graph.add_edge(
+                    rel_path, dep_path, source=record.source, kind=record.kind,
+                )
+            else:
+                external = f"<external>{record.module}"
+                self._graph.add_node(external)
+                self._graph.add_edge(
+                    rel_path, external, source=record.source, kind=record.kind,
+                )
 
     def _resolve_rel_path(self, file_path: str) -> str:
         """将文件路径转为相对于项目根目录的路径。"""
@@ -227,6 +249,31 @@ class DependencyGraph:
                 return normalized[len(root) + 1:]
         # 已经是相对路径
         return normalized
+
+    def _resolve_dependency(self, module: str, importer: Path) -> str | None:
+        """Resolve Python modules and JS/TS relative modules to project files."""
+        if importer.suffix.lower() == ".py":
+            return _normalize_module_to_path(
+                module, str(importer), getattr(self, "_project_root", None),
+            )
+        if not module.startswith("."):
+            return None
+        root_value = getattr(self, "_project_root", None)
+        if not root_value:
+            return None
+        root = Path(root_value)
+        base = (importer.parent / module).resolve()
+        candidates = [base]
+        if not base.suffix:
+            candidates.extend(base.with_suffix(ext) for ext in self._ext_to_lang if ext != ".py")
+            candidates.extend(base / f"index{ext}" for ext in self._ext_to_lang if ext != ".py")
+        for candidate in candidates:
+            if candidate.is_file():
+                try:
+                    return candidate.relative_to(root).as_posix()
+                except ValueError:
+                    return None
+        return None
 
     def get_dependents(self, file_path: str) -> list[str]:
         """谁依赖这个文件（反向依赖）。"""
@@ -295,6 +342,24 @@ class DependencyGraph:
                 deps[node] = internal
         return deps
 
+    def edge_evidence(self, source: str, target: str) -> dict[str, Any]:
+        """Return how one dependency edge was discovered."""
+        return dict(self._graph.get_edge_data(source, target, default={}))
+
+    def get_index_metadata(self) -> dict[str, Any]:
+        return {
+            "schema_version": self._schema_version,
+            "warnings": list(self._last_warnings),
+            "ast_edges": sum(
+                data.get("source") == "ast"
+                for _, _, data in self._graph.edges(data=True)
+            ),
+            "fallback_edges": sum(
+                data.get("source") == "regex_fallback"
+                for _, _, data in self._graph.edges(data=True)
+            ),
+        }
+
     @property
     def graph(self) -> nx.DiGraph:
         """获取底层 networkx 有向图。"""
@@ -315,6 +380,30 @@ class DependencyGraph:
         elif ext in (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"):
             return self._extract_js_imports(code)
         return []
+
+    def _extract_dependency_records(self, file_path: Path) -> list[DependencyRecord]:
+        ext = file_path.suffix.lower()
+        language = self._ext_to_lang.get(ext)
+        if language is None:
+            return []
+        try:
+            code = file_path.read_text(encoding="utf-8", errors="ignore")
+        except (OSError, PermissionError):
+            return []
+        try:
+            return self._ast_adapter.extract(code, language)
+        except Exception as exc:
+            self._last_warnings.append(
+                f"{file_path}: AST dependency parsing unavailable ({type(exc).__name__})"
+            )
+            modules = (
+                self._extract_python_imports(code)
+                if ext == ".py" else self._extract_js_imports(code)
+            )
+            return [
+                DependencyRecord(module, "import", "regex_fallback")
+                for module in modules
+            ]
 
     def _extract_python_imports(self, code: str) -> list[str]:
         """提取 Python 导入语句。"""

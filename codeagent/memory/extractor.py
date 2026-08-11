@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from codeagent.memory.retriever import MemoryRetriever
@@ -258,9 +258,16 @@ class MemoryExtractor:
     async def _call_llm(self, prompt: str) -> Optional[str]:
         """调用 LLM 获取响应文本。"""
         try:
+            routing = (
+                {"model_role": "memory"}
+                if hasattr(self._llm_client, "registry")
+                and hasattr(self._llm_client, "select")
+                else {}
+            )
             response = await self._llm_client(
                 model=self._model_name,
                 messages=[{"role": "user", "content": prompt}],
+                **routing,
             )
             content = response.choices[0].message.content
             return content

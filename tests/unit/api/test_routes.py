@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
@@ -19,6 +20,8 @@ from codeagent.gateway.orchestration_gateway import (
     TaskStatus,
 )
 from codeagent.interaction.api.routes import _get_gateway, router
+from codeagent.interaction.api import routes
+from codeagent.product_state import ProductStateStore
 
 
 # =============================================================================
@@ -45,6 +48,7 @@ def mock_gateway():
 
     # cancel_task
     gw.cancel_task.return_value = True
+    gw.steer_task.return_value = True
 
     # get_report
     gw.get_report.return_value = TaskReport(
@@ -54,6 +58,12 @@ def mock_gateway():
         validation_results=[{"layer": "syntax", "passed": True}],
         duration=12.5,
         token_usage=1500,
+        benchmark_instance_id="owner__repo-1",
+        model_runtime={"active_model": "test/model", "retry_count": 1},
+        infrastructure_runtime={
+            "redis": {"recovery_count": 1},
+            "tools": {"timeout_count": 1},
+        },
     )
 
     # submit_decision
@@ -63,11 +73,17 @@ def mock_gateway():
 
 
 @pytest.fixture
-def app(mock_gateway):
+def state_store(tmp_path):
+    return ProductStateStore(tmp_path / "product.sqlite3")
+
+
+@pytest.fixture
+def app(mock_gateway, state_store, monkeypatch):
     """Create a test FastAPI app with mocked gateway."""
     app = FastAPI()
     app.include_router(router)
     app.dependency_overrides[_get_gateway] = lambda: mock_gateway
+    monkeypatch.setattr(routes, "_product_state_store", state_store)
     return app
 
 
@@ -139,13 +155,35 @@ class TestCreateTask:
         )
         assert resp.status_code == 422
 
-    def test_missing_project_root(self, client):
-        """POST /tasks 缺少 project_root 时返回 422。"""
+    def test_accepts_long_official_benchmark_statement(self, client, mock_gateway):
+        mock_gateway.start_task.return_value = "benchmark-task"
+
+        resp = client.post(
+            "/api/v1/tasks",
+            json={"query": "x" * 15_000, "project_root": "/tmp/test"},
+        )
+
+        assert resp.status_code == 202
+
+    def test_missing_project_root_creates_managed_workspace(
+        self, client, mock_gateway, monkeypatch, tmp_path,
+    ):
+        from codeagent.workspaces import WorkspaceManager
+
+        monkeypatch.setattr(
+            "codeagent.interaction.api.routes._workspace_manager",
+            WorkspaceManager(tmp_path),
+        )
         resp = client.post(
             "/api/v1/tasks",
             json={"query": "Add logging"},
         )
-        assert resp.status_code == 422
+        assert resp.status_code == 202
+        workspace = Path(resp.json()["data"]["project_root"])
+        assert workspace.is_dir()
+        workspace.relative_to(tmp_path / ".codeagent" / "workspaces" / "sessions")
+        request = mock_gateway.start_task.await_args.args[0]
+        assert request.project_root == str(workspace)
 
     def test_gateway_error(self, client, mock_gateway):
         """POST /tasks gateway 异常时返回 500。"""
@@ -161,6 +199,37 @@ class TestCreateTask:
         data = resp.json()
         assert data["success"] is False
         assert "Redis connection failed" in data["error"]
+
+    def test_follow_up_uses_durable_history_and_removes_current_turn_duplicate(
+        self, client, mock_gateway, state_store, tmp_path,
+    ):
+        state_store.record_run(
+            "task-first",
+            conversation_id="conversation-1",
+            query="Create random_generator.py",
+            workspace_root=str(tmp_path),
+        )
+        state_store.save_report("task-first", {"assistant_response": "Created it. Output: 50"})
+
+        response = client.post(
+            "/api/v1/tasks",
+            json={
+                "query": "Run it again",
+                "project_root": str(tmp_path),
+                "conversation_id": "conversation-1",
+                "conversation_history": [
+                    {"role": "user", "content": "stale client copy"},
+                    {"role": "user", "content": "Run it again"},
+                ],
+            },
+        )
+
+        assert response.status_code == 202
+        request = mock_gateway.start_task.await_args.args[0]
+        assert request.conversation_history == [
+            {"role": "user", "content": "Create random_generator.py"},
+            {"role": "assistant", "content": "Created it. Output: 50"},
+        ]
 
 
 # =============================================================================
@@ -210,6 +279,24 @@ class TestGetTaskStatus:
         data = resp.json()
         assert data["success"] is False
         assert "not found" in data["error"].lower()
+
+    def test_falls_back_to_durable_status(
+        self, client, mock_gateway, state_store, tmp_path,
+    ):
+        state_store.record_run(
+            "durable-task",
+            conversation_id="conversation-1",
+            query="Fix it",
+            workspace_root=str(tmp_path),
+        )
+        state_store.update_run_state("durable-task", "completed")
+        mock_gateway.get_task_status.side_effect = KeyError("expired")
+
+        response = client.get("/api/v1/tasks/durable-task")
+
+        assert response.status_code == 200
+        assert response.json()["data"]["state"] == "completed"
+        assert response.json()["data"]["progress"] == 1.0
 
     def test_gateway_error(self, client, mock_gateway):
         """GET /tasks/{id} gateway 异常时返回 500。"""
@@ -286,6 +373,29 @@ class TestSubmitDecision:
         data = resp.json()
         assert data["success"] is False
 
+    def test_restarts_persisted_inline_checkpoint(
+        self, client, app, state_store, tmp_path,
+    ):
+        resume = AsyncMock()
+        app.state.inline_tasks = {}
+        app.state.resume_inline_checkpoint = resume
+        app.state.redis_url = "redis://test"
+        state_store.record_run(
+            "task-resume",
+            conversation_id="conversation-resume",
+            query="Continue after review",
+            workspace_root=str(tmp_path),
+        )
+        state_store.update_run_state("task-resume", "running")
+
+        response = client.post(
+            "/api/v1/tasks/task-resume/decision",
+            json={"decision": "approve"},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["data"]["checkpoint_resume_started"] is True
+
 
 # =============================================================================
 # DELETE /api/v1/tasks/{task_id}
@@ -321,6 +431,87 @@ class TestCancelTask:
         assert data["success"] is False
 
 
+class TestSteerTask:
+    def test_queues_runtime_instruction(self, client, mock_gateway):
+        response = client.post(
+            "/api/v1/tasks/task-1/steer",
+            json={"instruction": "Keep the public API compatible"},
+        )
+        assert response.status_code == 200
+        assert response.json()["data"]["queued"] is True
+        mock_gateway.steer_task.assert_awaited_once_with(
+            "task-1", "Keep the public API compatible"
+        )
+
+    def test_rejects_empty_runtime_instruction(self, client):
+        response = client.post(
+            "/api/v1/tasks/task-1/steer", json={"instruction": ""}
+        )
+        assert response.status_code == 422
+
+
+class TestRecoverTask:
+    def test_starts_new_run_in_existing_workspace(
+        self, client, mock_gateway, state_store, tmp_path,
+    ):
+        state_store.record_run(
+            "task-source",
+            conversation_id="conversation-1",
+            query="Finish the parser",
+            workspace_root=str(tmp_path),
+        )
+        state_store.update_run_state("task-source", "cancelled")
+        mock_gateway.start_task.return_value = "task-recovery"
+
+        response = client.post(
+            "/api/v1/tasks/task-source/recover",
+            json={"instruction": "Continue with the tests", "auto_mode": True},
+        )
+
+        assert response.status_code == 202
+        assert response.json()["data"]["task_id"] == "task-recovery"
+        assert response.json()["data"]["recovered_from_task_id"] == "task-source"
+        recovered = mock_gateway.start_task.await_args.args[0]
+        assert recovered.project_root == str(tmp_path.resolve())
+        assert recovered.conversation_id == "conversation-1"
+        assert recovered.response_mode == "execute"
+        assert "Original goal: Finish the parser" in recovered.query
+        assert "Recovery instruction: Continue with the tests" in recovered.query
+        assert recovered.recovered_from_task_id == "task-source"
+        assert state_store.get_run("task-recovery")["recovered_from_task_id"] == "task-source"
+
+    def test_rejects_recovery_of_active_or_successful_run(
+        self, client, state_store, tmp_path,
+    ):
+        state_store.record_run(
+            "task-source",
+            conversation_id="conversation-1",
+            query="Finish the parser",
+            workspace_root=str(tmp_path),
+        )
+        state_store.update_run_state("task-source", "completed")
+
+        response = client.post("/api/v1/tasks/task-source/recover", json={})
+
+        assert response.status_code == 409
+
+    def test_rejects_recovery_when_workspace_is_missing(
+        self, client, state_store, tmp_path,
+    ):
+        missing = tmp_path / "removed-workspace"
+        state_store.record_run(
+            "task-source",
+            conversation_id="conversation-1",
+            query="Finish the parser",
+            workspace_root=str(missing),
+        )
+        state_store.update_run_state("task-source", "failed")
+
+        response = client.post("/api/v1/tasks/task-source/recover", json={})
+
+        assert response.status_code == 409
+
+
 # =============================================================================
 # GET /api/v1/tasks/{task_id}/report
 # =============================================================================
@@ -339,6 +530,9 @@ class TestGetReport:
         assert len(data["data"]["plan"]) == 1
         assert len(data["data"]["changes"]) == 1
         assert len(data["data"]["validation_results"]) == 1
+        assert data["data"]["model_runtime"]["active_model"] == "test/model"
+        assert data["data"]["infrastructure_runtime"]["redis"]["recovery_count"] == 1
+        assert data["data"]["benchmark_instance_id"] == "owner__repo-1"
 
     def test_not_found(self, client, mock_gateway):
         """GET /tasks/{id}/report 不存在的报告返回 404。"""
@@ -348,6 +542,32 @@ class TestGetReport:
         data = resp.json()
         assert data["success"] is False
         assert "not found" in data["error"].lower()
+
+    def test_falls_back_to_durable_report(
+        self, client, mock_gateway, state_store, tmp_path,
+    ):
+        state_store.record_run(
+            "durable-task",
+            conversation_id="conversation-1",
+            query="Fix it",
+            workspace_root=str(tmp_path),
+        )
+        report = TaskReport(
+            task_id="durable-task",
+            plan=[],
+            changes=[],
+            validation_results=[],
+            duration=1.0,
+            token_usage=10,
+            assistant_response="Durable answer",
+        )
+        state_store.save_report("durable-task", report.__dict__)
+        mock_gateway.get_report.side_effect = KeyError("expired")
+
+        response = client.get("/api/v1/tasks/durable-task/report")
+
+        assert response.status_code == 200
+        assert response.json()["data"]["assistant_response"] == "Durable answer"
 
     def test_gateway_error(self, client, mock_gateway):
         """GET /tasks/{id}/report gateway 异常时返回 500。"""
@@ -454,3 +674,112 @@ class TestHealth:
         assert body["status"] == "ok"
         assert "inline_mode" in body
         assert "redis" in body
+
+
+class TestSystemCapabilities:
+    def test_does_not_connect_to_mcp_during_page_load(
+        self, client, monkeypatch, tmp_path,
+    ) -> None:
+        probe = AsyncMock(side_effect=AssertionError("MCP must stay cold"))
+        monkeypatch.setattr(routes.ToolGateway, "initialize_extensions", probe)
+
+        response = client.get(
+            "/api/v1/system/capabilities",
+            params={"project_root": str(tmp_path)},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["success"] is True
+        probe.assert_not_awaited()
+
+
+# =============================================================================
+# 任务工作区文件浏览
+# =============================================================================
+
+
+class TestTaskFiles:
+    def _seed_workspace(self, tmp_path: Path) -> None:
+        (tmp_path / "main.py").write_text("def hello():\n    return 1\n", encoding="utf-8")
+        (tmp_path / "notes.md").write_text("# notes\n", encoding="utf-8")
+        (tmp_path / "logo.png").write_bytes(b"\x89PNG\x00\x00\x00\x00binary")
+        (tmp_path / ".env").write_text("SECRET=1\n", encoding="utf-8")
+        node_modules = tmp_path / "node_modules" / "pkg"
+        node_modules.mkdir(parents=True)
+        (node_modules / "index.js").write_text("module.exports = 1\n", encoding="utf-8")
+        hidden_dir = tmp_path / ".codeagent"
+        hidden_dir.mkdir()
+        (hidden_dir / "report.json").write_text("{}", encoding="utf-8")
+
+    def test_lists_files_with_binary_markers(
+        self, client, state_store, tmp_path,
+    ):
+        state_store.record_run(
+            "file-task",
+            conversation_id="conversation-1",
+            query="Create a generator",
+            workspace_root=str(tmp_path),
+        )
+        self._seed_workspace(tmp_path)
+
+        resp = client.get("/api/v1/tasks/file-task/files")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["success"] is True
+        files = {item["path"]: item for item in data["data"]["files"]}
+        assert "main.py" in files
+        assert files["main.py"]["binary"] is False
+        assert "logo.png" in files
+        assert files["logo.png"]["binary"] is True
+        # 隐藏文件与依赖目录被跳过
+        assert ".env" not in files
+        assert "node_modules/pkg/index.js" not in files
+        assert ".codeagent/report.json" not in files
+
+    def test_file_list_unknown_task_returns_404(self, client):
+        resp = client.get("/api/v1/tasks/missing-task/files")
+        assert resp.status_code == 404
+
+    def test_serves_text_file_content(
+        self, client, state_store, tmp_path,
+    ):
+        state_store.record_run(
+            "file-task",
+            conversation_id="conversation-1",
+            query="Create a generator",
+            workspace_root=str(tmp_path),
+        )
+        (tmp_path / "main.py").write_text("def hello():\n    return 1\n", encoding="utf-8")
+
+        resp = client.get("/api/v1/tasks/file-task/files/main.py")
+
+        assert resp.status_code == 200
+        assert "def hello():" in resp.text
+
+    def test_rejects_path_escape(
+        self, client, state_store, tmp_path,
+    ):
+        # Literal "../" is normalized away by the HTTP client before routing, so use the
+        # URL-encoded form to exercise the server-side traversal guard.
+        state_store.record_run(
+            "file-task",
+            conversation_id="conversation-1",
+            query="Create a generator",
+            workspace_root=str(tmp_path),
+        )
+        resp = client.get("/api/v1/tasks/file-task/files/%2e%2e%2foutside.txt")
+        assert resp.status_code == 400
+
+    def test_rejects_hidden_file(
+        self, client, state_store, tmp_path,
+    ):
+        state_store.record_run(
+            "file-task",
+            conversation_id="conversation-1",
+            query="Create a generator",
+            workspace_root=str(tmp_path),
+        )
+        (tmp_path / ".env").write_text("SECRET=1\n", encoding="utf-8")
+        resp = client.get("/api/v1/tasks/file-task/files/.env")
+        assert resp.status_code == 400

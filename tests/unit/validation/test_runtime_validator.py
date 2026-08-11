@@ -6,16 +6,14 @@
 from __future__ import annotations
 
 import subprocess
-from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, PropertyMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from codeagent.gateway.validation_gateway import ValidationResult
 from codeagent.sandbox.docker_executor import ExecutionResult
 from codeagent.validation.error_analyzer import FixSuggestion
 from codeagent.validation.runtime_validator import RuntimeValidator
-from codeagent.validation.test_detector import TestFrameworkInfo
+from codeagent.validation.test_detector import TestFrameworkInfo as FrameworkInfo
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────
@@ -40,9 +38,9 @@ def _make_framework_info(
     has_asyncio: bool = False,
     has_cov: bool = False,
     test_command: str = "pytest -x --tb=short",
-) -> TestFrameworkInfo:
+) -> FrameworkInfo:
     """创建 TestFrameworkInfo 测试实例。"""
-    return TestFrameworkInfo(
+    return FrameworkInfo(
         framework=framework,
         config_files=config_files or [],
         test_dirs=test_dirs or [],
@@ -82,6 +80,86 @@ class TestRunTests:
         assert result.passed is True
         assert len(result.errors) == 0
         assert result.duration_ms >= 0
+
+    async def test_run_tests_targets_changed_pytest_file(
+        self, tmp_path, mock_test_detector, mocker
+    ) -> None:
+        project = tmp_path / "project"
+        test_dir = project / "tests"
+        test_dir.mkdir(parents=True)
+        target = test_dir / "test_changed.py"
+        target.write_text(
+            "def test_ok():\n    assert True\n", encoding="utf-8"
+        )
+        mock_test_detector.detect.return_value = _make_framework_info(
+            test_dirs=[str(test_dir)],
+            test_command="pytest tests -x --tb=short",
+        )
+
+        mock_proc = MagicMock(returncode=0, stdout="1 passed", stderr="")
+        run = mocker.patch(
+            "codeagent.validation.runtime_validator._run_subprocess",
+            return_value=mock_proc,
+        )
+
+        validator = RuntimeValidator(str(project))
+        result = await validator.run_tests(
+            test_targets=["src/main.py", "tests/test_changed.py"]
+        )
+
+        assert result.passed is True
+        command = run.call_args.args[0]
+        assert "tests/test_changed.py" in command
+        assert "tests" not in command
+
+    async def test_run_tests_keeps_default_for_source_only_changes(
+        self, tmp_path, mock_test_detector, mocker
+    ) -> None:
+        project = tmp_path / "project"
+        test_dir = project / "tests"
+        test_dir.mkdir(parents=True)
+        mock_test_detector.detect.return_value = _make_framework_info(
+            test_dirs=[str(test_dir)],
+            test_command="pytest tests -x --tb=short",
+        )
+
+        mock_proc = MagicMock(returncode=0, stdout="1 passed", stderr="")
+        run = mocker.patch(
+            "codeagent.validation.runtime_validator._run_subprocess",
+            return_value=mock_proc,
+        )
+
+        validator = RuntimeValidator(str(project))
+        result = await validator.run_tests(test_targets=["src/main.py"])
+
+        assert result.passed is True
+        assert "tests" in run.call_args.args[0]
+
+    async def test_run_tests_preserves_pytest_node_id(
+        self, tmp_path, mock_test_detector, mocker
+    ) -> None:
+        project = tmp_path / "project"
+        test_dir = project / "tests"
+        test_dir.mkdir(parents=True)
+        (test_dir / "test_target.py").write_text(
+            "def test_case():\n    assert True\n", encoding="utf-8"
+        )
+        mock_test_detector.detect.return_value = _make_framework_info(
+            test_dirs=[str(test_dir)],
+            test_command="pytest tests -x --tb=short",
+        )
+        run = mocker.patch(
+            "codeagent.validation.runtime_validator._run_subprocess",
+            return_value=MagicMock(returncode=0, stdout="1 passed", stderr=""),
+        )
+
+        validator = RuntimeValidator(str(project))
+        result = await validator.run_tests(
+            test_targets=["tests/test_target.py::test_case"]
+        )
+
+        assert result.passed is True
+        assert "tests/test_target.py::test_case" in run.call_args.args[0]
 
     async def test_run_tests_failed(
         self, mock_test_detector, mocker

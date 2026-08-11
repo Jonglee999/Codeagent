@@ -11,12 +11,12 @@ from __future__ import annotations
 
 import logging
 import time
-from unittest.mock import MagicMock, PropertyMock, patch
+from concurrent.futures import TimeoutError as FuturesTimeoutError
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from codeagent.tools.terminal.sandbox import (
-    ContainerInfo,
     DockerDaemonError,
     DockerNotAvailableError,
     TerminalSandbox,
@@ -71,6 +71,13 @@ class TestSandboxCreateContainer:
         assert cid == "container_id_001"
         assert cid in sandbox._containers
         assert sandbox.total_containers == 1
+        kwargs = sandbox.client.containers.create.call_args.kwargs
+        assert kwargs["name"].startswith("codeagent-sandbox-")
+        assert kwargs["labels"] == {
+            "com.codeagent.managed": "true",
+            "com.codeagent.kind": "sandbox",
+            "com.codeagent.scope": "task",
+        }
 
     def test_create_container_with_volumes(self, sandbox: TerminalSandbox) -> None:
         volumes = {"/project": {"bind": "/workspace", "mode": "ro"}}
@@ -132,6 +139,32 @@ class TestSandboxExecCommand:
         with pytest.raises(DockerDaemonError, match="Execution failed"):
             sandbox.exec_command("abc123", "sleep 100", timeout=5)
 
+    def test_real_timeout_kills_container(self, sandbox: TerminalSandbox, monkeypatch) -> None:
+        mock_container = sandbox.client.containers.get.return_value
+
+        class FakeFuture:
+            def result(self, timeout=None):
+                raise FuturesTimeoutError()
+
+        class FakePool:
+            def __init__(self, **_kwargs):
+                pass
+
+            def submit(self, *_args, **_kwargs):
+                return FakeFuture()
+
+            def shutdown(self, **_kwargs):
+                pass
+
+        monkeypatch.setattr(
+            "codeagent.tools.terminal.sandbox.ThreadPoolExecutor", FakePool
+        )
+
+        with pytest.raises(DockerDaemonError, match="timed out"):
+            sandbox.exec_command("abc123", "sleep 100", timeout=1)
+
+        mock_container.kill.assert_called_once_with()
+
     def test_exec_command_updates_last_used(self, sandbox: TerminalSandbox) -> None:
         cid = sandbox.create_container()
         old_time = sandbox._containers[cid].last_used_at
@@ -153,7 +186,17 @@ class TestSandboxCleanup:
     def test_cleanup_existing_container(self, sandbox: TerminalSandbox) -> None:
         cid = sandbox.create_container()
         sandbox.cleanup(cid)
-        sandbox.client.containers.get.return_value.remove.assert_called_once_with(force=True)
+        sandbox.client.containers.get.return_value.remove.assert_called_once_with(force=True, v=True)
+        assert cid not in sandbox._containers
+
+    def test_cleanup_retries_transient_failure(self, sandbox: TerminalSandbox) -> None:
+        cid = sandbox.create_container()
+        container = sandbox.client.containers.get.return_value
+        container.remove.side_effect = [RuntimeError("busy"), None]
+
+        sandbox.cleanup(cid)
+
+        assert container.remove.call_count == 2
         assert cid not in sandbox._containers
 
     def test_cleanup_nonexistent_container(self, sandbox: TerminalSandbox) -> None:
@@ -190,6 +233,10 @@ class TestSandboxWarmPool:
         sandbox.release_container(cid)
         assert sandbox.warm_pool_size == 1
         assert cid in sandbox._warm_pool
+
+    def test_default_pool_is_one_task_container(self, sandbox: TerminalSandbox) -> None:
+        assert sandbox.WARM_POOL_MIN_SIZE == 0
+        assert sandbox.WARM_POOL_MAX_SIZE == 1
 
     def test_release_when_pool_full(self, sandbox: TerminalSandbox) -> None:
         sandbox.WARM_POOL_MAX_SIZE = 2

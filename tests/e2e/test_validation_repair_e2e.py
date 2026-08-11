@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from codeagent.gateway.validation_gateway import IValidationGateway, ValidationError, ValidationResult
+from codeagent.gateway.validation_gateway import IValidationGateway, ValidationResult
 from codeagent.orchestration.nodes.execution_node import ExecutionNode
 from codeagent.orchestration.state import AgentState
 from codeagent.tools.gateway import ToolGateway
@@ -78,7 +78,7 @@ def _build_llm(model_name: str | None = None) -> callable:
     api_key = os.environ.get("LLM_API_KEY", "")
     api_base = os.environ.get("LLM_API_BASE", "")
     timeout = int(os.environ.get("LLM_TIMEOUT", "120"))
-    resolved_model = model_name or os.environ.get("LLM_MODEL", "openai/deepseek-v4-flash")
+    model_name or os.environ.get("LLM_MODEL", "openai/deepseek-v4-flash")
 
     async def llm_call(**kwargs: object) -> object:
         last_exc: Exception | None = None

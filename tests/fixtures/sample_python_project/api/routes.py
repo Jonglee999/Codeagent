@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from services.auth import authenticate_user, validate_token
+from services.auth import authenticate_user
 from services.user_service import UserService
-from config.settings import Settings
 
 
 def setup_routes(svc: UserService) -> dict[str, object]:

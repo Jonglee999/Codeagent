@@ -11,7 +11,6 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
 
 from codeagent.context_engine.evolution.strategy_extractor import Strategy
 from codeagent.context_engine.evolution.strategy_store import StrategyStore

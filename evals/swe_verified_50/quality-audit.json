@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "dataset_revision": "c104f840cc67f8b6eec6f759ebc8b2693d585d4a",
+  "purpose": "Post-inference quality labels; never injected into model prompts",
+  "instances": {
+    "pylint-dev__pylint-4551": {
+      "capability_gate_eligible": false,
+      "diagnostic_use": "mechanism_only",
+      "contamination_risk": "high",
+      "test_quality": "implementation_specific",
+      "evidence": [
+        "https://openai.com/index/why-we-no-longer-evaluate-swe-bench-verified/"
+      ],
+      "notes": "Problem statement does not specify get_annotation/infer_node, while hidden tests import exact helper names. The model produced those names post hoc."
+    }
+  }
+}

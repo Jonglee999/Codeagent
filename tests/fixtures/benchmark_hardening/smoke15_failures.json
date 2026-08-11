@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "source": "sanitized smoke-15 failure shapes",
+  "contains_private_reasoning": false,
+  "contains_credentials": false,
+  "baseline": {
+    "attempted": 15,
+    "non_empty_patches": 8,
+    "empty_patches": 7,
+    "new_paid_instances": 10,
+    "new_paid_token_usage": 645406
+  },
+  "cases": {
+    "reasoning_only_then_mutation": {
+      "content": "",
+      "reasoning_content": "The target replacement is known; apply it next.",
+      "required_tool": "apply_patch"
+    },
+    "patch_without_explicit_file_path": {
+      "tool": "apply_patch",
+      "arguments": {
+        "patch": "*** Begin Patch\n*** Update File: src/example.py\n@@\n-old = 1\n+old = 2\n*** End Patch\n"
+      }
+    },
+    "repeated_invalid_tool": {
+      "tool": "apply_patch",
+      "error_code": "INVALID_PARAMS",
+      "repeat_count_observed": 6,
+      "desired_max_repeats": 2
+    },
+    "missing_dependency_validation": {
+      "command": "python -m pytest -q",
+      "exit_code": 2,
+      "stderr": "ModuleNotFoundError: No module named 'project_dependency'",
+      "desired_state": "validation_degraded"
+    },
+    "corrupt_official_container": {
+      "report_resolved": false,
+      "log": "error: packfile .git/objects/pack/example.pack does not match index\nfatal: unable to read object",
+      "desired_state": "infrastructure_error"
+    },
+    "empty_paid_prediction": {
+      "model_patch": "",
+      "successful_provider_calls": 4,
+      "token_usage": 41329,
+      "desired_state": "empty_patch"
+    },
+    "zero_token_preparation_failure": {
+      "model_patch": "",
+      "successful_provider_calls": 0,
+      "token_usage": 0,
+      "eligible_for_denominator": false
+    },
+    "terminal_discovery_is_not_test_evidence": {
+      "command": "grep -rn \"permission\" source.py | head -30",
+      "desired_test_evidence": false
+    },
+    "explicit_target_discovery_stagnation": {
+      "explicit_target_read": true,
+      "discovery_calls": 4,
+      "patch_produced": false,
+      "desired_next_capability": "mutation_only"
+    },
+    "provider_requests_unexposed_tool": {
+      "exposed_tools": ["write_file", "apply_patch"],
+      "requested_tool": "read_file",
+      "desired_error_code": "CAPABILITY_NOT_EXPOSED",
+      "execute_gateway": false
+    },
+    "benchmark_url_does_not_enable_mcp": {
+      "issue_contains_url": true,
+      "external_tool": "mcp__fetch__fetch",
+      "desired_capability": "deferred"
+    },
+    "mutation_phase_requires_tool_call": {
+      "exposed_tools": ["write_file", "apply_patch"],
+      "provider_tool_choice": "auto",
+      "controller_reprompts_on_no_tool": true
+    }
+  }
+}

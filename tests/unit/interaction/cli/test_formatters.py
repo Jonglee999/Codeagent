@@ -8,11 +8,9 @@ from __future__ import annotations
 
 import json
 
-import pytest
 from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.table import Table
-from rich.text import Text
 
 from codeagent.gateway.tool_gateway import ToolDefinition, ToolResult
 from codeagent.interaction.cli import formatters

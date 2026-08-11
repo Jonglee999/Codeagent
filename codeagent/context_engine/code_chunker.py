@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import tiktoken
 
-from codeagent.context_engine.symbol_table import _detect_language, _init_parser
+from codeagent.context_engine.symbol_table import _detect_language
 
 # ── Token 计数 ─────────────────────────────────────────────────────────────────
 
@@ -68,7 +67,6 @@ def _extract_ast_blocks(code: str, language: str) -> list[dict[str, Any]]:
 
     返回按行排序的块列表，每个块包含 {name, kind, start_line, end_line}。
     """
-    from tree_sitter import Node
 
     if language == "python":
         from tree_sitter_python import language as _lang
@@ -414,7 +412,7 @@ class CodeChunker:
         """按行数简单拆分。"""
         chunks: list[CodeChunk] = []
         chunk_size = max(1, len(lines) // max(1, (sum(
-            _count_tokens(l) for l in lines
+            _count_tokens(line) for line in lines
         ) // max_chunk_size)))
 
         for i in range(0, len(lines), chunk_size):

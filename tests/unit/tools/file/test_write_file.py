@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 
 import pytest
 
@@ -89,6 +88,16 @@ class TestWriteModify:
         )
         assert result.success is True
         assert (tmp_path / "empty.txt").read_text() == "new content"
+
+    @pytest.mark.asyncio
+    async def test_infers_modify_when_mode_is_omitted(self, tool, tmp_path):
+        (tmp_path / "existing.txt").write_text("old")
+
+        result = await tool.execute(file_path="existing.txt", content="new")
+
+        assert result.success is True
+        assert result.data["mode"] == "modify"
+        assert (tmp_path / "existing.txt").read_text() == "new"
 
 
 class TestWriteDiff:

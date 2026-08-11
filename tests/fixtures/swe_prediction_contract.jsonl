@@ -1,0 +1,1 @@
+{"instance_id":"django__django-11179","model_name_or_path":"codeagent/contract-fixture","model_patch":"diff --git a/django/db/models/deletion.py b/django/db/models/deletion.py\n--- a/django/db/models/deletion.py\n+++ b/django/db/models/deletion.py\n@@ -1,1 +1,1 @@\n-old\n+new\n"}

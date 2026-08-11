@@ -201,7 +201,7 @@ class TestCodeAnalyzerIntegration:
         if "new_auth_function" in original_content:
             # 移除之前测试添加的内容
             lines = original_content.splitlines()
-            clean_lines = [l for l in lines if "new_auth_function" not in l]
+            clean_lines = [line for line in lines if "new_auth_function" not in line]
             # 移除尾部空行后的多余空行
             with open(auth_path, "w") as f:
                 f.write("\n".join(clean_lines))

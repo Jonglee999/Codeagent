@@ -15,7 +15,7 @@ from typing import Any, Callable, Optional
 
 from codeagent.gateway.memory_gateway import IMemoryGateway
 from codeagent.memory.extractor import MemoryExtractor
-from codeagent.memory.retriever import MemoryRetriever, RetrievalResult
+from codeagent.memory.retriever import MemoryRetriever
 from codeagent.memory.store import MemoryEntry, MemoryStore, MemoryType
 
 logger = logging.getLogger(__name__)

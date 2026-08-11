@@ -36,7 +36,7 @@ llm_call_duration_seconds = Histogram(
 llm_tokens_total = Counter(
     "codeagent_llm_tokens_total",
     "Total LLM tokens consumed",
-    labelnames=["model", "type"],  # type: prompt / completion
+    labelnames=["model", "type"],  # Label values: prompt / completion
 )
 
 # ════════════════════════════════════════════════════════════════

@@ -214,9 +214,9 @@ class ErrorAnalyzer:
             error_type=error_type or "UnknownError",
             message=message or block.strip()[:200],
             traceback_lines=[
-                l.rstrip()
-                for l in lines
-                if not l.startswith("E   ")
+                line.rstrip()
+                for line in lines
+                if not line.startswith("E   ")
             ],
         )
 

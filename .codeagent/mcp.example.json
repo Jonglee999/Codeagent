@@ -1,0 +1,28 @@
+{
+  "servers": {
+    "local-example": {
+      "transport": "stdio",
+      "command": "python",
+      "args": ["path/to/server.py"],
+      "allowed_tools": ["lookup"],
+      "env_allowlist": ["LOCAL_MCP_TOKEN"],
+      "required_env": ["LOCAL_MCP_TOKEN"],
+      "timeout_seconds": 30,
+      "max_concurrency": 2,
+      "max_output_chars": 32000,
+      "risk_level": "low",
+      "failure_threshold": 3,
+      "cooldown_seconds": 30
+    },
+    "remote-example": {
+      "transport": "streamable-http",
+      "url": "https://mcp.example.com/mcp",
+      "allowed_tools": ["search"],
+      "header_allowlist": ["Authorization"],
+      "timeout_seconds": 30,
+      "max_concurrency": 2,
+      "max_output_chars": 32000,
+      "risk_level": "low"
+    }
+  }
+}

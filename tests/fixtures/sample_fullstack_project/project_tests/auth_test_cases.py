@@ -1,7 +1,6 @@
 """Authentication tests — verify Basic Auth middleware behavior."""
 
-from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -50,7 +49,6 @@ class TestBasicAuth:
         request = MagicMock(spec=httpx.Request)
         request.headers = {}
 
-        import pytest
 
         with pytest.raises(Exception):
             import asyncio

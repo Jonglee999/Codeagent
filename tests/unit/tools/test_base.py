@@ -37,6 +37,7 @@ class TestToolResult:
         assert r.data is None
         assert r.error_message is None
         assert r.error_code is None
+        assert r.retryable is False
         assert r.duration_ms == 0.0
         assert r.tokens_consumed == 0
 
@@ -53,6 +54,8 @@ class TestToolResult:
         assert r.data == {"partial": "out"}
         assert r.error_message == "fail"
         assert r.error_code == "ERR_1"
+        assert r.retryable is False
+        assert r.suggested_recovery
         assert r.duration_ms == 50.0
         assert r.tokens_consumed == 10
 
@@ -87,6 +90,13 @@ class TestValidateParams:
     def test_invalid_params_wrong_type(self) -> None:
         tool = ConcreteTool()
         assert tool.validate_params(msg=123) is False
+
+    def test_detailed_validation_includes_exact_json_path(self) -> None:
+        result = ConcreteTool().validate_params_detailed(msg=123)
+
+        assert result.valid is False
+        assert result.errors[0].path == "$.msg"
+        assert "string" in result.errors[0].message
 
     def test_no_schema_returns_true(self) -> None:
         """如果 parameters 为空，validate_params 默认返回 True。"""
