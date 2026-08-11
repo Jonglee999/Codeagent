@@ -470,7 +470,7 @@ class TestTrajectoryRecorderPerformance:
     ) -> None:
         task_id = str(uuid.uuid4())
         recorder.start_task(task_id, "Perf test")
-        step = TrajectoryStep(
+        TrajectoryStep(
             step_id="perf-1", node_name="planning", step_type="llm_call",
             timestamp=datetime.now(), input_summary="in", output_summary="out",
         )

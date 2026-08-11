@@ -22,6 +22,20 @@ ws_router = APIRouter()
 
 _PING_INTERVAL = 25.0   # seconds between keepalive pings
 _POLL_INTERVAL = 0.05   # seconds between get_message polls
+_INTERNAL_EVENT_TYPES = {
+    "memory_recalled",
+    "memory_extracted",
+    "strategy_recalled",
+    "transcript_saved",
+}
+
+
+def _is_user_visible_event(event: dict) -> bool:
+    """Enforce the event visibility contract at the server boundary."""
+    return (
+        event.get("visibility") != "internal"
+        and event.get("type") not in _INTERNAL_EVENT_TYPES
+    )
 
 
 @ws_router.websocket("/api/v1/tasks/{task_id}/stream")
@@ -47,15 +61,19 @@ async def task_stream(websocket: WebSocket, task_id: str) -> None:
         # 2. 回放历史事件
         log_key = f"task:{task_id}:event_log"
         history_raw = await redis_client.lrange(log_key, 0, -1)
-        seen_timestamps: set[str] = set()
+        seen_events: set[str] = set()
         terminal = False
 
         for raw in history_raw:
             event_data = json.loads(raw)
-            ts = event_data.get("timestamp", "")
-            seen_timestamps.add(f"{event_data.get('type')}-{ts}")
+            event_key = event_data.get("event_id") or (
+                f"{event_data.get('type')}-{event_data.get('timestamp', '')}"
+            )
+            seen_events.add(event_key)
+            if not _is_user_visible_event(event_data):
+                continue
             await websocket.send_json(event_data)
-            if event_data.get("type") in ("task_complete", "task_error"):
+            if event_data.get("type") in ("task_complete", "task_error", "task_cancelled"):
                 terminal = True
                 break
 
@@ -75,6 +93,7 @@ async def task_stream(websocket: WebSocket, task_id: str) -> None:
                     await websocket.send_json(
                         {
                             "type": "ping",
+                            "schema_version": 1,
                             "timestamp": datetime.now(timezone.utc).isoformat(),
                         }
                     )
@@ -87,13 +106,19 @@ async def task_stream(websocket: WebSocket, task_id: str) -> None:
             )
 
             # 去重：跳过已在历史回放中发送过的事件
-            dedup_key = f"{event_data.get('type')}-{event_data.get('timestamp', '')}"
-            if dedup_key in seen_timestamps:
+            dedup_key = event_data.get("event_id") or (
+                f"{event_data.get('type')}-{event_data.get('timestamp', '')}"
+            )
+            if dedup_key in seen_events:
+                continue
+            seen_events.add(dedup_key)
+
+            if not _is_user_visible_event(event_data):
                 continue
 
             await websocket.send_json(event_data)
 
-            if event_data.get("type") in ("task_complete", "task_error"):
+            if event_data.get("type") in ("task_complete", "task_error", "task_cancelled"):
                 break
 
     except WebSocketDisconnect:

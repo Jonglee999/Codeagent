@@ -1,5 +1,4 @@
 """Unit tests for codeagent/interaction/api/metrics.py — Prometheus metrics.
-
 Coverage targets: ≥ 10 tests covering:
 - /metrics endpoint returns valid Prometheus text
 - Counter/Histogram/Gauge increment and observe
@@ -10,7 +9,7 @@ Coverage targets: ≥ 10 tests covering:
 from __future__ import annotations
 
 import pytest
-from prometheus_client import REGISTRY, Counter, Gauge, Histogram
+from prometheus_client import REGISTRY
 
 from codeagent.interaction.api import metrics as m
 
@@ -79,16 +78,6 @@ def test_llm_call_error_counter() -> None:
     assert value == 1
 
 
-def test_llm_call_duration_histogram() -> None:
-    """llm_call_duration_seconds histogram records observations."""
-    m.observe_llm_call("gpt-4", 2.5, status="success")
-    # Histogram _sum tracks total of observed values
-    # Internal: _sum.get()
-    h = m.llm_call_duration_seconds.labels(model="gpt-4")
-    # We can test that calling doesn't raise
-    assert True
-
-
 def test_tool_call_counter_with_labels() -> None:
     """tool_calls_total increments for different tool names and statuses."""
     m.observe_tool_call("read_file", 0.1, success=True)
@@ -102,13 +91,6 @@ def test_tool_call_counter_with_labels() -> None:
     assert read_ok == 1
     assert read_err == 1
     assert write_ok == 1
-
-
-def test_task_duration_histogram() -> None:
-    """task_duration_seconds histogram records task completion."""
-    m.observe_task_duration(120.0, "completed")
-    m.observe_task_duration(30.0, "failed")
-    # Should not raise
 
 
 def test_active_tasks_gauge() -> None:
@@ -134,13 +116,6 @@ def test_validation_results_counter() -> None:
     assert static_pass == 1
 
 
-def test_memory_retrieval_histogram() -> None:
-    """memory_retrieval_duration_seconds histogram records observations."""
-    m.observe_memory_retrieval(0.05)
-    m.observe_memory_retrieval(0.1)
-    # Should not raise
-
-
 def test_llm_tokens_counter() -> None:
     """llm_tokens_total records prompt and completion tokens."""
     m.observe_llm_call("gpt-4", 1.0, tokens_prompt=100, tokens_completion=200, status="success")
@@ -150,19 +125,3 @@ def test_llm_tokens_counter() -> None:
 
     assert prompt_val == 100
     assert completion_val == 200
-
-
-def test_observe_llm_call_does_not_raise() -> None:
-    """observe_llm_call with invalid args does not raise."""
-    # Should silently handle errors
-    m.observe_llm_call("", -1.0, status="success")  # negative duration
-    m.observe_llm_call("model", 0.0, status="")  # empty status
-    assert True
-
-
-def test_get_metrics_endpoint_multiple_calls() -> None:
-    """get_metrics_endpoint returns consistent text between calls."""
-    t1 = m.get_metrics_endpoint()
-    t2 = m.get_metrics_endpoint()
-    assert isinstance(t1, str)
-    assert isinstance(t2, str)

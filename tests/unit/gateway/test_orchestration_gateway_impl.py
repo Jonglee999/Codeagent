@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import time
-from unittest.mock import ANY, AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -33,6 +33,7 @@ from codeagent.gateway.orchestration_gateway_impl import OrchestrationGatewayImp
 def mock_redis_client():
     """Create an AsyncMock Redis client for testing."""
     client = AsyncMock()
+    client.incr.return_value = 1
     return client
 
 
@@ -159,6 +160,7 @@ class TestStartTask:
         patcher = _patch_redis(gateway, mock_redis_client)
 
         try:
+            sample_request.benchmark_instance_id = "owner__repo-1"
             task_id = await gateway.start_task(sample_request)
 
             # 验证 send_task 参数：send_task(name, args=[task_id, request_dict])
@@ -170,6 +172,8 @@ class TestStartTask:
             assert sent_args[1]["project_root"] == sample_request.project_root
             assert sent_args[1]["auto_mode"] == sample_request.auto_mode
             assert sent_args[1]["max_retries"] == sample_request.max_retries
+            assert sent_args[1]["benchmark_instance_id"] == "owner__repo-1"
+            assert call_kwargs["task_id"] == task_id
         finally:
             patcher.stop()
 
@@ -418,6 +422,72 @@ class TestCancelTask:
         finally:
             patcher.stop()
 
+    @pytest.mark.asyncio
+    async def test_cancel_task_persists_auditable_cancelled_report(
+        self, gateway, mock_redis_client
+    ):
+        patcher = _patch_redis(gateway, mock_redis_client)
+        mock_redis_client.get.return_value = json.dumps({
+            "task_id": "task-1", "state": "running", "progress": 0.3,
+        })
+        mock_redis_client.exists.return_value = False
+        try:
+            assert await gateway.cancel_task("task-1") is True
+            reports = [
+                json.loads(args[2])
+                for args, _ in mock_redis_client.setex.call_args_list
+                if args[0] == "task:task-1:report"
+            ]
+            assert reports[0]["status"] == "cancelled"
+            assert "partial workspace changes" in reports[0]["warnings"][0]
+        finally:
+            patcher.stop()
+
+    @pytest.mark.asyncio
+    async def test_cancel_terminal_task_is_a_noop(self, gateway, mock_redis_client):
+        patcher = _patch_redis(gateway, mock_redis_client)
+        mock_redis_client.get.return_value = json.dumps({
+            "task_id": "task-1", "state": "completed",
+        })
+        try:
+            assert await gateway.cancel_task("task-1") is False
+            gateway._celery.control.revoke.assert_not_called()
+        finally:
+            patcher.stop()
+
+
+class TestSteerTask:
+    @pytest.mark.asyncio
+    async def test_running_task_queues_and_publishes_instruction(
+        self, gateway, mock_redis_client
+    ):
+        patcher = _patch_redis(gateway, mock_redis_client)
+        mock_redis_client.get.return_value = json.dumps({
+            "task_id": "task-1", "state": "running",
+        })
+        mock_redis_client.llen.return_value = 0
+        try:
+            assert await gateway.steer_task("task-1", "Keep the REST API compatible") is True
+            queued_args = mock_redis_client.rpush.call_args_list[0].args
+            assert queued_args[0] == "task:task-1:steering"
+            assert json.loads(queued_args[1])["instruction"] == "Keep the REST API compatible"
+            published = json.loads(mock_redis_client.publish.call_args.args[1])
+            assert published["type"] == "steering_queued"
+        finally:
+            patcher.stop()
+
+    @pytest.mark.asyncio
+    async def test_terminal_task_rejects_steering(self, gateway, mock_redis_client):
+        patcher = _patch_redis(gateway, mock_redis_client)
+        mock_redis_client.get.return_value = json.dumps({
+            "task_id": "task-1", "state": "completed",
+        })
+        try:
+            assert await gateway.steer_task("task-1", "Do more") is False
+            mock_redis_client.rpush.assert_not_called()
+        finally:
+            patcher.stop()
+
 
 # =============================================================================
 # 测试：get_report
@@ -438,6 +508,8 @@ class TestGetReport:
             "validation_results": [{"passed": True}],
             "duration": 12.5,
             "token_usage": 1500,
+            "benchmark_instance_id": "owner__repo-1",
+            "infrastructure_runtime": {"redis": {"recovery_count": 1}},
         }, ensure_ascii=False)
 
         try:
@@ -446,9 +518,11 @@ class TestGetReport:
             assert isinstance(report, TaskReport)
             assert report.task_id == "task-1"
             assert len(report.plan) == 1
+            assert report.infrastructure_runtime["redis"]["recovery_count"] == 1
             assert len(report.changes) == 1
             assert report.duration == 12.5
             assert report.token_usage == 1500
+            assert report.benchmark_instance_id == "owner__repo-1"
         finally:
             patcher.stop()
 
@@ -535,7 +609,7 @@ class TestStreamTask:
         async def get_message_side_effect(*args, **kwargs):
             return await gen.__anext__()
 
-        mock_pubsub = self._setup_pubsub_mock(mock_redis_client, get_message_side_effect)
+        self._setup_pubsub_mock(mock_redis_client, get_message_side_effect)
         patcher = _patch_redis(gateway, mock_redis_client)
 
         try:
@@ -605,6 +679,26 @@ class TestStreamTask:
             # Verify unsubscribe was called during generator cleanup
             mock_pubsub.unsubscribe.assert_called_once_with("task:task-1:events")
             mock_redis_client.aclose.assert_called_once()
+        finally:
+            patcher.stop()
+
+    @pytest.mark.asyncio
+    async def test_stream_task_stops_on_cancelled(self, gateway, mock_redis_client):
+        async def single_event():
+            yield {"data": json.dumps({
+                "type": "task_cancelled", "data": {}, "timestamp": time.time(),
+            })}
+
+        gen = single_event()
+
+        async def get_message_side_effect(*args, **kwargs):
+            return await gen.__anext__()
+
+        self._setup_pubsub_mock(mock_redis_client, get_message_side_effect)
+        patcher = _patch_redis(gateway, mock_redis_client)
+        try:
+            events = [event async for event in gateway.stream_task("task-1")]
+            assert [event.type for event in events] == ["task_cancelled"]
         finally:
             patcher.stop()
 
@@ -680,6 +774,8 @@ class TestInternalMethods:
             published = json.loads(args[1])
             assert published["type"] == "test_event"
             assert published["data"] == {"key": "value"}
+            assert published["schema_version"] == 1
+            assert published["seq"] == 1
         finally:
             patcher.stop()
 
@@ -771,9 +867,10 @@ class TestConfigFunctions:
         monkeypatch.setenv("REDIS_URL", "redis://myredis:6380")
         assert get_redis_url() == "redis://myredis:6380"
 
-    def test_get_celery_task_timeout_default(self):
+    def test_get_celery_task_timeout_default(self, monkeypatch):
         """默认 CELERY_TASK_TIMEOUT 为 600。"""
         from codeagent.config import get_celery_task_timeout
+        monkeypatch.delenv("CELERY_TASK_TIMEOUT", raising=False)
         assert get_celery_task_timeout() == 600
 
     def test_get_celery_task_timeout_from_env(self, monkeypatch):

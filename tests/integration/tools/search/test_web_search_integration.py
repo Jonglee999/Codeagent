@@ -20,7 +20,7 @@ requires_network = pytest.mark.skipif(
     reason="Set CODAGENT_TEST_NETWORK=1 to enable network-dependent integration tests",
 )
 
-from codeagent.tools.search.web_search import WebSearchTool
+from codeagent.tools.search.web_search import WebSearchTool  # noqa: E402
 
 
 @pytest.fixture

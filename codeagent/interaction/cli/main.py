@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
@@ -23,22 +24,18 @@ import asyncio
 import click
 
 from codeagent.config import load_env_file, get_env, get_model
-from codeagent.gateway.tool_gateway import IToolGateway
 from codeagent.gateway.validation_gateway_impl import ValidationGateway
 
 from codeagent.interaction.cli.formatters import (
     console,
     format_error_report,
-    format_execution_summary,
     format_final_report,
     format_json_output,
     format_llm_response,
     format_step_header,
     format_tool_call,
-    format_tool_list,
     format_validation_result,
     format_welcome,
-    make_progress,
 )
 from codeagent.orchestration.orchestrator import Orchestrator
 from codeagent.orchestration.rollback import RollbackManager
@@ -71,61 +68,34 @@ class _ValidationGateway(ValidationGateway):
 
 
 def _build_llm(model_name: str) -> Any:
-    """构建 LLM 调用函数。
-
-    使用 litellm.acompletion，需设置 LLM_API_KEY 环境变量。
-    支持 LLM_API_BASE 环境变量设置自定义 API 地址（OpenAI 兼容接口）。
-    内置网络重试机制（最多 3 次，指数退避）。
-    """
-    api_key = get_env("LLM_API_KEY", "")
-    api_base = get_env("LLM_API_BASE", "")
-    timeout = int(get_env("LLM_TIMEOUT", "60"))
-
+    """Build the shared classified/retrying/fallback model gateway."""
     try:
-        import litellm
+        import litellm  # noqa: F401
     except ImportError:
         raise click.ClickException(
             "litellm is required. Install it with: pip install litellm"
         )
+    from codeagent.model_gateway import ModelGateway
+    from codeagent.model_routing import ModelRouter
 
-    litellm.set_verbose = False
+    gateway = ModelRouter.from_env()
+    # Preserve the CLI --model override without mutating process configuration.
+    if model_name and model_name != gateway.primary.model:
+        from dataclasses import replace
 
-    async def llm_call(**kwargs: Any) -> Any:
-        """包装 litellm.acompletion 的异步调用，含网络重试。"""
-        last_exc: Exception | None = None
-        for attempt in range(3):
-            try:
-                call_kwargs: dict[str, Any] = {
-                    **{k: v for k, v in kwargs.items() if v is not None},
-                    "timeout": timeout,
-                }
-                if api_key:
-                    call_kwargs["api_key"] = api_key
-                if api_base:
-                    call_kwargs["api_base"] = api_base
-                return await litellm.acompletion(**call_kwargs)
-            except Exception as e:
-                last_exc = e
-                if attempt < 2:
-                    await asyncio.sleep(1.5 * (attempt + 1))
-        raise last_exc  # type: ignore[misc]
-
-    return llm_call
+        gateway = ModelGateway(
+            replace(gateway.primary, model=model_name),
+            None,
+        )
+    return gateway
 
 
 # ── 组件构建 ────────────────────────────────────────────────────────────────
 
 
-def _build_tool_gateway(project_root: str) -> ToolGateway:
+def _build_tool_gateway(project_root: str, context_engine: Any | None = None) -> ToolGateway:
     """构建工具 Gateway，注册默认工具（ReadFileTool、WriteFileTool、RunTerminalTool）。"""
-    from codeagent.tools.terminal.run_terminal import RunTerminalTool
-
-    gateway = ToolGateway(project_root=project_root)
-    try:
-        gateway._registry.register(RunTerminalTool(project_root=project_root))
-    except Exception:
-        logger.warning("RunTerminalTool not available (Docker may not be installed)")
-    return gateway
+    return ToolGateway(project_root=project_root, context_engine=context_engine)
 
 
 def _build_validation_gateway(project_root: str = "") -> _ValidationGateway:
@@ -144,9 +114,7 @@ def _build_context_gateway(project_root: str) -> Any:
     """
     from codeagent.context_engine.engine import ContextEngine, ContextConfig
 
-    budget = int(get_env("CONTEXT_BUDGET_TOKENS", "8000"))
-    config = ContextConfig(total_budget=budget)
-    return ContextEngine(config=config)
+    return ContextEngine(config=ContextConfig.from_env())
 
 
 # ── click 命令 ──────────────────────────────────────────────────────────────
@@ -188,7 +156,7 @@ def cli() -> None:
     "--max-llm-calls",
     type=int,
     default=None,
-    help="Max LLM calls per task (from env MAX_LLM_CALLS_PER_TASK or 50)",
+    help="Max LLM calls per task (from env MAX_LLM_CALLS_PER_TASK or 20)",
 )
 @click.option(
     "--model",
@@ -249,14 +217,14 @@ def ask(
 
     # ── 构建组件 ──────────────────────────────────────────
     try:
-        tool_gateway = _build_tool_gateway(project_root)
-    except Exception as e:
-        raise click.ClickException(f"Failed to build tool gateway: {e}")
-
-    try:
         context_gateway = _build_context_gateway(project_root)
     except Exception as e:
         raise click.ClickException(f"Failed to build context gateway: {e}")
+
+    try:
+        tool_gateway = _build_tool_gateway(project_root, context_gateway)
+    except Exception as e:
+        raise click.ClickException(f"Failed to build tool gateway: {e}")
 
     try:
         validation_gateway = _build_validation_gateway(project_root)
@@ -287,15 +255,15 @@ def ask(
         console.print(format_welcome())
         console.print(format_step_header(1, 1, "Executing request"))
 
+    task_coroutine = _run_cli_task_with_lifecycle(
+        orchestrator=orchestrator,
+        tool_gateway=tool_gateway,
+        request=request,
+        project_root=project_root,
+        auto=auto,
+    )
     try:
-        result = asyncio.run(
-            _run_orchestrator_with_review(
-                orchestrator=orchestrator,
-                request=request,
-                project_root=project_root,
-                auto=auto,
-            )
-        )
+        result = asyncio.run(task_coroutine)
     except KeyboardInterrupt:
         if json_output:
             click.echo(
@@ -318,6 +286,12 @@ def ask(
             or "[red]Execution failed[/red]"
         )
         raise click.ClickException(str(e))
+    finally:
+        # Test and embedding callers may replace asyncio.run. Close a coroutine
+        # that such a runner did not consume so its task resources cannot warn
+        # or leak at garbage collection time.
+        if inspect.getcoroutinestate(task_coroutine) == inspect.CORO_CREATED:
+            task_coroutine.close()
 
     total_duration = (time.monotonic() - total_start) * 1000
 
@@ -469,6 +443,34 @@ def _display_entry(entry: dict[str, Any], project_root: str) -> None:
 
 
 # ── Orchestrator 异步执行（含 Human Review 循环）────────────────────────────
+
+
+async def _run_cli_task_with_lifecycle(
+    orchestrator: Orchestrator,
+    tool_gateway: ToolGateway,
+    request: str,
+    project_root: str,
+    auto: bool,
+) -> AgentState:
+    """Resolve extensions, run one CLI task, then destroy its sandbox."""
+    initialize = getattr(tool_gateway, "initialize_extensions", None)
+    if initialize is not None:
+        initialized = initialize(query=request)
+        if inspect.isawaitable(initialized):
+            await initialized
+    try:
+        return await _run_orchestrator_with_review(
+            orchestrator=orchestrator,
+            request=request,
+            project_root=project_root,
+            auto=auto,
+        )
+    finally:
+        close = getattr(tool_gateway, "aclose", None)
+        if close is not None:
+            closed = close()
+            if inspect.isawaitable(closed):
+                await closed
 
 
 async def _run_orchestrator_with_review(
@@ -647,6 +649,75 @@ def config(show: bool, set_key: tuple[str, str] | None) -> None:
         return
 
     click.echo("Usage: codeagent config --show  or  codeagent config --set KEY VALUE")
+
+
+@cli.group("mcp")
+def mcp_cli() -> None:
+    """Inspect and troubleshoot Model Context Protocol integrations."""
+
+
+@mcp_cli.command("doctor")
+@click.option(
+    "--project",
+    default=".",
+    type=click.Path(path_type=Path, file_okay=False),
+    help="Project root containing .codeagent/mcp.json",
+    show_default=True,
+)
+@click.option("--server", default=None, help="Check only one configured server")
+@click.option("--json", "json_output", is_flag=True, help="Emit machine-readable JSON")
+def mcp_doctor(project: Path, server: str | None, json_output: bool) -> None:
+    """Validate config, handshake servers, discover tools, and report latency."""
+    from codeagent.config import get_mcp_enabled
+    from codeagent.extensions.mcp import resolve_mcp_config
+    from codeagent.tools.mcp import discover_mcp_tools
+
+    project_root = project.resolve()
+    resolution = resolve_mcp_config(project_root)
+    if not get_mcp_enabled():
+        report = {
+            "enabled": False,
+            "configured": bool(resolution.servers or resolution.config_paths),
+            "available": False,
+            "servers": [],
+            "warnings": [*resolution.warnings, "MCP disabled by MCP_ENABLED=false"],
+        }
+    else:
+        selected = {server} if server else None
+        discovery = asyncio.run(
+            discover_mcp_tools(project_root, server_names=selected)
+        )
+        report = {
+            "enabled": True,
+            "configured": bool(resolution.servers or resolution.config_paths),
+            "available": bool(discovery.servers)
+            and all(item.get("available") for item in discovery.servers),
+            "servers": discovery.servers,
+            "warnings": discovery.warnings,
+        }
+
+    if json_output:
+        click.echo(json.dumps(report, ensure_ascii=False, indent=2, default=str))
+    else:
+        configured = "yes" if report["configured"] else "no"
+        click.echo(f"MCP enabled: {str(report['enabled']).lower()}; configured: {configured}")
+        if not report["servers"]:
+            click.echo("No MCP servers were checked.")
+        for item in report["servers"]:
+            state = "OK" if item.get("available") else "FAILED"
+            latency = item.get("last_latency_ms")
+            latency_text = f"{latency:.1f} ms" if isinstance(latency, (int, float)) else "n/a"
+            click.echo(
+                f"[{state}] {item.get('name')} ({item.get('transport')}) - "
+                f"{item.get('tool_count', 0)} tool(s), {latency_text}"
+            )
+            if item.get("last_error"):
+                click.echo(f"  error: {item['last_error']}")
+        for warning in report["warnings"]:
+            click.echo(f"warning: {warning}")
+
+    if not report["available"]:
+        raise click.exceptions.Exit(3)
 
 
 @cli.command()

@@ -106,7 +106,7 @@ class TestMemoryGatewayInjection:
         await node(state)
 
         # 验证 LLM 调用中包含记忆文本
-        call_kwargs = mock_llm.call_args.kwargs if hasattr(mock_llm, "call_args") else {}
+        mock_llm.call_args.kwargs if hasattr(mock_llm, "call_args") else {}
         # 通过 mock 的调用记录检查
         assert True  # 只要不崩溃就算通过
 

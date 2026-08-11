@@ -1,252 +1,109 @@
-import { useRef, useEffect, useState } from "react";
-import type { TaskEvent, LogGroup } from "../types";
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { TaskEvent } from "../types";
 
-interface ExecutionLogProps {
-  events: TaskEvent[];
-  onHumanReview: (event: TaskEvent) => void;
-  isRunning: boolean;
+const LABELS: Record<string, string> = {
+  worker: "Agent 已启动",
+  context: "读取必要上下文",
+  context_node: "读取必要上下文",
+  planning: "制定执行方案",
+  planning_node: "制定执行方案",
+  execution: "执行任务",
+  execution_node: "执行任务",
+  validation: "验证结果",
+  validation_node: "验证结果",
+  reflection: "分析失败证据",
+};
+
+function titleFor(event: TaskEvent) {
+  if (event.type === "run_profile_selected") return event.data?.workflow === "planned" ? "采用计划执行" : "采用直接执行";
+  if (event.type === "tools_selected") return "已选择本轮工具";
+  if (event.type === "context_selected") return "已选择本轮上下文";
+  if (event.type === "mcp_discovery_deferred") return "已延后无关 MCP 服务";
+  if (event.type === "steering_queued") return "追加指令已排队";
+  if (event.type === "steering_applied") return "Agent 已应用追加指令";
+  if (event.type === "recovery_started") return "已从上次运行继续";
+  if (event.type === "node_start") return LABELS[event.node || ""] || (event.node || "Agent 步骤").replaceAll("_", " ");
+  if (event.type === "node_complete") return event.success === false ? "步骤失败" : "步骤完成";
+  if (event.type === "tool_call") return `正在使用 ${event.tool || "工具"}`;
+  if (event.type === "tool_result") return event.success === false ? `${event.tool || "工具"}执行失败` : `${event.tool || "工具"}已完成`;
+  if (event.type === "validation_result") return `${event.layer || "验证"}${event.passed ? "通过" : "失败"}`;
+  if (event.type === "human_review_required") return "需要你的确认";
+  if (event.type === "task_complete") return "任务已完成";
+  if (event.type === "task_error") return "任务未完成";
+  if (event.type === "task_cancelled") return "任务已取消";
+  if (event.type === "deviation_detected") return "已阻止偏离目标的调用";
+  if (event.type === "memory_recalled") return "使用了相关项目经验";
+  if (event.type === "memory_extracted") return "保存了可复用经验";
+  if (event.type === "strategy_recalled") return "使用了历史策略";
+  if (event.type === "skill_resolved") return "已匹配项目能力";
+  if (event.type === "transcript_saved") return "执行记录已保存";
+  if (event.type === "capability_degraded") return "部分能力已降级";
+  if (event.type === "capabilities_resolved") return "工具能力已就绪";
+  if (event.type === "circuit_state_changed") return event.data?.capability === "model" ? "模型连接状态变化" : "MCP 连接状态变化";
+  if (event.type === "permission_denied") return "工具权限被拒绝";
+  if (event.type === "mcp_server_status") return "MCP 服务状态";
+  if (event.type === "mcp_tool_discovered") return "发现 MCP 工具";
+  if (event.type === "model_retry_scheduled") return "模型调用即将重试";
+  if (event.type === "model_call_failed") return "模型调用失败";
+  if (event.type === "fallback_activated") return "已切换备用模型";
+  if (event.type === "infrastructure_recovered") return "基础设施连接已恢复";
+  return event.type.replaceAll("_", " ");
 }
 
-function groupEvents(events: TaskEvent[]): LogGroup[] {
-  const groups: LogGroup[] = [];
-  let current: LogGroup | null = null;
-  for (const ev of events) {
-    if (ev.type === "node_start") {
-      current = { node: ev.node || "unknown", events: [ev] };
-      groups.push(current);
-    } else if (current) {
-      current.events.push(ev);
-    } else {
-      current = { node: "init", events: [ev] };
-      groups.push(current);
+function compactEvents(events: TaskEvent[]) {
+  const compacted: TaskEvent[] = [];
+  for (const event of events) {
+    if (["ping", "assistant_message"].includes(event.type)) continue;
+    if (event.type === "node_complete" && event.success !== false) continue;
+    if (event.type === "tool_result") {
+      const callIndex = compacted.findLastIndex((candidate) => candidate.type === "tool_call" && candidate.tool === event.tool);
+      if (callIndex >= 0) {
+        const call = compacted[callIndex];
+        compacted.splice(callIndex, 1, { ...call, ...event, params: call.params, type: "tool_result" });
+        continue;
+      }
     }
+    compacted.push(event);
   }
-  return groups;
+  return compacted;
 }
 
-function nodeLabel(node: string): string {
-  const map: Record<string, string> = {
-    worker: "Worker",
-    context_node: "Context",
-    planning_node: "Planning",
-    execution_node: "Execution",
-    validation_node: "Validation",
-    human_review_node: "Human Review",
-    init: "Init",
-  };
-  return map[node] ?? node.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
-}
-
-function nodeColor(node: string): string {
-  const map: Record<string, string> = {
-    worker: "text-slate-400 border-slate-600",
-    context_node: "text-cyan-400 border-cyan-500/40",
-    planning_node: "text-violet-400 border-violet-500/40",
-    execution_node: "text-indigo-400 border-indigo-500/40",
-    validation_node: "text-emerald-400 border-emerald-500/40",
-    human_review_node: "text-amber-400 border-amber-500/40",
-    init: "text-slate-400 border-slate-600",
-  };
-  return map[node] ?? "text-slate-400 border-slate-600";
-}
-
-function groupDone(group: LogGroup): boolean {
-  return group.events.some(
-    (e) => e.type === "task_complete" || e.type === "task_error" ||
-      (e.type === "node_start" && group.events.length > 1),
-  );
-}
-
-function EventRow({ event }: { event: TaskEvent }) {
+function EventItem({ event, onReview }: { event: TaskEvent; onReview: (event: TaskEvent) => void }) {
   const [expanded, setExpanded] = useState(false);
-
-  if (event.type === "node_start") return null; // rendered as group header
-
+  const failed = event.type === "task_error" || event.success === false || event.passed === false;
+  const success = event.type === "task_complete" || event.success === true || event.passed === true;
+  const payload = event.params || event.data || event.details;
   return (
-    <div className="animate-slide-in flex items-start gap-2 py-1 px-2 rounded-md text-xs hover:bg-white/5 transition-colors">
-      {/* icon */}
-      <span className="mt-0.5 shrink-0 w-3.5 text-center">
-        {event.type === "tool_call" && <span className="text-slate-500">⚙</span>}
-        {event.type === "tool_result" && (
-          event.success
-            ? <span className="text-emerald-400">✓</span>
-            : <span className="text-red-400">✗</span>
-        )}
-        {event.type === "validation_result" && (
-          event.passed
-            ? <span className="text-emerald-400">✓</span>
-            : <span className="text-red-400">✗</span>
-        )}
-        {event.type === "human_review_required" && <span className="text-amber-400">⚠</span>}
-        {event.type === "task_complete" && <span className="text-emerald-400">■</span>}
-        {event.type === "task_error" && <span className="text-red-400">■</span>}
-      </span>
-
-      {/* content */}
-      <div className="flex-1 min-w-0">
-        {event.type === "tool_call" && (
-          <span className="text-slate-400">
-            <span className="text-slate-500">tool </span>
-            <code className="text-indigo-300 bg-indigo-500/10 px-1 rounded">{event.tool}</code>
-            {event.params && (
-              <button
-                onClick={() => setExpanded(!expanded)}
-                className="ml-2 text-slate-600 hover:text-slate-400 transition-colors"
-              >
-                {expanded ? "▲ hide" : "▼ params"}
-              </button>
-            )}
-            {expanded && event.params && (
-              <pre className="mt-1 text-xs bg-[#0f1117] border border-[#2a2d3a] p-2 rounded overflow-x-auto text-slate-300">
-                {JSON.stringify(event.params, null, 2)}
-              </pre>
-            )}
-          </span>
-        )}
-        {event.type === "tool_result" && (
-          <span className={event.success ? "text-emerald-300" : "text-red-300"}>
-            {event.summary || event.tool || "result"}
-          </span>
-        )}
-        {event.type === "validation_result" && (
-          <span className={event.passed ? "text-emerald-300" : "text-red-300"}>
-            {event.passed ? "Validation passed" : "Validation failed"}
-            {event.layer && <span className="text-slate-500 ml-1">({event.layer})</span>}
-            {event.errors && event.errors.length > 0 && (
-              <ul className="mt-1 text-red-400 list-disc list-inside space-y-0.5">
-                {event.errors.map((e, i) => <li key={i}>{e}</li>)}
-              </ul>
-            )}
-          </span>
-        )}
-        {event.type === "human_review_required" && (
-          <span className="text-amber-300 font-medium">
-            Human review required
-            {event.review_type && <span className="ml-1 text-amber-500 font-normal">({event.review_type})</span>}
-          </span>
-        )}
-        {event.type === "task_complete" && (
-          <span className="text-emerald-300 font-medium">
-            Task completed{event.duration != null ? ` — ${event.duration.toFixed(1)}s` : ""}
-            {event.token_usage ? <span className="text-slate-500 ml-2">{event.token_usage} tokens</span> : null}
-          </span>
-        )}
-        {event.type === "task_error" && (
-          <span className="text-red-300">Error: {event.error}</span>
-        )}
-      </div>
-
-      <span className="text-slate-600 shrink-0 tabular-nums">
-        {new Date(event.timestamp).toLocaleTimeString()}
-      </span>
-    </div>
-  );
-}
-
-function NodeCard({ group, isLast, isRunning }: { group: LogGroup; isLast: boolean; isRunning: boolean }) {
-  const [collapsed, setCollapsed] = useState(false);
-  const hasError = group.events.some((e) => e.type === "task_error" || (e.type === "tool_result" && e.success === false));
-  const isDone = !isLast || !isRunning;
-  const colorClass = nodeColor(group.node);
-
-  return (
-    <div className={`border rounded-lg overflow-hidden animate-fade-in ${
-      hasError ? "border-red-500/30 bg-red-500/5"
-      : isDone  ? "border-[#2a2d3a] bg-[#1a1d27]"
-      : "border-indigo-500/30 bg-indigo-500/5"
-    }`}>
-      {/* Card header */}
-      <button
-        onClick={() => setCollapsed((v) => !v)}
-        className="w-full flex items-center gap-2 px-3 py-2 hover:bg-white/5 transition-colors text-left"
-      >
-        <span className={`text-xs font-semibold ${colorClass.split(" ")[0]}`}>
-          {nodeLabel(group.node)}
-        </span>
-        <span className="text-slate-600 text-xs">{group.events.filter((e) => e.type !== "node_start").length} events</span>
-        <span className="ml-auto">
-          {!isDone && isRunning ? (
-            <span className="flex items-center gap-1 text-xs text-indigo-400">
-              <svg className="animate-spin h-3 w-3" viewBox="0 0 24 24" fill="none">
-                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-              </svg>
-              running
-            </span>
-          ) : hasError ? (
-            <span className="text-xs text-red-400">failed</span>
-          ) : (
-            <span className="text-xs text-emerald-400">done</span>
-          )}
-        </span>
-        <span className="text-slate-600 text-xs">{collapsed ? "▶" : "▼"}</span>
-      </button>
-
-      {/* Card body */}
-      {!collapsed && (
-        <div className="px-2 pb-2 space-y-0.5 border-t border-[#2a2d3a]">
-          {group.events.map((ev, i) => <EventRow key={i} event={ev} />)}
+    <article className={`event-item ${failed ? "event-failed" : ""} ${success ? "event-success" : ""}`}>
+      <div className="event-rail"><span /></div>
+      <div className="event-body">
+        <div className="event-topline">
+          <strong>{titleFor(event)}</strong>
+          <time>{event.timestamp ? new Date(event.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : ""}</time>
         </div>
-      )}
-    </div>
+        {(event.summary || event.error) && <p>{event.error || event.summary}</p>}
+        {event.errors?.length ? <ul className="event-errors">{event.errors.map((error) => <li key={error}>{error}</li>)}</ul> : null}
+        {payload && <button className="details-button" onClick={() => setExpanded((value) => !value)}>{expanded ? "收起详情" : "查看详情"}</button>}
+        {expanded && payload && <pre>{JSON.stringify(payload, null, 2)}</pre>}
+        {event.type === "human_review_required" && <button className="review-button" onClick={() => onReview(event)}>打开审核</button>}
+      </div>
+    </article>
   );
 }
 
-export default function ExecutionLog({ events, onHumanReview, isRunning }: ExecutionLogProps) {
-  const bottomRef = useRef<HTMLDivElement>(null);
-  const notifiedCountRef = useRef(0);
-  const groups = groupEvents(events);
-
+export default function ExecutionLog({ events, onHumanReview, isRunning }: { events: TaskEvent[]; onHumanReview: (event: TaskEvent) => void; isRunning: boolean }) {
+  const endRef = useRef<HTMLDivElement>(null);
+  const visible = useMemo(() => compactEvents(events), [events]);
   useEffect(() => {
-    for (let i = notifiedCountRef.current; i < events.length; i++) {
-      if (events[i].type === "human_review_required") onHumanReview(events[i]);
-    }
-    notifiedCountRef.current = events.length;
-  }, [events, onHumanReview]);
+    if (typeof endRef.current?.scrollIntoView === "function") endRef.current.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }, [visible.length]);
 
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [events.length]);
-
-  if (events.length === 0) {
-    return (
-      <div
-        data-testid="execution-log"
-        className="border border-[#2a2d3a] rounded-xl p-12 text-center"
-      >
-        <div className="text-3xl mb-3 opacity-20">⚡</div>
-        <p className="text-slate-500 text-sm">No execution events yet.</p>
-        <p className="text-slate-600 text-xs mt-1">Submit a task to begin.</p>
-      </div>
-    );
-  }
-
-  return (
-    <div
-      data-testid="execution-log"
-      className="border border-[#2a2d3a] rounded-xl bg-[#1a1d27] overflow-y-auto"
-      style={{ maxHeight: "calc(100vh - 220px)", minHeight: "300px" }}
-    >
-      <div className="p-3 space-y-2">
-        {groups.map((group, gi) => (
-          <NodeCard
-            key={gi}
-            group={group}
-            isLast={gi === groups.length - 1}
-            isRunning={isRunning}
-          />
-        ))}
-        {isRunning && (
-          <div className="flex items-center gap-2 px-3 py-2 text-xs text-indigo-400 animate-pulse">
-            <svg className="animate-spin h-3 w-3" viewBox="0 0 24 24" fill="none">
-              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-            </svg>
-            Agent is running…
-          </div>
-        )}
-        <div ref={bottomRef} />
-      </div>
+  if (!visible.length) return (
+    <div className="empty-timeline">
+      <div className="empty-orbit"><span /></div>
+      <h3>{isRunning ? "正在连接执行流" : "等待任务"}</h3>
+      <p>{isRunning ? "实际使用的工具和验证结果会显示在这里。" : "描述目标后，Agent 会选择合适的执行方式。"}</p>
     </div>
   );
+  return <div className="event-list">{visible.map((event, index) => <EventItem key={event.event_id || `${event.type}-${event.timestamp}-${index}`} event={event} onReview={onHumanReview} />)}<div ref={endRef} /></div>;
 }

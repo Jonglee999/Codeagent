@@ -233,7 +233,7 @@ class HumanReviewNode:
             decision = await loop.run_in_executor(None, input, "")
             decision = decision.strip().lower()
             if decision not in _DECISION_OPTIONS:
-                print(f"无效选项，默认: abort", file=sys.stderr)
+                print("无效选项，默认: abort", file=sys.stderr)
                 return "abort"
             return decision
         except (EOFError, KeyboardInterrupt):

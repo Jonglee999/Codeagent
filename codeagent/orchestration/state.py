@@ -36,6 +36,8 @@ class PlanStep:
     target_file: str | None = None
     risk: RiskLevel = "low"
     dependencies: list[int] = field(default_factory=list)
+    acceptance_criteria: str = ""
+    evidence: list[dict[str, Any]] = field(default_factory=list)
 
 
 # ── Phase 5.4: 修复上下文 ──────────────────────────────────
@@ -123,9 +125,31 @@ class AgentState:
     current_step_index: int = 0
     accumulated_changes: list[dict] = field(default_factory=list)
     validation_results: list[ValidationResult] = field(default_factory=list)
+    validation_state: str = "not_run"
     human_decision: str | None = None
     retry_count: int = 0
     degraded_mode: bool = False
+    direct_execution: bool = False
+    benchmark_instance_id: str | None = None
+    benchmark_fail_to_pass: list[str] = field(default_factory=list)
+    benchmark_pass_to_pass: list[str] = field(default_factory=list)
+    recovered_from_task_id: str | None = None
+    run_profile: dict[str, Any] = field(default_factory=dict)
+    tool_manifest: dict[str, Any] = field(default_factory=dict)
+    context_manifest: dict[str, Any] = field(default_factory=dict)
+    steering_instructions: list[str] = field(default_factory=list)
+    context_mode: str = "full"
+    memory_mode: str = "relevant"
+    learning_mode: str = "off"
+    memory_recalled: bool = False
+    memory_context: str = ""
+    reflection: dict[str, Any] | None = None
+    reflection_count: int = 0
+    warnings: list[str] = field(default_factory=list)
+    resolved_skills: list[dict[str, Any]] = field(default_factory=list)
+    allowed_tools: list[str] = field(default_factory=list)
+    memory_hits: list[dict[str, Any]] = field(default_factory=list)
+    transcript_path: str | None = None
 
     # ── Phase 3.5 TaskFocus + Human Review 字段 ──────────────
     original_goal_summary: str = ""               # 原始目标摘要（Planning Node 写入）

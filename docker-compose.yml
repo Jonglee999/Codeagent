@@ -1,65 +1,37 @@
-# =============================================================================
-# CodeAgent — Docker Compose 一键部署
-#
-# 服务组成:
-#   redis   — Celery 消息队列 + WebSocket 事件总线
-#   jaeger  — 分布式追踪（OpenTelemetry OTLP）
-#   api     — FastAPI 服务（REST + WebSocket）
-#   worker  — Celery Worker（Agent 任务执行）
-#   nginx   — 反向代理 + 前端静态文件托管
-#
-# 使用方式:
-#   docker compose up -d                     # 启动所有服务
-#   docker compose logs -f                   # 查看日志
-#   docker compose down                      # 停止并清理
-#   docker compose up -d --build             # 重新构建后启动
-# =============================================================================
+name: codeagent
 
 services:
-  # ── Redis 服务 ──────────────────────────────────────────────────────
   redis:
     image: redis:7-alpine
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
     ports:
       - "6379:6379"
     volumes:
       - redis_data:/data
-
-  # ── Jaeger 分布式追踪 ──────────────────────────────────────────
-  jaeger:
-    image: jaegertracing/all-in-one:latest
-    ports:
-      - "16686:16686"   # Jaeger UI
-      - "4317:4317"     # OTLP gRPC
-    environment:
-      - COLLECTOR_OTLP_ENABLED=true
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
     restart: unless-stopped
 
-  # ── FastAPI 服务 ────────────────────────────────────────────────────
   api:
+    profiles: ["full"]
     build:
       context: .
       dockerfile: Dockerfile
       target: app
-    command: uvicorn codeagent.interaction.api.main:app --host 0.0.0.0 --port 8000 --log-level info
+    command: uvicorn codeagent.interaction.api.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    env_file:
+      - path: .env
+        required: false
     environment:
-      - LLM_API_KEY=${LLM_API_KEY:?LLM_API_KEY is required}
-      - LLM_API_BASE=${LLM_API_BASE:-https://api.deepseek.com/v1}
-      - LLM_MODEL=${LLM_MODEL:-deepseek/deepseek-v4-flash}
-      - LLM_TIMEOUT=${LLM_TIMEOUT:-120}
-      - REDIS_URL=redis://redis:6379
-      - SANDBOX_ENABLED=${SANDBOX_ENABLED:-false}
-      - CELERY_TASK_TIMEOUT=${CELERY_TASK_TIMEOUT:-600}
-      - MAX_LLM_CALLS_PER_TASK=${MAX_LLM_CALLS_PER_TASK:-50}
-      - MAX_TOKENS_PER_TASK=${MAX_TOKENS_PER_TASK:-100000}
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
-      - OTEL_SERVICE_NAME=codeagent-api
+      REDIS_URL: redis://redis:6379
+      USE_INLINE_RUNNER: "true"
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_API_BASE: ${LLM_API_BASE:-https://api.deepseek.com/v1}
+      LLM_MODEL: ${LLM_MODEL:-deepseek/deepseek-v4-flash}
     depends_on:
       redis:
         condition: service_healthy
@@ -67,44 +39,44 @@ services:
       - workspace:/workspace
     restart: unless-stopped
 
-  # ── Celery Worker 服务 ──────────────────────────────────────────────
   worker:
+    profiles: ["distributed"]
     build:
       context: .
       dockerfile: Dockerfile
       target: app
     command: celery -A codeagent.worker worker --loglevel=info --concurrency=2
+    env_file:
+      - path: .env
+        required: false
     environment:
-      - LLM_API_KEY=${LLM_API_KEY:?LLM_API_KEY is required}
-      - LLM_API_BASE=${LLM_API_BASE:-https://api.deepseek.com/v1}
-      - LLM_MODEL=${LLM_MODEL:-deepseek/deepseek-v4-flash}
-      - LLM_TIMEOUT=${LLM_TIMEOUT:-120}
-      - REDIS_URL=redis://redis:6379
-      - SANDBOX_ENABLED=${SANDBOX_ENABLED:-false}
-      - CELERY_TASK_TIMEOUT=${CELERY_TASK_TIMEOUT:-600}
-      - MAX_LLM_CALLS_PER_TASK=${MAX_LLM_CALLS_PER_TASK:-50}
-      - MAX_TOKENS_PER_TASK=${MAX_TOKENS_PER_TASK:-100000}
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
-      - OTEL_SERVICE_NAME=codeagent-worker
+      REDIS_URL: redis://redis:6379
+      LLM_API_KEY: ${LLM_API_KEY:-}
     depends_on:
       redis:
         condition: service_healthy
     volumes:
       - workspace:/workspace
-    restart: unless-stopped
 
-  # ── Nginx 反向代理 ─────────────────────────────────────────────────
+  jaeger:
+    profiles: ["observability"]
+    image: jaegertracing/all-in-one:latest
+    ports:
+      - "16686:16686"
+      - "4317:4317"
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+
   nginx:
+    profiles: ["full"]
     build:
       context: .
       dockerfile: Dockerfile
       target: nginx
     ports:
-      - "80:80"
+      - "8080:80"
     depends_on:
       - api
-    restart: unless-stopped
 
 volumes:
   redis_data:

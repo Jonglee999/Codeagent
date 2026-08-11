@@ -5,11 +5,9 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import pytest
-from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (

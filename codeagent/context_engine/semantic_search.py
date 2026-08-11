@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import math
-import os
 import re
-import tempfile
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from collections.abc import Callable
 
 import lancedb
 import numpy as np
@@ -24,6 +23,7 @@ _DEFAULT_DB_PATH = ".codeagent/lancedb"
 _VECTOR_WEIGHT = 0.7
 _BM25_WEIGHT = 0.3
 _DEFAULT_TOP_K = 10
+_INDEX_SCHEMA_VERSION = 2
 
 
 # ── SearchResult 数据类 ───────────────────────────────────────────────────────
@@ -189,7 +189,9 @@ class _MockEmbeddingModel:
         result = []
         for text in texts:
             # 基于文本哈希生成确定性向量
-            h = hashlib.md5(text.encode()).hexdigest()
+            # This digest only seeds deterministic mock embeddings; it is not a
+            # security or integrity primitive.
+            h = hashlib.md5(text.encode(), usedforsecurity=False).hexdigest()
             seed = int(h[:8], 16)
             rng = np.random.RandomState(seed)
             vec = rng.randn(self._dim).astype(np.float32)
@@ -236,6 +238,9 @@ class SemanticSearchEngine:
         self._total_files: int = 0
         self._chunk_metadata: list[dict[str, Any]] = []
         self._chunk_texts: list[str] = []
+        self._metadata_by_id: dict[int, dict[str, Any]] = {}
+        self._project_root: Path | None = None
+        self._index_lock = asyncio.Lock()
 
     def _get_model(self) -> _EmbeddingModel | _MockEmbeddingModel:
         """获取嵌入模型（延迟初始化）。"""
@@ -266,6 +271,9 @@ class SemanticSearchEngine:
         root = Path(project_root).resolve()
         if not root.is_dir():
             raise NotADirectoryError(f"Not a directory: {root}")
+        self._project_root = root
+        if self._db is None and not Path(self._db_path).is_absolute():
+            self._db_path = str(root / self._db_path)
 
         # 收集所有源文件
         extensions = {".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}
@@ -322,6 +330,7 @@ class SemanticSearchEngine:
 
         table_data = []
         for i, chunk in enumerate(all_chunks):
+            metadata[i]["id"] = i
             table_data.append({
                 "vector": embeddings[i],
                 "id": i,
@@ -334,7 +343,7 @@ class SemanticSearchEngine:
                 "token_count": chunk.token_count,
             })
 
-        table = db.create_table(table_name, data=table_data)
+        db.create_table(table_name, data=table_data)
 
         # 创建 BM25 索引
         self._bm25.index(texts, metadata)
@@ -344,6 +353,7 @@ class SemanticSearchEngine:
         self._total_files = len(source_files)
         self._chunk_metadata = metadata
         self._chunk_texts = texts
+        self._metadata_by_id = {int(item["id"]): item for item in metadata}
 
         return {
             "total_files": self._total_files,
@@ -409,11 +419,16 @@ class SemanticSearchEngine:
         # BM25 搜索（自行过滤语言）
         bm25_results = self._bm25.search(query, top_k=top_k * 3)
         bm25_scores: dict[int, float] = {}
-        for idx, score in bm25_results:
+        for position, score in bm25_results:
+            meta = (
+                self._chunk_metadata[position]
+                if position < len(self._chunk_metadata)
+                else {}
+            )
             if filter_lang:
-                meta = self._chunk_metadata[idx] if idx < len(self._chunk_metadata) else {}
                 if meta.get("language") != filter_lang:
                     continue
+            idx = int(meta.get("id", position))
             bm25_scores[idx] = score
 
         # 归一化 BM25 得分
@@ -439,8 +454,8 @@ class SemanticSearchEngine:
         # 构建结果
         results: list[SearchResult] = []
         for idx, score in hybrid_scores:
-            if idx < len(self._chunk_metadata):
-                meta = self._chunk_metadata[idx]
+            meta = self._metadata_by_id.get(idx)
+            if meta is not None:
                 results.append(SearchResult(
                     file_path=meta.get("file_path", ""),
                     start_line=meta.get("start_line", 0),
@@ -490,13 +505,62 @@ class SemanticSearchEngine:
             table.delete(f'file_path = "{file_path.replace("\\", "\\\\")}"')
         except Exception:
             pass
+        await self._finish_reindex(file_path, table, chunks, embeddings)
+
+    async def _finish_reindex(
+        self,
+        file_path: str,
+        table: Any,
+        chunks: list[CodeChunk],
+        embeddings: list[list[float]],
+    ) -> None:
+        """Finish an incremental replacement and rebuild the lexical index."""
+        try:
+            table = self._get_db().open_table("code_chunks")
+        except Exception:
+            return
+
+        resolved = str(Path(file_path).resolve())
+        escaped = resolved.replace("'", "''")
+        try:
+            table.delete(f"file_path = '{escaped}'")
+        except Exception:
+            return
+
+        self._chunk_texts = []
+        self._chunk_metadata = []
+        self._metadata_by_id = {}
+        try:
+            rows = table.to_arrow().to_pylist()
+            for row in rows:
+                self._chunk_texts.append(row.get("code_snippet", ""))
+                item = {
+                    "id": int(row.get("id")),
+                    "file_path": row.get("file_path"),
+                    "start_line": row.get("start_line"),
+                    "end_line": row.get("end_line"),
+                    "code": row.get("code_snippet"),
+                    "symbol_name": row.get("symbol_name"),
+                    "language": row.get("language"),
+                }
+                self._chunk_metadata.append(item)
+            self._bm25.index(self._chunk_texts, self._chunk_metadata)
+            self._total_chunks = len(rows)
+            self._total_files = len({row.get("file_path") for row in rows})
+        except Exception:
+            pass
 
         # 添加新索引
         table_data = []
         for i, chunk in enumerate(chunks):
+            stable_key = (
+                f"{Path(chunk.file_path).resolve()}:{chunk.start_line}:"
+                f"{chunk.end_line}:{chunk.code}"
+            ).encode("utf-8")
             table_data.append({
                 "vector": embeddings[i],
-                "id": hash(chunk.code + str(chunk.start_line)),
+                "id": int.from_bytes(hashlib.sha256(stable_key).digest()[:8], "big")
+                & ((1 << 63) - 1),
                 "file_path": chunk.file_path,
                 "start_line": chunk.start_line,
                 "end_line": chunk.end_line,
@@ -515,21 +579,26 @@ class SemanticSearchEngine:
 
         # 重新加载所有数据
         try:
-            data = table.to_pandas()
-            if not data.empty:
-                for _, row in data.iterrows():
+            rows = table.to_arrow().to_pylist()
+            if rows:
+                for row in rows:
                     self._chunk_texts.append(row.get("code_snippet", ""))
-                    self._chunk_metadata.append({
+                    item = {
+                        "id": int(row.get("id")),
                         "file_path": row.get("file_path"),
                         "start_line": row.get("start_line"),
                         "end_line": row.get("end_line"),
                         "code": row.get("code_snippet"),
                         "symbol_name": row.get("symbol_name"),
                         "language": row.get("language"),
-                    })
+                    }
+                    self._chunk_metadata.append(item)
                 self._bm25.index(self._chunk_texts, self._chunk_metadata)
+                self._metadata_by_id = {
+                    int(item["id"]): item for item in self._chunk_metadata
+                }
 
-            self._total_chunks = len(data)
+            self._total_chunks = len(rows)
         except Exception:
             pass
 
@@ -540,4 +609,43 @@ class SemanticSearchEngine:
             "total_files": self._total_files,
             "model": self._model_name,
             "db_path": self._db_path,
+            "schema_version": _INDEX_SCHEMA_VERSION,
+            "model_loaded": self._model is not None,
         }
+
+    async def delete_file(self, file_path: str) -> None:
+        """Remove stale vectors for a file that no longer exists."""
+        try:
+            table = self._get_db().open_table("code_chunks")
+        except Exception:
+            return
+        escaped = str(Path(file_path).resolve()).replace("'", "''")
+        try:
+            table.delete(f"file_path = '{escaped}'")
+        except Exception:
+            return
+        self._chunk_texts = []
+        self._chunk_metadata = []
+        self._metadata_by_id = {}
+        try:
+            rows = table.to_arrow().to_pylist()
+            for row in rows:
+                self._chunk_texts.append(row.get("code_snippet", ""))
+                item = {
+                    "id": int(row.get("id")),
+                    "file_path": row.get("file_path"),
+                    "start_line": row.get("start_line"),
+                    "end_line": row.get("end_line"),
+                    "code": row.get("code_snippet"),
+                    "symbol_name": row.get("symbol_name"),
+                    "language": row.get("language"),
+                }
+                self._chunk_metadata.append(item)
+            self._bm25.index(self._chunk_texts, self._chunk_metadata)
+            self._metadata_by_id = {
+                int(item["id"]): item for item in self._chunk_metadata
+            }
+            self._total_chunks = len(rows)
+            self._total_files = len({row.get("file_path") for row in rows})
+        except Exception:
+            pass

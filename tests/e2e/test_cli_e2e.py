@@ -19,7 +19,6 @@ from pathlib import Path
 
 import pytest
 
-from codeagent.gateway.tool_gateway import IToolGateway
 from codeagent.gateway.validation_gateway import IValidationGateway
 from codeagent.orchestration.nodes.execution_node import ExecutionNode
 from codeagent.orchestration.state import AgentState
@@ -373,7 +372,7 @@ class TestE2EToolIntegration:
 
         # 验证备份存在
         backup_path = tmp_path / ".codeagent" / "backups"
-        backups = list(backup_path.glob("*counter.py"))
+        list(backup_path.glob("*counter.py"))
 
 # ── Scene A: Flask /health endpoint ──────────────────────────────────────────
 
@@ -1042,7 +1041,7 @@ class TestE2EAuthModification:
         # 验证 routes.py 已更新
         routes_file = project_dir / "backend" / "api" / "routes.py"
         assert routes_file.exists()
-        routes_content = routes_file.read_text(encoding="utf-8")
+        routes_file.read_text(encoding="utf-8")
 
         # 验证 client.py 已更新
         client_file = project_dir / "frontend" / "src" / "api" / "client.py"

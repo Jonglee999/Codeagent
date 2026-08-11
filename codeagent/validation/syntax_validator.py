@@ -7,7 +7,6 @@ TypeScript/JavaScript 使用 tree-sitter 解析，tsc --noEmit 作为备选。
 from __future__ import annotations
 
 import ast
-import os
 import subprocess
 import time
 from pathlib import Path

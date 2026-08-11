@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import io
 import structlog
-import pytest
 
 from codeagent.observability import configure_logging, get_logger
 

@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -638,6 +637,49 @@ class TestConfigCommand:
             assert config["auto_mode"] == "true"
 
 
+class TestMCPDoctorCommand:
+    def test_no_configuration_returns_optional_capability_exit_code(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        with runner.isolated_filesystem(temp_dir=tmp_path):
+            result = runner.invoke(cli, ["mcp", "doctor", "--json"])
+
+        assert result.exit_code == 3
+        report = json.loads(result.output)
+        assert report["configured"] is False
+        assert report["available"] is False
+
+    def test_reports_discovered_server(
+        self, runner: CliRunner, tmp_path: Path, monkeypatch
+    ) -> None:
+        from codeagent.tools.mcp import MCPDiscovery
+
+        async def fake_discovery(*args, **kwargs):
+            return MCPDiscovery(servers=[{
+                "name": "docs",
+                "transport": "stdio",
+                "available": True,
+                "tool_count": 2,
+                "last_latency_ms": 12.5,
+            }])
+
+        monkeypatch.setattr(
+            "codeagent.tools.mcp.discover_mcp_tools", fake_discovery
+        )
+        with runner.isolated_filesystem(temp_dir=tmp_path):
+            config_dir = Path.cwd() / ".codeagent"
+            config_dir.mkdir()
+            (config_dir / "mcp.json").write_text(
+                json.dumps({"servers": {"docs": {"command": "unused"}}}),
+                encoding="utf-8",
+            )
+            result = runner.invoke(cli, ["mcp", "doctor"])
+
+        assert result.exit_code == 0
+        assert "[OK] docs" in result.output
+        assert "12.5 ms" in result.output
+
+
 # ── Tests: history command ─────────────────────────────────────────────────
 
 
@@ -1018,5 +1060,8 @@ class TestAskHistoryIntegration:
 
             result = runner.invoke(cli, ["history", "--limit", "1"])
             assert result.exit_code == 0
-            lines = [l for l in result.output.split("\n") if "request 2" in l.strip()]
+            lines = [
+                line for line in result.output.split("\n")
+                if "request 2" in line.strip()
+            ]
             assert len(lines) == 1

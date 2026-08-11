@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import tempfile
-from pathlib import Path
 
 import pytest
 
@@ -233,10 +232,10 @@ class TestSemanticSearchQuery:
 
         # 搜索"用户认证"相关内容
         auth_results = await engine.search("user authentication", top_k=5)
-        auth_files = {r.file_path for r in auth_results}
+        {r.file_path for r in auth_results}
 
         # 搜索完全无关的内容
-        unrelated_results = await engine.search("xyznonexistent_keyword_12345", top_k=5)
+        await engine.search("xyznonexistent_keyword_12345", top_k=5)
 
         # 相关搜索应有非零结果
         assert len(auth_results) > 0
@@ -257,7 +256,7 @@ class TestSemanticSearchReindex:
     ) -> None:
         """验证文件重新索引。"""
         await engine.index_project(sample_project)
-        stats_before = engine.get_index_stats()
+        engine.get_index_stats()
 
         # 添加新函数到 auth.py
         auth_path = os.path.join(sample_project, "services", "auth.py")
@@ -299,7 +298,7 @@ class TestSemanticSearchEdgeCases:
     ) -> None:
         """重复索引不应崩溃。"""
         await engine.index_project(sample_project)
-        stats1 = engine.get_index_stats()
+        engine.get_index_stats()
 
         # 第二次索引
         stats2 = await engine.index_project(sample_project)

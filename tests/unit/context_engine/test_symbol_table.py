@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import tempfile
-from pathlib import Path
 
 import pytest
 
@@ -421,7 +420,7 @@ class TestSymbolTableLanguageConfig:
     @pytest.mark.asyncio
     async def test_symtable_language_not_installed(self) -> None:
         # Should not crash with unsupported language
-        st = SymbolTable(languages=["python", "rust"])
+        SymbolTable(languages=["python", "rust"])
         # Should work fine (rust not supported but ignored)
 
 

@@ -227,7 +227,7 @@ class TestBudgetTrimming:
                 for i in range(50)
             ],
         )
-        result = assembler.assemble(package)
+        assembler.assemble(package)
         report = assembler.get_budget_report()
         assert report is not None
         assert report.total_used <= report.total_budget
@@ -248,6 +248,32 @@ class TestBudgetTrimming:
         package = ContextPackage(file_tree=deep_tree)
         result = assembler.assemble(package)
         assert isinstance(result, str)
+
+    def test_tiny_budget_terminates_and_stays_within_budget(self) -> None:
+        assembler = ContextAssembler(total_budget=1)
+        package = ContextPackage(
+            file_tree={
+                "name": "root",
+                "type": "directory",
+                "path": ".",
+                "children": [
+                    {"name": "a_really_long_file_name.py", "type": "file", "size": 10},
+                ],
+            },
+            related_code=[CodeSnippet(
+                file_path="long.py",
+                start_line=1,
+                end_line=100,
+                code="very_long_identifier = 1\n" * 100,
+                score=1.0,
+            )],
+        )
+
+        assembler.assemble(package)
+        report = assembler.get_budget_report()
+
+        assert report is not None
+        assert report.total_used <= 1
 
 
 # ── Tests: Current file section ──────────────────────────────────────────
@@ -506,7 +532,7 @@ class TestScoreBasedTrimming:
             ),
         ]
         allocation = BudgetAllocation(section="related_code", budget=1000)
-        text = assembler._format_related_code(snippets)
+        assembler._format_related_code(snippets)
         result = assembler._trim_related_code_by_score(snippets, 2000, allocation)
         assert result is not None
         assert not allocation.trimmed

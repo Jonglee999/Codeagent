@@ -14,6 +14,19 @@ import pytest
 from codeagent.validation.test_detector import TestDetector
 
 
+@pytest.mark.asyncio
+async def test_detects_pytest_file_in_project_root(tmp_path: Path) -> None:
+    (tmp_path / "test_calculator.py").write_text(
+        "def test_add():\n    assert 1 + 1 == 2\n",
+        encoding="utf-8",
+    )
+
+    info = await TestDetector(str(tmp_path)).detect()
+
+    assert info.framework == "pytest"
+    assert info.test_command.startswith("pytest")
+
+
 # ── Fixtures ──────────────────────────────────────────────────────────────
 
 

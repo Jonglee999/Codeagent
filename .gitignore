@@ -33,14 +33,26 @@ Thumbs.db
 # ─── Environment ───────────────────────────────────────
 .env
 .env.local
+**/mcp.secrets.json
 *.key
 *.pem
 
 # ─── Project-specific ──────────────────────────────────
-.codeagent/cache/
-.codeagent/backups/
+.codeagent/mcp.json
+.codeagent/bin/
+.codeagent/workspaces/
+.codeagent/evaluators/
+.codeagent/benchmarks/
+**/.codeagent/backups/
+**/.codeagent/cache/
+**/.codeagent/lancedb/
+**/.codeagent/state/
+**/.codeagent/transcripts/
+.harness/
+.pytest_cache/
 dist/
 devdoc/
+/docs/
 
 # ─── Coverage / Reports ───────────────────────────────
 htmlcov/

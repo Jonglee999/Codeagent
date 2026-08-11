@@ -92,6 +92,15 @@ class ToolRegistry:
                     name=t.name,
                     description=t.description,
                     parameters_schema=t.parameters,
+                    category=getattr(t, "category", "general"),
+                    risk_level=getattr(t, "risk_level", "low"),
+                    source=getattr(t, "source", "core"),
+                    read_only=bool(getattr(t, "read_only", False)),
+                    external=bool(getattr(t, "external", False)),
+                    latency_hint=getattr(t, "latency_hint", "fast"),
+                    cost_hint=getattr(t, "cost_hint", "free"),
+                    idempotent=bool(getattr(t, "idempotent", True)),
+                    reversible=bool(getattr(t, "reversible", True)),
                 )
                 for t in self._tools.values()
             ]

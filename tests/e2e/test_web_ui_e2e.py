@@ -219,7 +219,7 @@ class TestTaskHistory:
         page.wait_for_selector('[data-testid="task-history"]', timeout=5000)
 
         # 记住历史条目数量
-        history_count_before = page.locator('[data-testid="history-item"]').count()
+        page.locator('[data-testid="history-item"]').count()
 
         # 刷新页面
         page.reload()

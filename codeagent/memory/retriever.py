@@ -6,11 +6,11 @@
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 import re
 import time
 from dataclasses import dataclass
-from typing import Optional
 
 from codeagent.interaction.api.metrics import observe_memory_retrieval
 from codeagent.memory.store import MemoryEntry, MemoryStore, MemoryType
@@ -205,9 +205,7 @@ class MemoryRetriever:
 
         sentence-transformers 不可用时返回 0.0，优雅降级。
         """
-        try:
-            from sentence_transformers import SentenceTransformer
-        except ImportError:
+        if importlib.util.find_spec("sentence_transformers") is None:
             logger.debug("sentence-transformers not available, vector score = 0.0")
             return 0.0
 

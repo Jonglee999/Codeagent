@@ -7,9 +7,6 @@
 from __future__ import annotations
 
 import configparser
-import os
-import shutil
-import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -101,6 +98,8 @@ class TestDetector:
         info.framework = self._detect_framework(
             config_files, test_dirs, installed
         )
+        if info.framework is None and self._find_root_test_files():
+            info.framework = "pytest"
 
         # 6. 生成测试命令
         if info.framework == "pytest":
@@ -113,6 +112,12 @@ class TestDetector:
             info.test_command = self._build_pytest_command(info)
 
         return info
+
+    def _find_root_test_files(self) -> list[Path]:
+        """Discover pytest-style files placed directly in the project root."""
+        found = set(self._project_root.glob("test_*.py"))
+        found.update(self._project_root.glob("*_test.py"))
+        return sorted(path for path in found if path.is_file())
 
     # ── 配置文件发现 ──────────────────────────────────────────
 
@@ -332,11 +337,24 @@ class TestDetector:
         # 取第一个有效配置
         if info.config_files:
             cmd_parts.append("-c")
-            cmd_parts.append(str(info.config_files[0]))
+            config_path = Path(info.config_files[0])
+            try:
+                config_path = config_path.relative_to(self._project_root)
+            except ValueError:
+                pass
+            cmd_parts.append(config_path.as_posix())
 
         # 测试目录
         if info.test_dirs:
-            dirs_str = " ".join(str(d) for d in info.test_dirs)
+            relative_dirs: list[str] = []
+            for item in info.test_dirs:
+                directory = Path(item)
+                try:
+                    directory = directory.relative_to(self._project_root)
+                except ValueError:
+                    pass
+                relative_dirs.append(directory.as_posix())
+            dirs_str = " ".join(relative_dirs)
             cmd_parts.append(dirs_str)
 
         # 选项

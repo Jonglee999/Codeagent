@@ -9,16 +9,40 @@ from __future__ import annotations
 from typing import Literal
 
 from codeagent.orchestration.state import AgentState
+from codeagent.orchestration.nodes.validation_node import (
+    benchmark_runtime_environment_unavailable,
+)
 
 # 路由目标类型
 AfterPlanning = Literal["context", "execution", "human_review", "end"]
+AfterContext = Literal["planning", "execution"]
 AfterExecution = Literal["validation", "execution", "end", "human_review"]
 AfterValidation = Literal["execution", "planning", "human_review", "end"]
+AfterReflection = Literal["execution", "planning", "human_review", "end"]
+AfterValidationEvidence = Literal["reflection", "end"]
 AfterHumanReview = Literal["execution", "planning", "end"]
 
 # 验证修复循环常量
 _MAX_VALIDATION_RETRIES = 3          # 单轮最大重试次数
 _MAX_CONSECUTIVE_FAILURES = 9        # 连续验证失败上限（3 轮 × 3 次）
+
+
+def _benchmark_runtime_environment_unavailable(state: AgentState) -> bool:
+    """Detect a benchmark test collection failure caused by the generic sandbox.
+
+    Benchmark repositories are validated authoritatively by SWE-bench's project-specific
+    Docker image. The lightweight Agent sandbox intentionally doesn't install every
+    benchmark project's dependencies, so a collection-time missing-module error must not
+    spend more model calls trying to repair otherwise valid source code.
+    """
+    return benchmark_runtime_environment_unavailable(
+        state, state.validation_results
+    )
+
+
+def route_after_context(state: AgentState) -> AfterContext:
+    """Follow-up code requests bypass the planning node entirely."""
+    return "execution" if state.direct_execution else "planning"
 
 
 def route_after_planning(state: AgentState) -> AfterPlanning:
@@ -37,6 +61,9 @@ def route_after_planning(state: AgentState) -> AfterPlanning:
         下一节点名称
     """
     # 有严重错误时终止
+    if state.direct_execution:
+        return "execution"
+
     if state.errors and any("Plan generation failed" in e for e in state.errors):
         return "end"
 
@@ -75,7 +102,9 @@ def route_after_execution(state: AgentState) -> AfterExecution:
     """
     # 有 fatal 错误时终止
     if state.errors and any(
-        "Exceeded max tool calls" in e or "LLM call failed" in e
+        "Exceeded max tool calls" in e
+        or "LLM call failed" in e
+        or "Step evidence missing" in e
         for e in state.errors
     ):
         return "end"
@@ -94,7 +123,13 @@ def route_after_execution(state: AgentState) -> AfterExecution:
             return "execution"
         return "validation"
 
-    # 无 plan（直连模式）→ 验证
+    # Read/run-only direct turns have no mutation to validate. This is common
+    # for conversational follow-ups such as "run it again and show the result";
+    # sending them through every repository validator adds noise and latency.
+    if state.direct_execution and not state.accumulated_changes:
+        return "end"
+
+    # 无 plan（直连模式）且产生了文件修改 → 验证
     return "validation"
 
 
@@ -121,6 +156,9 @@ def route_after_validation(state: AgentState) -> AfterValidation:
     if all_passed:
         return "end"
 
+    if _benchmark_runtime_environment_unavailable(state):
+        return "end"
+
     # ── Phase 4.A.5 增强：修复循环路由 ─────────────────────────
     if state.retry_count < _MAX_VALIDATION_RETRIES:
         return "execution"
@@ -134,6 +172,27 @@ def route_after_validation(state: AgentState) -> AfterValidation:
         return "human_review"
 
     return "planning"
+
+
+def route_after_validation_evidence(state: AgentState) -> AfterValidationEvidence:
+    """Reflect only when validation produced evidence that needs revision."""
+    if state.validation_results and all(result.passed for result in state.validation_results):
+        return "end"
+    if not state.validation_results:
+        return "end"
+    if _benchmark_runtime_environment_unavailable(state):
+        return "end"
+    return "reflection"
+
+
+def route_after_reflection(state: AgentState) -> AfterReflection:
+    action = (state.reflection or {}).get("next_action")
+    return {
+        "finish": "end",
+        "repair": "execution",
+        "replan": "planning",
+        "review": "human_review",
+    }.get(action, "end")  # type: ignore[return-value]
 
 
 def route_after_human_review(state: AgentState) -> AfterHumanReview:

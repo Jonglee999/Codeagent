@@ -7,8 +7,8 @@ from __future__ import annotations
 
 import inspect
 import time
-from collections.abc import AsyncGenerator, AsyncIterator
-from typing import Any, get_type_hints
+from collections.abc import AsyncGenerator
+from typing import get_type_hints
 
 import pytest
 
@@ -52,6 +52,9 @@ class MockOrchestrationGateway(IOrchestrationGateway):
 
     async def cancel_task(self, task_id: str) -> bool:
         return True
+
+    async def steer_task(self, task_id: str, instruction: str) -> bool:
+        return bool(task_id and instruction)
 
     async def get_report(self, task_id: str) -> TaskReport:
         return TaskReport(
@@ -178,6 +181,13 @@ class TestInterfaceSignatures:
         assert hints["return"] is TaskReport, (
             f"Expected return TaskReport, got {hints['return']}"
         )
+
+    def test_steer_task_signature(self) -> None:
+        sig = inspect.signature(IOrchestrationGateway.steer_task)
+        assert "task_id" in sig.parameters
+        assert "instruction" in sig.parameters
+        hints = get_type_hints(IOrchestrationGateway.steer_task)
+        assert hints["return"] is bool
 
 
 # =============================================================================
@@ -388,6 +398,11 @@ class TestMockBehavior:
         gw = MockOrchestrationGateway()
         result = await gw.cancel_task("task-1")
         assert result is True
+
+    @pytest.mark.asyncio
+    async def test_mock_steer_task(self) -> None:
+        gw = MockOrchestrationGateway()
+        assert await gw.steer_task("task-1", "Keep the API compatible") is True
 
     @pytest.mark.asyncio
     async def test_mock_get_report(self) -> None:

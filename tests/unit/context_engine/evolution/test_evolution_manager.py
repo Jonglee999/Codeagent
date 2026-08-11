@@ -10,12 +10,12 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from codeagent.context_engine.evolution.manager import SelfEvolutionManager
-from codeagent.context_engine.evolution.trajectory_recorder import Trajectory, TrajectoryStep
+from codeagent.context_engine.evolution.trajectory_recorder import TrajectoryStep
 
 
 @pytest.fixture

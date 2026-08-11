@@ -489,8 +489,6 @@ class WebSearchTool(BaseTool):
 
         此 API 永不屏蔽请求，但仅返回摘要式结果（非完整网页搜索结果）。
         """
-        import asyncio
-        import json
 
         import httpx
 

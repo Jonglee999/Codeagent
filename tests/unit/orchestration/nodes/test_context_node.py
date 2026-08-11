@@ -148,11 +148,15 @@ class TestContextNodeDegradation:
         mock_gateway.build_context = AsyncMock(
             side_effect=RuntimeError("Cannot connect to index")
         )
-        node = ContextNode(context_gateway=mock_gateway)
+        events: list[dict] = []
+        node = ContextNode(context_gateway=mock_gateway, progress_callback=events.append)
         result = await node(state)
         assert result["degraded_mode"] is True
-        assert len(result["errors"]) >= 1
-        assert "Context build failed" in result["errors"][0]
+        assert len(result["warnings"]) >= 1
+        assert "Context build degraded" in result["warnings"][0]
+        assert events[-1]["type"] == "capability_degraded"
+        assert events[-1]["data"]["capability"] == "context"
+        assert events[-1]["data"]["fallback"] == "direct_tools"
 
     @pytest.mark.asyncio
     async def test_timeout_degradation(
@@ -180,6 +184,53 @@ class TestContextNodeDegradation:
         # 空上下文应返回空字符串
         assert result["semantic_context"] == ""
         assert result["current_file_context"] == ""
+
+    @pytest.mark.asyncio
+    async def test_disabled_skills_emit_auditable_degradation(
+        self, mock_gateway: MagicMock, state: AgentState, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        events: list[dict] = []
+        monkeypatch.setattr(
+            "codeagent.orchestration.nodes.context_node.codeagent_config.get_skills_enabled",
+            lambda: False,
+        )
+        node = ContextNode(context_gateway=mock_gateway, progress_callback=events.append)
+
+        result = await node(state)
+
+        assert result["resolved_skills"] == []
+        assert result["allowed_tools"] == []
+        assert result["degraded_mode"] is True
+        assert "SKILLS_ENABLED=false" in result["warnings"][0]
+        assert any(event["type"] == "capability_degraded" for event in events)
+
+    @pytest.mark.asyncio
+    async def test_minimal_mode_skips_broad_context_build(
+        self, node: ContextNode, state: AgentState, mock_gateway: MagicMock
+    ) -> None:
+        state.context_mode = "minimal"
+
+        result = await node(state)
+
+        mock_gateway.build_context.assert_not_called()
+        assert "allowed_tools" in result
+        assert result.get("file_tree") is None
+        assert result["context_manifest"]["strategy"] == "just_in_time_tools"
+        assert any(
+            source["kind"] == "repository_index" and source["included"] is False
+            for source in result["context_manifest"]["sources"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_full_mode_reports_budgeted_context_sources(
+        self, node: ContextNode, state: AgentState
+    ) -> None:
+        result = await node(state)
+
+        manifest = result["context_manifest"]
+        assert manifest["strategy"] == "budgeted_repository_context"
+        assert manifest["total_budget"] >= manifest["total_used"]
+        assert any(source["kind"] == "related_code" for source in manifest["sources"])
 
 
 class TestContextNodeEdgeCases:

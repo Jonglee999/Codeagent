@@ -6,14 +6,11 @@
 from __future__ import annotations
 
 import json
-import os
-import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from codeagent.gateway.validation_gateway import ValidationResult
 from codeagent.validation.static_analyzer import StaticAnalyzer
 
 
@@ -379,7 +376,7 @@ class TestPathHandling:
         analyzer = StaticAnalyzer(project_root=str(tmp_path))
         f = tmp_path / "test.py"
         f.write_text("x = 1\n")
-        result = await analyzer.run_lint([str(f)])
+        result = await analyzer.run_lint(["test.py"])
         assert result.passed is True
 
     async def test_lint_with_config(self, analyzer: StaticAnalyzer, tmp_path: Path) -> None:

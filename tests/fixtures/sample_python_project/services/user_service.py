@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Any
 
 from config.settings import Settings
 from models.user import User

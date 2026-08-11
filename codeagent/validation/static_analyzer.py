@@ -6,7 +6,6 @@
 
 from __future__ import annotations
 
-import ast
 import json
 import os
 import re
@@ -19,7 +18,7 @@ from typing import TYPE_CHECKING, Any
 from codeagent.gateway.validation_gateway import ValidationError, ValidationResult
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    pass
 
 # ruff / mypy 子进程超时（秒）
 _TOOL_TIMEOUT = 60
@@ -156,6 +155,15 @@ class StaticAnalyzer:
         self._ruff_available: bool | None = None  # 懒检测
         self._mypy_available: bool | None = None
 
+    def _project_files(self, files: list[str]) -> list[str]:
+        """Resolve task-relative files against the configured project root."""
+        root = Path(self._project_root)
+        resolved: list[str] = []
+        for item in files:
+            path = Path(item)
+            resolved.append(str(path if path.is_absolute() else root / path))
+        return resolved
+
     # ── 工具可用性检测 ────────────────────────────────────────
 
     def _check_ruff_available(self) -> bool:
@@ -202,7 +210,7 @@ class StaticAnalyzer:
                 duration_ms=(time.monotonic() - start) * 1000,
             )
 
-        py_files = [f for f in files if _is_python_file(f)]
+        py_files = self._project_files([f for f in files if _is_python_file(f)])
         if not py_files:
             return ValidationResult(
                 passed=True,
@@ -341,7 +349,7 @@ class StaticAnalyzer:
                 duration_ms=(time.monotonic() - start) * 1000,
             )
 
-        py_files = [f for f in files if _is_python_file(f)]
+        py_files = self._project_files([f for f in files if _is_python_file(f)])
         if not py_files:
             return ValidationResult(
                 passed=True,
@@ -476,7 +484,7 @@ class StaticAnalyzer:
         """
         start = time.monotonic()
 
-        py_files = [f for f in files if _is_python_file(f)]
+        py_files = self._project_files([f for f in files if _is_python_file(f)])
         if not py_files:
             return ValidationResult(
                 passed=True,
@@ -521,16 +529,18 @@ class StaticAnalyzer:
 
         errors: list[ValidationError] = []
         warnings: list[ValidationError] = []
+        blocking_test_ids = {"B102", "B307", "B602", "B604", "B605", "B606"}
         for issue in data.get("results", []):
             severity = issue.get("issue_severity", "LOW")
+            test_id = issue.get("test_id", "")
             err = ValidationError(
                 file_path=issue.get("filename", ""),
                 line=issue.get("line_number", 0),
                 message=issue.get("issue_text", ""),
-                code=issue.get("test_id", ""),
-                severity="error" if severity == "HIGH" else "warning",
+                code=test_id,
+                severity="error" if severity == "HIGH" or test_id in blocking_test_ids else "warning",
             )
-            if severity == "HIGH":
+            if severity == "HIGH" or test_id in blocking_test_ids:
                 errors.append(err)
             elif severity == "MEDIUM":
                 warnings.append(err)

@@ -7,7 +7,7 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import AsyncGenerator
+from typing import Any, AsyncGenerator
 
 
 class TaskState(str, Enum):
@@ -36,6 +36,14 @@ class UserRequest:
     project_root: str
     auto_mode: bool = False
     max_retries: int = 3
+    conversation_history: list[dict[str, str]] = field(default_factory=list)
+    response_mode: str = "auto"
+    direct_execution: bool = False
+    conversation_id: str | None = None
+    benchmark_instance_id: str | None = None
+    benchmark_fail_to_pass: list[str] = field(default_factory=list)
+    benchmark_pass_to_pass: list[str] = field(default_factory=list)
+    recovered_from_task_id: str | None = None
 
 
 @dataclass
@@ -72,6 +80,9 @@ class TaskEvent:
     type: str
     data: dict
     timestamp: float
+    event_id: str | None = None
+    seq: int | None = None
+    schema_version: int = 1
 
 
 @dataclass
@@ -108,6 +119,26 @@ class TaskReport:
     validation_results: list
     duration: float
     token_usage: int
+    status: str = "completed"
+    assistant_response: str = ""
+    response_mode: str = "execute"
+    run_profile: dict = field(default_factory=dict)
+    tool_manifest: dict = field(default_factory=dict)
+    context_manifest: dict = field(default_factory=dict)
+    steering_instructions: list[str] = field(default_factory=list)
+    memory_hits: list[dict] = field(default_factory=list)
+    resolved_skills: list[dict] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    reflection: dict | None = None
+    transcript_path: str | None = None
+    mcp_servers: list[dict] = field(default_factory=list)
+    model_runtime: dict = field(default_factory=dict)
+    infrastructure_runtime: dict = field(default_factory=dict)
+    benchmark_metrics: dict[str, Any] = field(default_factory=dict)
+    benchmark_instance_id: str | None = None
+    artifacts: list[dict] = field(default_factory=list)
+    error: str | None = None
+    recovered_from_task_id: str | None = None
 
 
 class IOrchestrationGateway(ABC):
@@ -142,6 +173,11 @@ class IOrchestrationGateway(ABC):
     @abstractmethod
     async def cancel_task(self, task_id: str) -> bool:
         """取消任务。"""
+        ...
+
+    @abstractmethod
+    async def steer_task(self, task_id: str, instruction: str) -> bool:
+        """Queue a user instruction for the next safe execution boundary."""
         ...
 
     @abstractmethod

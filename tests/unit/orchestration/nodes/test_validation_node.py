@@ -42,12 +42,14 @@ def node(mock_gateway: AsyncMock) -> ValidationNode:
 def make_state(
     accumulated_changes: list | None = None,
     execution_log: list | None = None,
+    **overrides,
 ) -> AgentState:
     return AgentState(
         user_request="test",
         project_root="/root",
         accumulated_changes=accumulated_changes or [],
         execution_log=execution_log or [],
+        **overrides,
     )
 
 
@@ -111,6 +113,111 @@ class TestValidationNode:
 
         assert not any(r.passed for r in result["validation_results"])
 
+    async def test_benchmark_missing_conftest_dependency_is_degraded(
+        self, node: ValidationNode, mock_gateway: AsyncMock
+    ) -> None:
+        mock_gateway.run_runtime_check.return_value = ValidationResult(
+            passed=False,
+            errors=[ValidationError(
+                file_path="conftest.py",
+                message=(
+                    "ImportError while loading conftest '/workspace/conftest.py'.\n"
+                    "ModuleNotFoundError: No module named 'hypothesis'"
+                ),
+            )],
+        )
+        state = make_state(
+            accumulated_changes=[{"file_path": "main.py"}],
+            benchmark_instance_id="owner__repo-1",
+        )
+
+        result = await node(state)
+
+        assert result["validation_state"] == "validation_degraded"
+        assert any("official evaluation" in warning for warning in result["warnings"])
+
+    async def test_non_benchmark_missing_dependency_remains_failed(
+        self, node: ValidationNode, mock_gateway: AsyncMock
+    ) -> None:
+        mock_gateway.run_runtime_check.return_value = ValidationResult(
+            passed=False,
+            errors=[ValidationError(
+                file_path="conftest.py",
+                message=(
+                    "ImportError while loading conftest '/workspace/conftest.py'.\n"
+                    "ModuleNotFoundError: No module named 'hypothesis'"
+                ),
+            )],
+        )
+        state = make_state(accumulated_changes=[{"file_path": "main.py"}])
+
+        result = await node(state)
+
+        assert result["validation_state"] == "validation_failed"
+
+    async def test_benchmark_ignores_static_error_on_unchanged_line(
+        self, mock_gateway: AsyncMock, tmp_path
+    ) -> None:
+        source = tmp_path / "main.py"
+        original = "danger = compile('x', '', 'exec')\n"
+        source.write_text(original + "fixed = True\n", encoding="utf-8")
+        mock_gateway.run_lint.return_value = ValidationResult(
+            passed=False,
+            errors=[ValidationError(
+                file_path=str(source), line=1, code="SEC_COMPILE", message="compile",
+            )],
+        )
+        mock_gateway.run_runtime_check.return_value = ValidationResult(
+            passed=False,
+            errors=[ValidationError(
+                file_path="conftest.py",
+                message="ImportError while loading conftest; No module named 'project'",
+            )],
+        )
+        validation = ValidationNode(mock_gateway)
+        state = AgentState(
+            user_request="fix",
+            project_root=str(tmp_path),
+            benchmark_instance_id="owner__repo-1",
+            accumulated_changes=[{
+                "file_path": "main.py",
+                "original_content": original,
+            }],
+        )
+
+        result = await validation(state)
+
+        assert result["validation_state"] == "validation_degraded"
+        assert result["validation_results"][1].passed
+        assert result["validation_results"][1].warnings[-1].code == "PRE_EXISTING_STATIC"
+
+    async def test_benchmark_keeps_static_error_on_changed_line(
+        self, mock_gateway: AsyncMock, tmp_path
+    ) -> None:
+        source = tmp_path / "main.py"
+        source.write_text("safe = True\ndanger = compile('x', '', 'exec')\n", encoding="utf-8")
+        mock_gateway.run_lint.return_value = ValidationResult(
+            passed=False,
+            errors=[ValidationError(
+                file_path=str(source), line=2, code="SEC_COMPILE", message="compile",
+            )],
+        )
+        validation = ValidationNode(mock_gateway)
+        state = AgentState(
+            user_request="fix",
+            project_root=str(tmp_path),
+            benchmark_instance_id="owner__repo-1",
+            accumulated_changes=[{
+                "file_path": "main.py",
+                "original_content": "safe = True\n",
+            }],
+        )
+
+        result = await validation(state)
+
+        assert result["validation_state"] == "validation_failed"
+        assert result["validation_results"][1].errors[0].line == 2
+
     async def test_no_changed_files_all_pass_trivially(self, node: ValidationNode, mock_gateway: AsyncMock) -> None:
         state = make_state()
         result = await node(state)
@@ -153,6 +260,19 @@ class TestValidationNode:
 
         assert all(r.passed for r in result["validation_results"])
         mock_gateway.run_syntax_check.assert_awaited_once_with("log_file.py")
+
+    async def test_collects_apply_patch_from_execution_log(
+        self, node: ValidationNode, mock_gateway: AsyncMock
+    ) -> None:
+        state = make_state(execution_log=[{
+            "type": "tool_call",
+            "tool_name": "apply_patch",
+            "arguments": {"file_path": "patched.py"},
+        }])
+
+        await node(state)
+
+        mock_gateway.run_syntax_check.assert_awaited_once_with("patched.py")
 
     async def test_prefers_accumulated_changes_over_log(self, node: ValidationNode, mock_gateway: AsyncMock) -> None:
         """accumulated_changes 和 log 中出现同一文件应去重。"""
@@ -204,6 +324,22 @@ class TestValidationNodeEdgeCases:
         assert results[0].passed  # syntax
         assert results[1].passed  # lint
         assert not results[2].passed  # runtime
+
+    async def test_runtime_false_with_output_is_not_promoted_to_passed(
+        self, node: ValidationNode, mock_gateway: AsyncMock
+    ) -> None:
+        mock_gateway.run_runtime_check.return_value = ValidationResult(
+            passed=False,
+            output="1 failed during collection",
+        )
+        state = make_state(accumulated_changes=[{"file_path": "main.py"}])
+
+        result = await node(state)
+
+        runtime = result["validation_results"][2]
+        assert runtime.passed is False
+        assert runtime.output == "1 failed during collection"
+        assert runtime.errors[0].message == "1 failed during collection"
 
     async def test_empty_file_path_in_changes_skipped(self, node: ValidationNode, mock_gateway: AsyncMock) -> None:
         state = make_state(accumulated_changes=[{"file_path": ""}])
@@ -335,16 +471,39 @@ class TestRuntimeValidatorIntegration:
         """RuntimeValidator.run_tests() 被调用。"""
         mock_rv = AsyncMock(spec=RuntimeValidator)
         mock_rv.run_tests.return_value = ValidationResult(passed=True)
-        mock_rv.last_test_output = None
+        mock_rv.last_test_output = "1 passed in 0.01s"
 
         node = ValidationNode(mock_gateway, runtime_validator=mock_rv)
         state = make_state(accumulated_changes=[{"file_path": "main.py"}])
         result = await node(state)
 
         assert result["validation_results"][2].passed
-        mock_rv.run_tests.assert_awaited_once()
+        assert result["validation_results"][2].output == "1 passed in 0.01s"
+        mock_rv.run_tests.assert_awaited_once_with(test_targets=["main.py"])
         # gateway.run_runtime_check 不应被调用
         mock_gateway.run_runtime_check.assert_not_called()
+
+    async def test_benchmark_contract_targets_runtime_tests(
+        self, mock_gateway: AsyncMock
+    ) -> None:
+        mock_rv = AsyncMock(spec=RuntimeValidator)
+        mock_rv.run_tests.return_value = ValidationResult(passed=True)
+        mock_rv.last_test_output = "2 passed"
+        node = ValidationNode(mock_gateway, runtime_validator=mock_rv)
+        state = make_state(
+            accumulated_changes=[{"file_path": "src/main.py"}],
+            benchmark_fail_to_pass=["tests/test_fix.py::test_regression"],
+            benchmark_pass_to_pass=["tests/test_existing.py::test_still_passes"],
+        )
+
+        await node(state)
+
+        mock_rv.run_tests.assert_awaited_once_with(
+            test_targets=[
+                "tests/test_fix.py::test_regression",
+                "tests/test_existing.py::test_still_passes",
+            ]
+        )
 
     async def test_runtime_fallback_when_no_framework(
         self, mock_gateway: AsyncMock

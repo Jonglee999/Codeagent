@@ -24,7 +24,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from codeagent.gateway.memory_gateway import IMemoryGateway
-from codeagent.gateway.tool_gateway import IToolGateway, ToolDefinition, ToolResult
+from codeagent.gateway.tool_gateway import IToolGateway, ToolResult
 from codeagent.gateway.validation_gateway import IValidationGateway, ValidationResult
 from codeagent.memory.extractor import MemoryExtractor
 from codeagent.memory.manager import MemoryManager

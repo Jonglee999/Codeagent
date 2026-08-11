@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import time
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -151,7 +151,6 @@ class TestRuffDiagnostics:
     @pytest.mark.asyncio
     async def test_diagnostic_to_dict(self, py_lsp: LspClient, tmp_path) -> None:
         """Diagnostic.to_dict() 应返回正确结构。"""
-        import json
 
         from codeagent.tools.lsp.lsp_client import Diagnostic
 

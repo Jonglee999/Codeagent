@@ -1,131 +1,78 @@
 import type { TaskEvent, TaskReport } from "../types";
 
-interface ReportPanelProps {
-  report: unknown;
-  completeEvent: TaskEvent | null;
+function describeStep(step: unknown) {
+  if (typeof step === "string") return step;
+  if (step && typeof step === "object") {
+    const value = step as Record<string, unknown>;
+    return String(value.description || value.action || JSON.stringify(step));
+  }
+  return String(step);
 }
 
-export default function ReportPanel({ report, completeEvent }: ReportPanelProps) {
-  const r = report as TaskReport | null;
+function stringList(value: unknown): string[] {
+  return Array.isArray(value) ? value.map(String) : [];
+}
 
-  const duration = r?.duration ?? completeEvent?.duration;
-  const tokenUsage = r?.token_usage ?? completeEvent?.token_usage;
-  const isError = completeEvent?.type === "task_error";
+export default function ReportPanel({
+  report,
+  completeEvent,
+  onRecover,
+  onOpenFile,
+}: {
+  report: TaskReport | null;
+  completeEvent: TaskEvent | null;
+  onRecover?: () => void;
+  onOpenFile?: (path: string) => void;
+}) {
+  const failed = completeEvent?.type === "task_error" || !!report?.error;
+  const duration = report?.duration ?? completeEvent?.duration;
+  const tokens = report?.token_usage ?? completeEvent?.token_usage;
+  const redisRuntime = (report?.infrastructure_runtime?.redis || {}) as Record<string, unknown>;
+  const toolRuntime = (report?.infrastructure_runtime?.tools || {}) as Record<string, unknown>;
+  const workingSet = (toolRuntime.working_set || {}) as Record<string, unknown>;
+  const selectedTools = stringList(report?.tool_manifest?.selected_names);
+  const deferredTools = stringList(report?.tool_manifest?.deferred_names);
+  const contextSources = Array.isArray(report?.context_manifest?.sources)
+    ? report.context_manifest.sources as Record<string, unknown>[]
+    : [];
+  const hasDiagnostics = !!(
+    selectedTools.length || contextSources.length || report?.resolved_skills?.length
+    || report?.mcp_servers?.length || report?.steering_instructions?.length || report?.reflection
+    || (report?.model_runtime && Object.keys(report.model_runtime).length)
+    || (report?.infrastructure_runtime && Object.keys(report.infrastructure_runtime).length)
+  );
+  const cancelled = report?.status === "cancelled" || completeEvent?.type === "task_cancelled";
 
   return (
-    <div className={`border rounded-xl p-4 animate-slide-in ${
-      isError
-        ? "border-red-500/30 bg-red-500/5"
-        : "border-emerald-500/30 bg-emerald-500/5"
-    }`}>
-      {/* Header */}
-      <div className="flex items-center gap-2 mb-4">
-        <span className={`text-base ${isError ? "text-red-400" : "text-emerald-400"}`}>
-          {isError ? "✗" : "✓"}
-        </span>
-        <h3 className={`text-sm font-semibold ${isError ? "text-red-300" : "text-emerald-300"}`}>
-          {isError ? "Task Failed" : "Task Completed"}
-        </h3>
+    <section className={`panel report-panel ${cancelled ? "cancelled" : failed ? "failed" : "passed"}`}>
+      <div className="report-heading"><div className="report-icon">{cancelled ? "■" : failed ? "!" : "✓"}</div><div><p className="eyebrow">执行报告{report?.run_profile?.workflow ? ` · ${report.run_profile.workflow === "planned" ? "计划执行" : "直接执行"}` : ""}</p><h2>{cancelled ? "执行已停止" : failed ? "变更需要处理" : "实现已完成"}</h2></div></div>
+      {(completeEvent?.error || report?.error) && <div className="alert error"><span>{completeEvent?.error || report?.error}</span></div>}
+      <div className="report-stats">
+        <div><strong>{duration != null ? `${duration.toFixed(1)}s` : "—"}</strong><span>耗时</span></div>
+        <div><strong>{tokens != null ? tokens.toLocaleString() : "—"}</strong><span>Tokens</span></div>
+        <div><strong>{report?.changes?.length || 0}</strong><span>变更</span></div>
+        <div><strong>{report?.validation_results?.length || 0}</strong><span>检查</span></div>
       </div>
 
-      {/* Stats row */}
-      <div className="grid grid-cols-2 gap-3 mb-4">
-        <div className="bg-[#0f1117]/60 border border-[#2a2d3a] rounded-lg p-3 text-center">
-          <div className="text-xl font-mono text-indigo-400">
-            {duration != null ? `${duration.toFixed(1)}s` : "—"}
-          </div>
-          <div className="text-xs text-slate-500 mt-0.5">Duration</div>
-        </div>
-        <div className="bg-[#0f1117]/60 border border-[#2a2d3a] rounded-lg p-3 text-center">
-          <div className="text-xl font-mono text-violet-400">
-            {tokenUsage != null ? tokenUsage.toLocaleString() : "—"}
-          </div>
-          <div className="text-xs text-slate-500 mt-0.5">Tokens Used</div>
-        </div>
-      </div>
+      {report?.changes?.length ? <div className="report-section"><h3>变更文件</h3><div className="change-list">{report.changes.map((change, index) => { const path = String(change.file_path || change.path || `变更 ${index + 1}`); return onOpenFile ? <button type="button" className="change-file-link" key={index} onClick={() => onOpenFile(path)} title={`查看 ${path}`}>{path}</button> : <code key={index}>{path}</code>; })}</div></div> : null}
+      {report?.validation_results?.length ? <div className="report-section"><h3>验证证据</h3><div className="validation-grid">{report.validation_results.map((result, index) => <div className={result.passed ? "valid" : "invalid"} key={index}><span>{result.passed ? "✓" : "×"}</span>{String(result.layer || result.type || `检查 ${index + 1}`)}</div>)}</div></div> : null}
+      {report?.plan?.length ? <details className="report-section"><summary>执行方案（{report.plan.length} 步）</summary><ol>{report.plan.map((step, index) => <li key={index}><span>{index + 1}</span>{describeStep(step)}</li>)}</ol></details> : null}
+      {report?.artifacts?.length ? <div className="report-section artifact-list"><h3>可审查产物</h3>{report.artifacts.map((artifact) => <a key={artifact.artifact_id} href={artifact.download_url} download><code>{artifact.kind}</code><span>{artifact.size != null ? `${artifact.size.toLocaleString()} B` : "下载"}</span></a>)}</div> : null}
+      {report?.recovered_from_task_id ? <div className="report-section"><h3>恢复来源</h3><div className="change-list"><code>{report.recovered_from_task_id}</code></div></div> : null}
 
-      {/* Error message */}
-      {(isError || r?.error) && (
-        <div className="mb-4 text-xs text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg px-3 py-2">
-          {completeEvent?.error ?? r?.error ?? "Unknown error"}
-        </div>
-      )}
-
-      {/* Plan */}
-      {r?.plan && r.plan.length > 0 && (
-        <div className="mb-4">
-          <div className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">
-            Execution Plan ({r.plan.length} steps)
-          </div>
-          <ol className="space-y-1.5">
-            {r.plan.map((step, i) => (
-              <li key={i} className="flex items-start gap-2 text-xs">
-                <span className="shrink-0 w-4 h-4 rounded-full bg-indigo-500/10 border border-indigo-500/30 text-indigo-400 flex items-center justify-center font-mono text-[10px]">
-                  {i + 1}
-                </span>
-                <span className="text-slate-400 pt-0.5">
-                  {typeof step === "string"
-                    ? step
-                    : (step as Record<string, unknown>)?.description as string
-                      ?? (step as Record<string, unknown>)?.action as string
-                      ?? JSON.stringify(step)}
-                </span>
-              </li>
-            ))}
-          </ol>
-        </div>
-      )}
-
-      {/* Changed files */}
-      {r?.changes && r.changes.length > 0 && (
-        <div className="mb-4">
-          <div className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">
-            Changed Files ({r.changes.length})
-          </div>
-          <ul className="space-y-1">
-            {r.changes.map((c, i) => {
-              const change = c as Record<string, unknown>;
-              const path = change?.file_path as string ?? change?.path as string ?? JSON.stringify(c);
-              const op = change?.operation as string ?? change?.type as string;
-              return (
-                <li key={i} className="flex items-center gap-2 text-xs">
-                  <span className={`shrink-0 px-1.5 py-0.5 rounded text-[10px] font-medium ${
-                    op === "create" ? "bg-emerald-500/10 text-emerald-400"
-                    : op === "delete" ? "bg-red-500/10 text-red-400"
-                    : "bg-indigo-500/10 text-indigo-400"
-                  }`}>
-                    {op ?? "edit"}
-                  </span>
-                  <code className="text-slate-400 font-mono truncate">{path}</code>
-                </li>
-              );
-            })}
-          </ul>
-        </div>
-      )}
-
-      {/* Validation results */}
-      {r?.validation_results && r.validation_results.length > 0 && (
-        <div>
-          <div className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">
-            Validation Results
-          </div>
-          <ul className="space-y-1">
-            {r.validation_results.map((v, i) => {
-              const vr = v as Record<string, unknown>;
-              const passed = vr?.passed as boolean;
-              return (
-                <li key={i} className={`flex items-center gap-2 text-xs px-2 py-1 rounded ${
-                  passed ? "bg-emerald-500/10 text-emerald-400" : "bg-red-500/10 text-red-400"
-                }`}>
-                  <span>{passed ? "✓" : "✗"}</span>
-                  <span>{vr?.layer as string ?? vr?.type as string ?? `Check ${i + 1}`}</span>
-                </li>
-              );
-            })}
-          </ul>
-        </div>
-      )}
-    </div>
+      {hasDiagnostics ? <details className="report-section run-diagnostics">
+        <summary>运行范围与诊断</summary>
+        {selectedTools.length ? <div><h3>本轮工具</h3><div className="change-list">{selectedTools.map((name) => <code key={name}>{name}</code>)}</div>{deferredTools.length ? <><p>以下 {deferredTools.length} 个无关或高权限工具未暴露给模型：</p><div className="change-list deferred-tools">{deferredTools.map((name) => <code key={name}>{name}</code>)}</div></> : null}</div> : null}
+        {contextSources.length ? <div><h3>上下文来源</h3><div className="change-list">{contextSources.map((source, index) => <code key={index}>{String(source.kind || `来源 ${index + 1}`)}{source.tokens != null ? ` · ${Number(source.tokens)} tokens` : ""}{source.included === false ? " · 已延后" : ""}</code>)}</div></div> : null}
+        {report?.resolved_skills?.length ? <div><h3>Skills</h3><div className="change-list">{report.resolved_skills.map((skill, index) => <code key={index}>{String(skill.skill_id || `Skill ${index + 1}`)}</code>)}</div></div> : null}
+        {report?.mcp_servers?.length ? <div><h3>MCP</h3><div className="change-list">{report.mcp_servers.map((server, index) => <code key={index}>{String(server.name || `Server ${index + 1}`)} · {server.deferred ? "已延后" : server.available ? "可用" : "已降级"}</code>)}</div></div> : null}
+        {report?.steering_instructions?.length ? <div><h3>运行中追加指令</h3><div className="change-list">{report.steering_instructions.map((instruction, index) => <code key={index}>{instruction}</code>)}</div></div> : null}
+        {report?.model_runtime && Object.keys(report.model_runtime).length ? <div><h3>模型可靠性</h3><div className="change-list"><code>{String(report.model_runtime.active_model || "unknown")} · 重试 {Number(report.model_runtime.retry_count || 0)} 次 · {report.model_runtime.fallback_activated ? "已切换备用模型" : "主模型"}</code></div></div> : null}
+        {report?.infrastructure_runtime && Object.keys(report.infrastructure_runtime).length ? <div><h3>基础设施可靠性</h3><div className="change-list"><code>Redis 重试 {Number(redisRuntime.retry_count || 0)} 次 · 恢复 {Number(redisRuntime.recovery_count || 0)} 次 · 丢弃事件 {Number(redisRuntime.dropped_event_count || 0)} 个</code><code>工具调用 {Number(toolRuntime.call_count || 0)} 次 · 失败 {Number(toolRuntime.failure_count || 0)} 次 · 超时 {Number(toolRuntime.timeout_count || 0)} 次</code>{Number(workingSet.read_requests || 0) > 0 ? <code>Working set 读取 {Number(workingSet.read_requests || 0)} 次 · 命中 {Number(workingSet.cache_hits || 0)} 次 · 精确失效 {Number(workingSet.invalidation_count || 0)} 项</code> : null}</div></div> : null}
+        {report?.reflection ? <div><h3>失败分析</h3><div className="change-list"><code>{String(report.reflection.next_action || "finish")} · {String(report.reflection.reason || "validation evidence reviewed")}</code></div></div> : null}
+      </details> : null}
+      {report?.warnings?.length ? <div className="alert error"><span>{report.warnings.join("；")}</span></div> : null}
+      {(cancelled || failed) && onRecover ? <button type="button" className="recover-button" onClick={onRecover}>从当前工作区继续</button> : null}
+    </section>
   );
 }

@@ -6,10 +6,13 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 from typing import Any
 
+from codeagent import config as codeagent_config
 from codeagent.context_engine.context_assembler import ContextAssembler
+from codeagent.extensions import resolve_project_instructions
 from codeagent.gateway.context_gateway import IContextGateway
 from codeagent.orchestration.state import AgentState
 from codeagent.tracing import trace_node
@@ -29,6 +32,7 @@ class ContextNode:
         self,
         context_gateway: IContextGateway,
         context_assembler: ContextAssembler | None = None,
+        progress_callback: Any | None = None,
     ) -> None:
         """初始化 ContextNode。
 
@@ -37,7 +41,25 @@ class ContextNode:
             context_assembler: 上下文组装器（可选，默认创建）
         """
         self._gateway = context_gateway
-        self._assembler = context_assembler or ContextAssembler()
+        self._assembler = (
+            context_assembler
+            or getattr(context_gateway, "context_assembler", None)
+            or ContextAssembler(
+                total_budget=codeagent_config.get_context_budget(),
+                model_name=codeagent_config.get_model(),
+            )
+        )
+        self._progress_callback = progress_callback
+
+    async def _emit(self, event: dict[str, Any]) -> None:
+        if self._progress_callback is None:
+            return
+        try:
+            result = self._progress_callback(event)
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:
+            logger.warning("Skill resolution event failed: %s", exc)
 
     @trace_node("context")
     async def __call__(self, state: AgentState) -> dict[str, Any]:
@@ -52,6 +74,69 @@ class ContextNode:
         Returns:
             dict: 更新的状态字段
         """
+        if state.context_mode == "minimal":
+            skills_enabled = codeagent_config.get_skills_enabled()
+            resolution = resolve_project_instructions(
+                state.project_root,
+                state.user_request,
+                skills_enabled=skills_enabled,
+            )
+            if not skills_enabled:
+                resolution.warnings.append("Skills disabled by SKILLS_ENABLED=false")
+            skill_metadata = [skill.public_metadata() for skill in resolution.skills]
+            await self._emit({
+                "type": "skill_resolved",
+                "summary": (
+                    f"Matched {len(skill_metadata)} Skill(s)"
+                    if skill_metadata else "No Skill matched this request"
+                ),
+                "data": {
+                    "skills": skill_metadata,
+                    "repository_instructions": resolution.repository_instructions,
+                    "allowed_tools": resolution.allowed_tools,
+                    "warnings": resolution.warnings,
+                    "context_mode": "minimal",
+                },
+            })
+            context_manifest = {
+                "mode": "minimal",
+                "strategy": "just_in_time_tools",
+                "total_budget": 0,
+                "total_used": max(0, len(resolution.instructions) // 4),
+                "sources": [
+                    {
+                        "kind": "repository_instructions",
+                        "included": bool(resolution.repository_instructions),
+                        "tokens": max(0, len(resolution.instructions) // 4),
+                        "reason": "persistent project instructions",
+                    },
+                    {
+                        "kind": "skills",
+                        "included": bool(skill_metadata),
+                        "count": len(skill_metadata),
+                        "reason": "request-matched workflow instructions",
+                    },
+                    {
+                        "kind": "repository_index",
+                        "included": False,
+                        "reason": "deferred until search/read tools request code",
+                    },
+                ],
+            }
+            await self._emit({
+                "type": "context_selected",
+                "summary": "Using project instructions and just-in-time code discovery",
+                "data": context_manifest,
+            })
+            return {
+                "context": resolution.instructions,
+                "semantic_context": resolution.instructions or None,
+                "resolved_skills": skill_metadata,
+                "allowed_tools": resolution.allowed_tools,
+                "warnings": [*state.warnings, *resolution.warnings],
+                "context_manifest": context_manifest,
+            }
+
         try:
             package = await self._gateway.build_context(
                 project_root=state.project_root,
@@ -60,6 +145,35 @@ class ContextNode:
 
             # 格式化为 LLM-ready 字符串（Phase 1a 兼容）
             assembled = self._assembler.assemble(package)
+            skills_enabled = codeagent_config.get_skills_enabled()
+            resolution = resolve_project_instructions(
+                state.project_root,
+                state.user_request,
+                skills_enabled=skills_enabled,
+            )
+            if not skills_enabled:
+                resolution.warnings.append("Skills disabled by SKILLS_ENABLED=false")
+                await self._emit({
+                    "type": "capability_degraded",
+                    "summary": "Skill injection is disabled; core tools remain available",
+                    "data": {"capability": "skills", "reason": "SKILLS_ENABLED=false"},
+                })
+            if resolution.instructions:
+                assembled = f"{resolution.instructions}\n\n## Retrieved project context\n{assembled}"
+            skill_metadata = [skill.public_metadata() for skill in resolution.skills]
+            await self._emit({
+                "type": "skill_resolved",
+                "summary": (
+                    f"Matched {len(skill_metadata)} Skill(s)"
+                    if skill_metadata else "No Skill matched this request"
+                ),
+                "data": {
+                    "skills": skill_metadata,
+                    "repository_instructions": resolution.repository_instructions,
+                    "allowed_tools": resolution.allowed_tools,
+                    "warnings": resolution.warnings,
+                },
+            })
 
             # 语义上下文：相关代码片段
             semantic_ctx = self._format_related_text(package.related_code)
@@ -69,20 +183,90 @@ class ContextNode:
                 package.file_tree
             ) if package.file_tree else ""
 
-            return {
+            budget_report = self._assembler.get_budget_report()
+            allocations = [
+                {
+                    "kind": allocation.section,
+                    "included": allocation.used > 0,
+                    "budget": allocation.budget,
+                    "tokens": allocation.used,
+                    "trimmed": allocation.trimmed,
+                    "reason": "selected by full repository context policy",
+                }
+                for allocation in (budget_report.allocations if budget_report else [])
+            ]
+            context_manifest = {
+                "mode": "full",
+                "strategy": "budgeted_repository_context",
+                "total_budget": budget_report.total_budget if budget_report else 0,
+                "total_used": budget_report.total_used if budget_report else 0,
+                "symbol_count": budget_report.symbol_count if budget_report else 0,
+                "dependency_count": budget_report.dependency_count if budget_report else 0,
+                "tokenizer": budget_report.tokenizer if budget_report else "unknown",
+                "trim_reasons": budget_report.trim_reasons if budget_report else [],
+                "sources": [
+                    {
+                        "kind": "repository_instructions",
+                        "included": bool(resolution.repository_instructions),
+                        "reason": "persistent project instructions",
+                    },
+                    {
+                        "kind": "skills",
+                        "included": bool(skill_metadata),
+                        "count": len(skill_metadata),
+                        "reason": "request-matched workflow instructions",
+                    },
+                    *allocations,
+                ],
+            }
+            await self._emit({
+                "type": "context_selected",
+                "summary": (
+                    f"Selected {context_manifest['total_used']} of "
+                    f"{context_manifest['total_budget']} context tokens"
+                ),
+                "data": context_manifest,
+            })
+
+            result: dict[str, Any] = {
                 "file_tree": package.file_tree,
                 "context": assembled,
                 "semantic_context": semantic_ctx or assembled,
                 "current_file_context": file_tree_text,
                 "dependency_graph": package.dependency_info,
+                "resolved_skills": skill_metadata,
+                "allowed_tools": resolution.allowed_tools,
+                "warnings": [*state.warnings, *resolution.warnings],
+                "context_manifest": context_manifest,
             }
+            if not skills_enabled:
+                result["degraded_mode"] = True
+            return result
         except Exception as exc:
             logger.warning(
                 "Context build failed, entering degraded mode: %s", exc
             )
+            await self._emit({
+                "type": "capability_degraded",
+                "summary": "Context index unavailable; continuing with direct file and search tools",
+                "data": {
+                    "capability": "context",
+                    "reason": type(exc).__name__,
+                    "fallback": "direct_tools",
+                },
+            })
             return {
-                "errors": [f"Context build failed: {exc}"],
+                "warnings": [*state.warnings, f"Context build degraded: {exc}"],
                 "degraded_mode": True,
+                "context_manifest": {
+                    "mode": state.context_mode,
+                    "strategy": "direct_tool_fallback",
+                    "total_budget": 0,
+                    "total_used": 0,
+                    "sources": [],
+                    "degraded": True,
+                    "reason": type(exc).__name__,
+                },
             }
 
     def _format_related_text(

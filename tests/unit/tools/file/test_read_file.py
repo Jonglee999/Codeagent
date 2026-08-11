@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 
 import pytest
 
@@ -197,7 +196,6 @@ class TestReadEdgeCases:
     @pytest.mark.asyncio
     async def test_invalid_path_returns_error(self, tool):
         """无效路径应返回 INVALID_PATH。"""
-        import os
         # 使用 NUL 设备路径（Windows）或 /dev/null（Unix）来触发路径解析异常
         result = await tool.execute(file_path="\0invalid")
         assert result.success is False
@@ -234,6 +232,7 @@ class TestReadLargeFile:
         assert result.success is True
         # 应只读取 2000 行
         content_lines = result.data["content"].splitlines()
-        assert len(content_lines) <= 2000
+        assert len(content_lines) == 500
         assert "warning" in result.data
+        assert result.data["next_start_line"] == 501
         assert result.data["total_lines"] == 2500

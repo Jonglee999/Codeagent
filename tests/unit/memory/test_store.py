@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -95,6 +94,15 @@ class TestFrontmatterSerialization:
         assert restored.body == entry.body
         assert restored.tags == entry.tags
         assert restored.confidence == entry.confidence
+
+    def test_frontmatter_preserves_explicit_expiry(self) -> None:
+        expires_at = datetime.now() + timedelta(days=30)
+        entry = make_entry(name="expiring-session", memory_type=MemoryType.SESSION)
+        entry.expires_at = expires_at
+
+        restored = MemoryEntry.from_frontmatter_str(entry.to_frontmatter_str())
+
+        assert restored.expires_at == expires_at
 
     def test_frontmatter_handles_empty_body(self) -> None:
         """验证空 body 也能正确序列化。"""

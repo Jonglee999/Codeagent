@@ -111,7 +111,7 @@ class TestRegexSearch:
     @pytest.mark.asyncio
     async def test_basic_regex_search(self, tool: SearchCodeTool) -> None:
         """基本正则搜索应返回匹配结果。"""
-        ndjson = "\n".join([
+        "\n".join([
             _make_match("src/main.py", 10, "def hello():\n", column=1, submatch_text="hello"),
             _make_match("src/main.py", 20, "    return hello\n", column=5, submatch_text="hello"),
             '{"type":"summary","data":{"elapsed_total":{"secs":0,"nanos":1234},"stats":{"matches":2}}}',
@@ -187,6 +187,25 @@ class TestRegexSearch:
             )
             assert result.success is True
             assert result.data["total_results"] == 1
+
+    @pytest.mark.asyncio
+    async def test_path_qualified_glob_matches_under_absolute_search_root(
+        self, tool: SearchCodeTool, tmp_path
+    ) -> None:
+        target = tmp_path / "src" / "_pytest" / "mark" / "structures.py"
+        target.parent.mkdir(parents=True)
+        target.write_text("pytestmark = []\n", encoding="utf-8")
+
+        result = await tool.execute(
+            query="pytestmark",
+            file_pattern="src/_pytest/mark/*.py",
+        )
+
+        assert result.success is True
+        assert result.data["total_results"] == 1
+        assert result.data["results"][0]["file_path"] == (
+            "src/_pytest/mark/structures.py"
+        )
 
     @pytest.mark.asyncio
     async def test_regex_with_context_lines(self, tool: SearchCodeTool) -> None:
@@ -345,16 +364,28 @@ class TestEdgeCases:
         assert result.error_code == "INVALID_SEARCH_TYPE"
 
     @pytest.mark.asyncio
-    async def test_rg_not_found(self, tool: SearchCodeTool) -> None:
+    async def test_rg_not_found_uses_python_fallback(
+        self, tool: SearchCodeTool, tmp_path
+    ) -> None:
         """rg 未安装时应返回友好错误。"""
+        (tmp_path / "example.py").write_text(
+            "first line\nneedle = True\n", encoding="utf-8"
+        )
         with patch("asyncio.create_subprocess_exec") as mock_subprocess:
             mock_subprocess.side_effect = FileNotFoundError(
                 "No such file or directory: 'rg'",
             )
 
-            result = await tool.execute(query="test")
-            assert result.success is False
-            assert result.error_code == "RG_NOT_FOUND"
+            result = await tool.execute(query="needle", file_pattern="*.py")
+
+            assert result.success is True
+            assert result.data["engine"] == "python-fallback"
+            assert result.data["results"] == [{
+                "file_path": "example.py",
+                "line": 2,
+                "column": 1,
+                "line_content": "needle = True",
+            }]
 
     @pytest.mark.asyncio
     async def test_rg_error(self, tool: SearchCodeTool) -> None:
@@ -369,3 +400,35 @@ class TestEdgeCases:
             result = await tool.execute(query="test")
             assert result.success is False
             assert result.error_code == "RG_ERROR"
+
+    @pytest.mark.asyncio
+    async def test_search_path_cannot_escape_project(self, tool: SearchCodeTool) -> None:
+        result = await tool.execute(query="anything", paths=["../outside"])
+        assert result.success is False
+        assert result.error_code == "PATH_OUTSIDE_PROJECT"
+
+
+@pytest.mark.asyncio
+async def test_hybrid_search_fuses_regex_ast_and_semantic(tmp_path) -> None:
+    engine = MagicMock()
+    engine.search_semantic = AsyncMock(return_value=[CodeSnippet(
+        file_path="auth.py", start_line=10, end_line=12,
+        code="def authenticate(): pass", score=0.9,
+    )])
+    engine.search_structural = AsyncMock(return_value=[CodeSnippet(
+        file_path="auth.py", start_line=10, end_line=12,
+        code="def authenticate(): pass", score=1.0,
+    )])
+    tool = SearchCodeTool(tmp_path, context_engine=engine)
+    lexical = type("TR", (), {
+        "success": True,
+        "data": {"results": [{
+            "file_path": "auth.py", "line": 10, "column": 1,
+            "line_content": "def authenticate(): pass",
+        }]},
+    })()
+    with patch.object(tool, "_execute_regex", new=AsyncMock(return_value=lexical)):
+        result = await tool.execute("authenticate", search_type="hybrid")
+
+    assert result.success is True
+    assert result.data["results"][0]["sources"] == ["ast", "regex", "semantic"]

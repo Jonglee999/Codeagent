@@ -15,6 +15,7 @@ import json
 import logging
 import time
 import uuid
+from datetime import datetime, timezone
 from typing import AsyncGenerator
 
 import redis.asyncio as aioredis
@@ -30,6 +31,7 @@ from codeagent.gateway.orchestration_gateway import (
     TaskStatus,
     UserRequest,
 )
+from codeagent.product_state import product_state_store
 
 logger = logging.getLogger(__name__)
 
@@ -39,12 +41,15 @@ _EVENTS_CHANNEL = "task:{task_id}:events"
 _DECISION_KEY = "task:{task_id}:decision"
 _REPORT_KEY = "task:{task_id}:report"
 _CANCEL_KEY = "task:{task_id}:cancel"
+_STEERING_KEY = "task:{task_id}:steering"
 
 # TTL 常量（秒）
 _STATUS_TTL = 3600
 _REPORT_TTL = 3600
 _DECISION_TTL = 600
 _CANCEL_TTL = 60
+_STEERING_TTL = 3600
+_MAX_PENDING_STEERING = 20
 
 # stream_task keepalive 超时
 _STREAM_KEEPALIVE_TIMEOUT = 60.0
@@ -109,11 +114,21 @@ class OrchestrationGatewayImpl(IOrchestrationGateway):
                 "project_root": request.project_root,
                 "auto_mode": request.auto_mode,
                 "max_retries": request.max_retries,
+                "conversation_history": request.conversation_history,
+                "response_mode": request.response_mode,
+                "direct_execution": request.direct_execution,
+                "conversation_id": request.conversation_id,
+                "benchmark_instance_id": request.benchmark_instance_id,
+                "benchmark_fail_to_pass": request.benchmark_fail_to_pass,
+                "benchmark_pass_to_pass": request.benchmark_pass_to_pass,
+                "recovered_from_task_id": request.recovered_from_task_id,
             }]
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(
                 None,
-                lambda: self._celery.send_task("codeagent.run_agent_task", args=task_args),
+                lambda: self._celery.send_task(
+                    "codeagent.run_agent_task", args=task_args, task_id=task_id
+                ),
             )
             logger.info("Task %s submitted to Celery (query=%r)", task_id, request.query[:80])
         else:
@@ -178,10 +193,13 @@ class OrchestrationGatewayImpl(IOrchestrationGateway):
                     type=event_data.get("type", "unknown"),
                     data=event_data.get("data", {}),
                     timestamp=event_data.get("timestamp", time.time()),
+                    event_id=event_data.get("event_id"),
+                    seq=event_data.get("seq"),
+                    schema_version=event_data.get("schema_version", 1),
                 )
                 yield event
 
-                if event.type in ("task_complete", "task_error"):
+                if event.type in ("task_complete", "task_error", "task_cancelled"):
                     break
         finally:
             await pubsub.unsubscribe(_EVENTS_CHANNEL.format(task_id=task_id))
@@ -218,6 +236,16 @@ class OrchestrationGatewayImpl(IOrchestrationGateway):
         loop = asyncio.get_event_loop()
         redis_client = aioredis.from_url(self._redis_url)
         try:
+            raw = await redis_client.get(_STATUS_KEY.format(task_id=task_id))
+            if raw is None:
+                return False
+            status_data = json.loads(raw)
+            if status_data.get("state") in {
+                TaskState.COMPLETED.value,
+                TaskState.FAILED.value,
+                TaskState.CANCELLED.value,
+            }:
+                return False
             # 设置取消标志
             await redis_client.setex(
                 _CANCEL_KEY.format(task_id=task_id),
@@ -235,17 +263,115 @@ class OrchestrationGatewayImpl(IOrchestrationGateway):
                 logger.warning("Celery revoke failed for %s: %s", task_id, exc)
 
             # 更新状态为 CANCELLED
-            raw = await redis_client.get(_STATUS_KEY.format(task_id=task_id))
             if raw:
-                status_data = json.loads(raw)
                 status_data["state"] = TaskState.CANCELLED.value
+                status_data["current_step"] = "cancelled_by_user"
                 await redis_client.setex(
                     _STATUS_KEY.format(task_id=task_id),
                     _STATUS_TTL,
                     json.dumps(status_data, ensure_ascii=False),
                 )
+                report_key = _REPORT_KEY.format(task_id=task_id)
+                if not await redis_client.exists(report_key):
+                    durable_run = product_state_store.get_run(task_id) or {}
+                    cancelled_report = {
+                        "task_id": task_id,
+                        "status": "cancelled",
+                        "plan": [],
+                        "changes": [],
+                        "validation_results": [],
+                        "duration": 0.0,
+                        "token_usage": 0,
+                        "assistant_response": "Task cancelled by the user.",
+                        "response_mode": "execute",
+                        "memory_hits": [],
+                        "resolved_skills": [],
+                        "steering_instructions": [],
+                        "warnings": [
+                            "Execution was interrupted; partial workspace changes may remain."
+                        ],
+                        "mcp_servers": [],
+                        "model_runtime": {},
+                        "infrastructure_runtime": {},
+                        "artifacts": [],
+                        "error": None,
+                        "recovered_from_task_id": durable_run.get("recovered_from_task_id"),
+                    }
+                    await redis_client.setex(
+                        report_key,
+                        _REPORT_TTL,
+                        json.dumps(cancelled_report, ensure_ascii=False),
+                    )
+                    product_state_store.save_report(task_id, cancelled_report)
+                product_state_store.update_run_state(task_id, TaskState.CANCELLED.value)
+
+                # Subscribers can fetch the terminal report as soon as this event arrives.
+                event_data = {
+                    "event_id": uuid.uuid4().hex,
+                    "schema_version": 1,
+                    "seq": int(await redis_client.incr(f"task:{task_id}:event_seq")),
+                    "type": "task_cancelled",
+                    "status": "cancelled",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+                payload = json.dumps(event_data, ensure_ascii=False)
+                await redis_client.publish(
+                    _EVENTS_CHANNEL.format(task_id=task_id), payload,
+                )
+                log_key = f"task:{task_id}:event_log"
+                await redis_client.rpush(log_key, payload)
+                await redis_client.expire(log_key, _STATUS_TTL)
                 return True
             return False
+        finally:
+            await redis_client.aclose()
+
+    async def steer_task(self, task_id: str, instruction: str) -> bool:
+        """Queue steering for execution and publish an auditable receipt."""
+        cleaned = instruction.strip()
+        if not cleaned:
+            raise ValueError("Steering instruction cannot be empty")
+        if len(cleaned) > 4000:
+            raise ValueError("Steering instruction exceeds 4000 characters")
+
+        redis_client = aioredis.from_url(self._redis_url)
+        try:
+            raw = await redis_client.get(_STATUS_KEY.format(task_id=task_id))
+            if raw is None:
+                return False
+            status_data = json.loads(raw)
+            if status_data.get("state") not in {
+                TaskState.PENDING.value,
+                TaskState.RUNNING.value,
+                TaskState.WAITING_REVIEW.value,
+            }:
+                return False
+            key = _STEERING_KEY.format(task_id=task_id)
+            if int(await redis_client.llen(key)) >= _MAX_PENDING_STEERING:
+                raise ValueError("Too many pending steering instructions")
+            steering_id = uuid.uuid4().hex
+            entry = {
+                "steering_id": steering_id,
+                "instruction": cleaned,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            await redis_client.rpush(key, json.dumps(entry, ensure_ascii=False))
+            await redis_client.expire(key, _STEERING_TTL)
+            event_data = {
+                "event_id": uuid.uuid4().hex,
+                "schema_version": 1,
+                "seq": int(await redis_client.incr(f"task:{task_id}:event_seq")),
+                "type": "steering_queued",
+                "summary": cleaned[:200],
+                "data": {"steering_id": steering_id},
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            payload = json.dumps(event_data, ensure_ascii=False)
+            await redis_client.publish(_EVENTS_CHANNEL.format(task_id=task_id), payload)
+            log_key = f"task:{task_id}:event_log"
+            await redis_client.rpush(log_key, payload)
+            await redis_client.expire(log_key, _STATUS_TTL)
+            return True
         finally:
             await redis_client.aclose()
 
@@ -263,11 +389,31 @@ class OrchestrationGatewayImpl(IOrchestrationGateway):
             data = json.loads(raw)
             return TaskReport(
                 task_id=data["task_id"],
+                status=data.get("status", "completed"),
                 plan=data.get("plan", []),
                 changes=data.get("changes", []),
                 validation_results=data.get("validation_results", []),
                 duration=data.get("duration", 0.0),
                 token_usage=data.get("token_usage", 0),
+                assistant_response=data.get("assistant_response", ""),
+                response_mode=data.get("response_mode", "execute"),
+                run_profile=data.get("run_profile", {}),
+                tool_manifest=data.get("tool_manifest", {}),
+                context_manifest=data.get("context_manifest", {}),
+                steering_instructions=data.get("steering_instructions", []),
+                memory_hits=data.get("memory_hits", []),
+                resolved_skills=data.get("resolved_skills", []),
+                warnings=data.get("warnings", []),
+                reflection=data.get("reflection"),
+                transcript_path=data.get("transcript_path"),
+                mcp_servers=data.get("mcp_servers", []),
+                model_runtime=data.get("model_runtime", {}),
+                infrastructure_runtime=data.get("infrastructure_runtime", {}),
+                benchmark_metrics=data.get("benchmark_metrics", {}),
+                benchmark_instance_id=data.get("benchmark_instance_id"),
+                artifacts=data.get("artifacts", []),
+                error=data.get("error"),
+                recovered_from_task_id=data.get("recovered_from_task_id"),
             )
         finally:
             await redis_client.aclose()
@@ -279,6 +425,11 @@ class OrchestrationGatewayImpl(IOrchestrationGateway):
         redis_client = aioredis.from_url(self._redis_url)
         try:
             event_data = {
+                "event_id": event.event_id or uuid.uuid4().hex,
+                "schema_version": event.schema_version,
+                "seq": event.seq or int(
+                    await redis_client.incr(f"task:{task_id}:event_seq")
+                ),
                 "type": event.type,
                 "data": event.data,
                 "timestamp": event.timestamp,

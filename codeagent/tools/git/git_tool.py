@@ -11,7 +11,6 @@ from __future__ import annotations
 import asyncio
 import time
 from pathlib import Path
-from typing import Any
 
 from codeagent.tools.base import BaseTool, ToolResult
 
@@ -34,6 +33,10 @@ class GitTool(BaseTool):
     """执行 Git 操作（status, diff, log, commit, branch 等）。"""
 
     name = "git"
+    category = "version_control"
+    risk_level = "medium"
+    latency_hint = "medium"
+    idempotent = False
     description = "执行 Git 操作（status, diff, log, commit, branch 等）"
     parameters = {
         "type": "object",
@@ -113,6 +116,7 @@ class GitTool(BaseTool):
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
+                cwd=str(self._project_root),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )

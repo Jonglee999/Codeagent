@@ -6,13 +6,12 @@
 职责：
 - 任务开始时：启动轨迹记录 + 检索相关策略
 - 任务执行中：记录每一步轨迹
-- 任务完成时：异步触发策略提炼（不阻塞）
+- 任务完成时：等待策略提炼持久化，避免进程退出丢失
 - 定时维护：置信度衰减
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import Any, Optional
 
@@ -33,7 +32,7 @@ class SelfEvolutionManager:
     职责：
     - 任务开始时：启动轨迹记录 + 检索相关策略
     - 任务执行中：记录每一步轨迹
-    - 任务完成时：异步触发策略提炼（不阻塞）
+    - 任务完成时：等待策略提炼持久化
     - 定时维护：置信度衰减
 
     Args:
@@ -57,6 +56,11 @@ class SelfEvolutionManager:
         self._store = store
         self._applier = applier
         self._task_count = task_count
+
+    @property
+    def recorder(self) -> TrajectoryRecorder:
+        """Return the recorder used by the workflow instrumentation."""
+        return self._recorder
 
     # ── 公开接口 ──────────────────────────────────────────────
 
@@ -126,7 +130,7 @@ class SelfEvolutionManager:
 
         1. recorder.complete_task()
         2. 如果有应用的策略：applier.record_outcome()
-        3. 异步触发策略提炼（不阻塞）
+        3. 按触发条件提炼并持久化策略
 
         Args:
             task_id: 任务唯一 ID
@@ -177,11 +181,11 @@ class SelfEvolutionManager:
 
         if should_extract:
             logger.info(
-                "SelfEvolutionManager: triggering async strategy extraction "
+                "SelfEvolutionManager: triggering durable strategy extraction "
                 "(task_count=%d, repairs=%d)",
                 self._task_count, repair_rounds,
             )
-            asyncio.create_task(self._do_extract())
+            await self._do_extract()
 
     def run_maintenance(self) -> dict:
         """执行定时维护：置信度衰减。
@@ -217,12 +221,7 @@ class SelfEvolutionManager:
     # ── 内部方法 ──────────────────────────────────────────────
 
     async def _do_extract(self) -> None:
-        """后台执行策略提取。
-
-        被 on_task_complete 通过 asyncio.create_task 调用，
-        不阻塞主流程返回。
-        异常时只记录日志。
-        """
+        """执行并持久化策略提取；异常只记录日志。"""
         try:
             strategies = await self._extractor.extract_from_recent()
             if not strategies:

@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
@@ -73,6 +75,8 @@ class DockerExecutor:
         self._timeout_s = timeout_s
         self._client: Optional[Any] = None
         self._sync_pool = ThreadPoolExecutor(max_workers=4)
+        self._active_lock = threading.RLock()
+        self._active_containers: dict[str, Any] = {}
 
     # ── 客户端连接 ────────────────────────────────────────────
 
@@ -100,6 +104,23 @@ class DockerExecutor:
         client = await asyncio.to_thread(self._get_client)
         return client is not None
 
+    def close(self) -> None:
+        """Release client-side resources owned by the executor."""
+        with self._active_lock:
+            active = list(self._active_containers.values())
+        for container in active:
+            try:
+                container.kill()
+            except Exception:
+                logger.debug("Could not kill active Docker container during close", exc_info=True)
+        self._sync_pool.shutdown(wait=False, cancel_futures=True)
+        if self._client is not None:
+            try:
+                self._client.close()
+            except Exception:
+                logger.debug("Could not close Docker client", exc_info=True)
+            self._client = None
+
     # ── 命令执行 ──────────────────────────────────────────────
 
     async def run(
@@ -110,7 +131,7 @@ class DockerExecutor:
     ) -> ExecutionResult:
         """在容器内执行命令。
 
-        挂载 workdir 为只读卷，在容器内 /workspace 执行命令。
+        将 workdir 以读写卷挂载到容器 /workspace 后执行命令。
         捕获 stdout/stderr，超时后强制 kill 容器。
 
         Args:
@@ -138,7 +159,7 @@ class DockerExecutor:
         volumes = {
             workdir_path.as_posix(): {
                 "bind": container_workdir,
-                "mode": "ro",
+                "mode": "rw",
             }
         }
 
@@ -146,6 +167,8 @@ class DockerExecutor:
         if env:
             env_vars.update(env)
 
+        run_id = uuid.uuid4().hex
+        cancel_event = threading.Event()
         try:
             result = await asyncio.to_thread(
                 self._run_in_container_sync,
@@ -154,9 +177,15 @@ class DockerExecutor:
                 container_workdir,
                 volumes,
                 env_vars,
+                run_id,
+                cancel_event,
             )
             result.duration_ms = int((time.monotonic() - start) * 1000)
             return result
+        except asyncio.CancelledError:
+            cancel_event.set()
+            await asyncio.to_thread(self._cancel_active_run, run_id)
+            raise
         except Exception as exc:
             logger.exception("Unexpected error in Docker run")
             return ExecutionResult(
@@ -173,12 +202,15 @@ class DockerExecutor:
         container_workdir: str,
         volumes: dict,
         env_vars: dict,
+        run_id: str | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> ExecutionResult:
         """同步执行容器内命令（在线程池中运行）。"""
         container = None
         try:
             container = client.containers.create(
                 image=self._image,
+                name=f"codeagent-sandbox-{uuid.uuid4().hex[:12]}",
                 command=["sh", "-c", command],
                 working_dir=container_workdir,
                 volumes=volumes,
@@ -186,7 +218,21 @@ class DockerExecutor:
                 environment=env_vars or None,
                 detach=True,
                 auto_remove=False,
+                labels={
+                    "com.codeagent.managed": "true",
+                    "com.codeagent.kind": "sandbox",
+                },
             )
+
+            if run_id is not None:
+                with self._active_lock:
+                    self._active_containers[run_id] = container
+            if cancel_event is not None and cancel_event.is_set():
+                return ExecutionResult(
+                    stderr="Container execution cancelled before start",
+                    exit_code=-2,
+                    sandboxed=True,
+                )
 
             container.start()
 
@@ -197,10 +243,6 @@ class DockerExecutor:
                     response = future.result(timeout=self._timeout_s)
                 except FuturesTimeoutError:
                     container.kill()
-                    try:
-                        container.remove(force=True)
-                    except Exception:
-                        pass
                     return ExecutionResult(
                         stdout="",
                         stderr=f"Command timed out after {self._timeout_s}s",
@@ -230,11 +272,39 @@ class DockerExecutor:
                 sandboxed=True,
             )
         finally:
+            if run_id is not None:
+                with self._active_lock:
+                    self._active_containers.pop(run_id, None)
             if container is not None:
-                try:
-                    container.remove(force=True)
-                except Exception:
-                    pass
+                self._remove_container(container)
+
+    def _cancel_active_run(self, run_id: str) -> None:
+        with self._active_lock:
+            container = self._active_containers.get(run_id)
+        if container is None:
+            return
+        try:
+            container.kill()
+        except Exception:
+            logger.debug("Could not kill cancelled Docker run %s", run_id, exc_info=True)
+
+    @staticmethod
+    def _remove_container(container: Any) -> None:
+        """Remove a sandbox container, retrying transient Docker Desktop races."""
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                container.remove(force=True, v=True)
+                return
+            except Exception as exc:
+                last_error = exc
+                if attempt < 2:
+                    time.sleep(0.1 * (attempt + 1))
+        logger.warning(
+            "Failed to remove CodeAgent sandbox container %s after 3 attempts: %s",
+            getattr(container, "id", "unknown"),
+            last_error,
+        )
 
     # ── 测试执行 ──────────────────────────────────────────────
 
@@ -257,7 +327,10 @@ class DockerExecutor:
             ExecutionResult: 执行结果
         """
         # 先确保 pytest 可用
-        install_cmd = "pip install pytest -q --break-system-packages 2>/dev/null || pip install pytest -q"
+        install_cmd = (
+            "python -m pytest --version >/dev/null 2>&1 || "
+            "(pip install pytest -q --break-system-packages 2>/dev/null || pip install pytest -q)"
+        )
         full_cmd = f"({install_cmd}) && {test_command}"
 
         start = time.monotonic()

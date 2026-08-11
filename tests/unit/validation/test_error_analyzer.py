@@ -5,12 +5,9 @@
 
 from __future__ import annotations
 
-import os
-from pathlib import Path
 
-import pytest
 
-from codeagent.validation.error_analyzer import ErrorAnalyzer, FixSuggestion
+from codeagent.validation.error_analyzer import ErrorAnalyzer
 
 
 # ── 夹具：模拟 pytest 输出 ─────────────────────────────────────

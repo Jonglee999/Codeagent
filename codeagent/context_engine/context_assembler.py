@@ -80,6 +80,8 @@ class BudgetReport:
     allocations: list[BudgetAllocation] = field(default_factory=list)
     symbol_count: int = 0
     dependency_count: int = 0
+    tokenizer: str = _ENCODING
+    trim_reasons: list[str] = field(default_factory=list)
 
 
 class ContextAssembler:
@@ -94,6 +96,7 @@ class ContextAssembler:
         total_budget: int = 8000,
         memory_gateway: Optional[IMemoryGateway] = None,
         memory_token_budget: int = 800,
+        model_name: str = "",
     ) -> None:
         """初始化 ContextAssembler。
 
@@ -105,7 +108,7 @@ class ContextAssembler:
         self.total_budget = total_budget
         self._memory_gateway = memory_gateway
         self._memory_token_budget = memory_token_budget
-        self._tokenizer = tiktoken.get_encoding(_ENCODING)
+        self._tokenizer, self._tokenizer_name = self._resolve_tokenizer(model_name)
         self._last_report: BudgetReport | None = None
 
     def assemble(self, package: ContextPackage) -> str:
@@ -119,6 +122,24 @@ class ContextAssembler:
         Returns:
             str: XML 格式的上下文文本
         """
+        # Preserve a structurally valid minimal envelope for callers that use
+        # zero as a sentinel while reporting zero payload tokens.
+        if self.total_budget <= 0:
+            allocations = [
+                BudgetAllocation(section=section, budget=0, trimmed=True)
+                for section in ("file_tree", "related_code", "current_file", "dependency")
+            ]
+            self._last_report = BudgetReport(
+                total_budget=self.total_budget,
+                total_used=0,
+                allocations=allocations,
+                symbol_count=len(package.symbol_table),
+                dependency_count=self._count_dep_items(package.dependency_info),
+                tokenizer=self._tokenizer_name,
+                trim_reasons=["zero_context_budget"],
+            )
+            return "<project_tree>\n\n</project_tree>" if package.file_tree else ""
+
         # ── 计算各区块预算 ──────────────────────────────
         system_reserve = int(self.total_budget * SYSTEM_RESERVED_RATIO)
         usable = self.total_budget - system_reserve
@@ -145,7 +166,6 @@ class ContextAssembler:
         )
 
         # ── 组装相关代码（按 score 排序裁剪） ──────────
-        related_str = self._format_related_code(package.related_code)
         parts["related_code"] = self._trim_related_code_by_score(
             package.related_code, related_code_budget, allocations[1]
         )
@@ -201,6 +221,12 @@ class ContextAssembler:
             allocations=allocations,
             symbol_count=symbol_count,
             dependency_count=dep_count,
+            tokenizer=self._tokenizer_name,
+            trim_reasons=[
+                f"{allocation.section}_exceeded_allocation"
+                for allocation in allocations
+                if allocation.trimmed
+            ],
         )
 
         return "\n\n".join(output_parts)
@@ -243,13 +269,28 @@ class ContextAssembler:
         """计算文本的 token 数。"""
         return len(self._tokenizer.encode(text, disallowed_special=()))
 
+    @staticmethod
+    def _resolve_tokenizer(model_name: str) -> tuple[Any, str]:
+        """Use a provider/model tokenizer when tiktoken knows it, else a safe fallback."""
+        candidate = model_name.split("/", 1)[-1] if model_name else ""
+        if candidate:
+            try:
+                encoding = tiktoken.encoding_for_model(candidate)
+                return encoding, encoding.name
+            except KeyError:
+                pass
+        encoding = tiktoken.get_encoding(_ENCODING)
+        return encoding, f"{_ENCODING}:fallback"
+
     # ── 通用裁剪 ───────────────────────────────────────────────────────────
 
     def _trim_to_budget(
         self, text: str, budget: int, allocation: BudgetAllocation
     ) -> str | None:
         """将文本裁剪到预算内（按行裁剪）。"""
-        if not text:
+        if not text or budget <= 0:
+            allocation.trimmed = bool(text)
+            allocation.used = 0
             return None
 
         tokens = self._count_tokens(text)
@@ -273,14 +314,21 @@ class ContextAssembler:
         allocation.trimmed = True
         allocation.used = current_tokens
 
-        if not trimmed:
-            trimmed = lines[:1]
-
         result = "\n".join(trimmed)
         if len(lines) > len(trimmed):
             result += f"\n... ({len(lines) - len(trimmed)} more lines cropped)"
+        result = self._hard_trim(result, budget)
+        allocation.used = self._count_tokens(result)
+        return result or None
 
-        return result
+    def _hard_trim(self, text: str, budget: int) -> str:
+        """Token-level final guard for very small budgets and long single lines."""
+        if not text or budget <= 0:
+            return ""
+        encoded = self._tokenizer.encode(text, disallowed_special=())
+        if len(encoded) <= budget:
+            return text
+        return self._tokenizer.decode(encoded[:budget])
 
     def _crop_if_needed(
         self,
@@ -303,16 +351,34 @@ class ContextAssembler:
             if not content:
                 continue
 
-            budget = alloc_map[section].budget
+            budget = min(
+                alloc_map[section].budget,
+                self._count_tokens(content),
+            )
 
             while total > self.total_budget and budget > 0:
-                budget = max(budget // 2, 10)
+                next_budget = budget // 2
+                if next_budget >= budget:
+                    next_budget = 0
+                budget = next_budget
                 parts[section] = self._trim_to_budget(
                     content, budget, alloc_map[section]
                 )
                 total = sum(
                     self._count_tokens(v or "") for v in parts.values()
                 )
+
+        # Defensive guard: custom formatters must never be able to exceed the
+        # advertised budget, even when it is only a handful of tokens.
+        if total > self.total_budget:
+            for section in [*_TRIM_ORDER, "current_file"]:
+                if total <= self.total_budget:
+                    break
+                parts[section] = None
+                allocation = alloc_map[section]
+                allocation.trimmed = True
+                allocation.used = 0
+                total = sum(self._count_tokens(v or "") for v in parts.values())
 
     # ── Phase 2: 文件树折叠 ───────────────────────────────────────────────
 
@@ -365,7 +431,9 @@ class ContextAssembler:
         allocation: BudgetAllocation,
     ) -> str | None:
         """将相关代码按 score 从低到高移除，直到符合预算。"""
-        if not related_code:
+        if not related_code or budget <= 0:
+            allocation.trimmed = bool(related_code)
+            allocation.used = 0
             return None
 
         # 先格式化为文本
@@ -389,7 +457,9 @@ class ContextAssembler:
                 if len(remaining) < len(related_code):
                     removed = len(related_code) - len(remaining)
                     text += f"\n... ({removed} lower-score snippets removed)"
-                return text
+                text = self._hard_trim(text, budget)
+                allocation.used = self._count_tokens(text)
+                return text or None
             # 移除最低分的代码片段
             remaining = remaining[1:]
 
@@ -397,10 +467,11 @@ class ContextAssembler:
         best = [max(related_code, key=lambda s: s.score)]
         text = self._format_related_code(best)
         allocation.trimmed = True
-        allocation.used = self._count_tokens(text)
         removed = len(related_code) - 1
         text += f"\n... ({removed} lower-score snippets removed)"
-        return text
+        text = self._hard_trim(text, budget)
+        allocation.used = self._count_tokens(text)
+        return text or None
 
     # ── Phase 2: 当前文件裁剪为签名+import ────────────────────────────────
 
@@ -408,7 +479,9 @@ class ContextAssembler:
         self, text: str, budget: int, allocation: BudgetAllocation
     ) -> str | None:
         """将当前文件内容裁剪为仅保留函数/类签名 + import 区域。"""
-        if not text:
+        if not text or budget <= 0:
+            allocation.trimmed = bool(text)
+            allocation.used = 0
             return None
 
         tokens = self._count_tokens(text)
@@ -448,16 +521,15 @@ class ContextAssembler:
         allocation.trimmed = True
         allocation.used = current_tokens
 
-        if not significant_lines:
-            significant_lines = lines[:3]
-
         result = "\n".join(significant_lines)
         if removed_count > 0:
             result += f"\n... ({removed_count} body lines cropped to signatures only)"
         elif len(lines) > len(significant_lines):
             result += f"\n... ({len(lines) - len(significant_lines)} lines cropped)"
 
-        return result
+        result = self._hard_trim(result, budget)
+        allocation.used = self._count_tokens(result)
+        return result or None
 
     # ── Phase 2: 符号表 XML 格式化 ─────────────────────────────────────────
 

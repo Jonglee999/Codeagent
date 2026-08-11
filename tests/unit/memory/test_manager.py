@@ -14,9 +14,9 @@ from unittest.mock import MagicMock
 import pytest
 
 from codeagent.gateway.memory_gateway import IMemoryGateway
-from codeagent.memory.extractor import ExtractionCandidate, MemoryExtractor
+from codeagent.memory.extractor import MemoryExtractor
 from codeagent.memory.manager import MemoryManager
-from codeagent.memory.retriever import MemoryRetriever, RetrievalResult
+from codeagent.memory.retriever import MemoryRetriever
 from codeagent.memory.store import MemoryEntry, MemoryStore, MemoryType
 
 

@@ -7,8 +7,10 @@
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 import time
+from fnmatch import fnmatch
 from pathlib import Path
 
 from typing import Optional
@@ -107,7 +109,9 @@ class RuntimeValidator:
     # ── 测试执行 ────────────────────────────────────────────────
 
     async def run_tests(
-        self, timeout: int = _DEFAULT_TEST_TIMEOUT
+        self,
+        timeout: int = _DEFAULT_TEST_TIMEOUT,
+        test_targets: list[str] | None = None,
     ) -> ValidationResult:
         """运行测试套件。
 
@@ -138,7 +142,7 @@ class RuntimeValidator:
                 duration_ms=(time.monotonic() - start) * 1000,
             )
 
-        cmd = info.test_command.split()
+        cmd = self._build_test_command(info, test_targets or [])
         if not cmd:
             return ValidationResult(
                 passed=True,
@@ -157,7 +161,7 @@ class RuntimeValidator:
         if self._executor and await self._executor.is_available():
             exec_result = await self._executor.run_tests(
                 project_root=str(self._project_root),
-                test_command=info.test_command,
+                test_command=shlex.join(cmd),
             )
             output = exec_result.stdout + "\n" + exec_result.stderr
             self._last_raw_output = output
@@ -191,8 +195,6 @@ class RuntimeValidator:
                 errors = []
 
             # 提取摘要统计
-            summary = self._error_analyzer.extract_summary(output)
-
             return ValidationResult(
                 passed=passed,
                 errors=errors,
@@ -241,6 +243,71 @@ class RuntimeValidator:
                 ],
                 duration_ms=(time.monotonic() - start) * 1000,
             )
+
+    def _build_test_command(
+        self,
+        info: object,
+        test_targets: list[str],
+    ) -> list[str]:
+        """Build the detected command, narrowing pytest to explicit test files."""
+        test_command = str(getattr(info, "test_command", ""))
+        try:
+            cmd = shlex.split(test_command, posix=os.name != "nt")
+        except ValueError:
+            return []
+
+        if getattr(info, "framework", None) != "pytest":
+            return cmd
+
+        targets = self._existing_pytest_targets(test_targets)
+        if not targets:
+            return cmd
+
+        detected_dirs: set[str] = set()
+        for raw_dir in getattr(info, "test_dirs", []):
+            directory = Path(raw_dir)
+            try:
+                directory = directory.resolve().relative_to(self._project_root)
+            except (OSError, ValueError):
+                pass
+            detected_dirs.add(directory.as_posix().rstrip("/"))
+
+        narrowed = [
+            token
+            for token in cmd
+            if token.replace("\\", "/").rstrip("/") not in detected_dirs
+        ]
+        narrowed.extend(targets)
+        return narrowed
+
+    def _existing_pytest_targets(self, candidates: list[str]) -> list[str]:
+        """Return unique in-workspace pytest files suitable as direct targets."""
+        targets: list[str] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            file_part, separator, node_suffix = candidate.partition("::")
+            path = Path(file_part)
+            resolved = (
+                path.resolve()
+                if path.is_absolute()
+                else (self._project_root / path).resolve()
+            )
+            try:
+                relative = resolved.relative_to(self._project_root)
+            except (OSError, ValueError):
+                continue
+            if not resolved.is_file() or not (
+                fnmatch(resolved.name, "test_*.py")
+                or fnmatch(resolved.name, "*_test.py")
+            ):
+                continue
+            normalized = relative.as_posix()
+            if separator:
+                normalized = f"{normalized}::{node_suffix}"
+            if normalized not in seen:
+                targets.append(normalized)
+                seen.add(normalized)
+        return targets
 
     def _parse_test_errors(
         self, output: str
@@ -423,6 +490,7 @@ class RuntimeValidator:
             proc = _run_subprocess(
                 ["python", abs_path],
                 timeout=_FALLBACK_TIMEOUT,
+                cwd=str(self._project_root),
             )
             if proc.returncode != 0:
                 stderr = str(proc.stderr).strip()
@@ -459,6 +527,7 @@ class RuntimeValidator:
             proc = _run_subprocess(
                 ["python", "-c", f"import {module_path}"],
                 timeout=_FALLBACK_TIMEOUT,
+                cwd=str(self._project_root),
             )
             if proc.returncode != 0:
                 stderr = str(proc.stderr).strip()
@@ -494,6 +563,7 @@ class RuntimeValidator:
             proc = _run_subprocess(
                 ["python", abs_path, "--help"],
                 timeout=_FALLBACK_TIMEOUT,
+                cwd=str(self._project_root),
             )
             if proc.returncode != 0:
                 stderr = str(proc.stderr).strip()

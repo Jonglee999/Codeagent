@@ -6,7 +6,6 @@ CLI 模式不受影响、自动 approve 模式。
 
 from __future__ import annotations
 
-import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 

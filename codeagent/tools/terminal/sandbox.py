@@ -7,8 +7,9 @@ from __future__ import annotations
 
 import logging
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -76,7 +77,7 @@ class TerminalSandbox:
     使用示例：
         sandbox = TerminalSandbox()
         cid = sandbox.create_container(
-            volumes={"/project": {"bind": "/workspace", "mode": "ro"}},
+            volumes={"/project": {"bind": "/workspace", "mode": "rw"}},
             network="none",
         )
         stdout, stderr, exit_code = sandbox.exec_command(cid, "python --version")
@@ -89,9 +90,10 @@ class TerminalSandbox:
     DEFAULT_CPU_COUNT = 1.0
     DEFAULT_TIMEOUT = 60
 
-    # 温容器池配置
-    WARM_POOL_MIN_SIZE = 2
-    WARM_POOL_MAX_SIZE = 4
+    # A TerminalSandbox belongs to one Agent task. Keep at most one warm
+    # container so sequential terminal calls reuse that task environment.
+    WARM_POOL_MIN_SIZE = 0
+    WARM_POOL_MAX_SIZE = 1
     WARM_POOL_MAX_LIFETIME = 300  # 5 分钟
 
     def __init__(self, image: str = DEFAULT_IMAGE) -> None:
@@ -172,6 +174,7 @@ class TerminalSandbox:
         try:
             container = self.client.containers.create(
                 image=self._image,
+                name=f"codeagent-sandbox-{uuid.uuid4().hex[:12]}",
                 working_dir=working_dir,
                 volumes=volumes or {},
                 network=self._resolve_network(network),
@@ -181,6 +184,11 @@ class TerminalSandbox:
                 stdin_open=True,
                 tty=False,
                 auto_remove=False,  # 手动控制清理
+                labels={
+                    "com.codeagent.managed": "true",
+                    "com.codeagent.kind": "sandbox",
+                    "com.codeagent.scope": "task",
+                },
             )
             info = ContainerInfo(
                 container_id=container.id,
@@ -239,6 +247,10 @@ class TerminalSandbox:
                 future.result(timeout=timeout)
             except FuturesTimeoutError:
                 pool.shutdown(wait=False, cancel_futures=True)
+                try:
+                    container.kill()
+                except Exception:
+                    logger.debug("Could not kill timed-out container %s", container_id[:12], exc_info=True)
                 raise TimeoutError(f"Command timed out after {timeout}s")
             except Exception as exc:
                 pool.shutdown(wait=False)
@@ -271,7 +283,25 @@ class TerminalSandbox:
         """
         try:
             container = self.client.containers.get(container_id)
-            container.remove(force=force)
+            last_error: Exception | None = None
+            for attempt in range(3):
+                try:
+                    container.remove(force=force, v=True)
+                    last_error = None
+                    break
+                except docker.errors.NotFound:
+                    last_error = None
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    if attempt < 2:
+                        time.sleep(0.1 * (attempt + 1))
+            if last_error is not None:
+                logger.warning(
+                    "Failed to cleanup task sandbox %s after 3 attempts: %s",
+                    container_id[:12],
+                    last_error,
+                )
         except docker.errors.NotFound:
             pass  # 容器已经不存在
         except Exception as exc:

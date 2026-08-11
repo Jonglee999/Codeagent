@@ -4,17 +4,35 @@ from __future__ import annotations
 
 import time
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Any
 
 try:
-    from jsonschema import validate as jsonschema_validate
+    from jsonschema.validators import validator_for
     from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
 except ImportError:  # pragma: no cover
-    jsonschema_validate = None  # type: ignore[assignment]
+    validator_for = None  # type: ignore[assignment]
     JsonSchemaValidationError = None  # type: ignore[assignment]
 
 # 复用 Gateway 层定义的 DTO
 from codeagent.gateway.tool_gateway import ToolResult  # noqa: F401
+
+
+@dataclass(frozen=True)
+class ToolParamValidationError:
+    """One model-actionable JSON Schema validation error."""
+
+    path: str
+    message: str
+    validator: str | None = None
+
+
+@dataclass(frozen=True)
+class ToolParamValidationResult:
+    """Detailed parameter validation result shared by tools and the gateway."""
+
+    valid: bool
+    errors: tuple[ToolParamValidationError, ...] = ()
 
 
 class BaseTool(ABC):
@@ -30,6 +48,17 @@ class BaseTool(ABC):
     name: str = ""
     description: str = ""
     parameters: dict = {}
+
+    # Orchestration metadata. Subclasses override only what differs.
+    category: str = "general"
+    risk_level: str = "low"
+    source: str = "core"
+    read_only: bool = False
+    external: bool = False
+    latency_hint: str = "fast"
+    cost_hint: str = "free"
+    idempotent: bool = True
+    reversible: bool = True
 
     # 安全边界配置
     requires_sandbox: bool = False
@@ -57,14 +86,39 @@ class BaseTool(ABC):
         Returns:
             bool: 参数是否有效
         """
-        if not self.parameters or jsonschema_validate is None:
-            return True
+        return self.validate_params_detailed(**kwargs).valid
 
-        try:
-            jsonschema_validate(instance=kwargs, schema=self.parameters)
-            return True
-        except JsonSchemaValidationError:
-            return False
+    def validate_params_detailed(self, **kwargs: Any) -> ToolParamValidationResult:
+        """Validate parameters and preserve exact JSON paths for correction."""
+
+        if not self.parameters or validator_for is None:
+            return ToolParamValidationResult(valid=True)
+
+        validator_class = validator_for(self.parameters)
+        validator_class.check_schema(self.parameters)
+        errors = sorted(
+            validator_class(self.parameters).iter_errors(kwargs),
+            key=lambda error: tuple(str(part) for part in error.absolute_path),
+        )
+        if not errors:
+            return ToolParamValidationResult(valid=True)
+        return ToolParamValidationResult(
+            valid=False,
+            errors=tuple(
+                ToolParamValidationError(
+                    path=(
+                        "$"
+                        + "".join(
+                            f"[{part}]" if isinstance(part, int) else f".{part}"
+                            for part in error.absolute_path
+                        )
+                    ),
+                    message=error.message,
+                    validator=str(error.validator) if error.validator else None,
+                )
+                for error in errors[:10]
+            ),
+        )
 
     def get_langchain_tool(self) -> Any:
         """生成 LangChain/LangGraph 兼容的 Tool 对象。

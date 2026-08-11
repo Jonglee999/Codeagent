@@ -6,14 +6,14 @@
 
 from __future__ import annotations
 
-import pytest
 
-from codeagent.gateway.validation_gateway import ValidationResult
+from codeagent.gateway.validation_gateway import ValidationError, ValidationResult
 from codeagent.orchestration.routing import (
     route_after_execution,
     route_after_human_review,
     route_after_planning,
     route_after_validation,
+    route_after_validation_evidence,
 )
 from codeagent.orchestration.state import AgentState, PlanStep
 
@@ -141,17 +141,20 @@ class TestRouteAfterExecution:
         )
         assert route_after_execution(state) == "execution"
 
-    def test_no_plan_goes_to_validation(self) -> None:
+    def test_direct_read_only_turn_skips_validation(self) -> None:
         state = AgentState(
             user_request="test", project_root="/root",
             plan=None,
+            direct_execution=True,
         )
-        assert route_after_execution(state) == "validation"
+        assert route_after_execution(state) == "end"
 
-    def test_empty_plan_goes_to_validation(self) -> None:
+    def test_direct_mutation_goes_to_validation(self) -> None:
         state = AgentState(
             user_request="test", project_root="/root",
             plan=[],
+            direct_execution=True,
+            accumulated_changes=[{"file_path": "main.py"}],
         )
         assert route_after_execution(state) == "validation"
 
@@ -220,6 +223,85 @@ class TestRouteAfterValidation:
             validation_results=[ValidationResult(passed=True)],
         )
         assert route_after_validation(state) == "end"
+
+    def test_success_skips_reflection_phase(self) -> None:
+        state = AgentState(
+            user_request="test", project_root="/root",
+            validation_results=[ValidationResult(passed=True)],
+        )
+        assert route_after_validation_evidence(state) == "end"
+
+    def test_failure_enters_reflection_phase(self) -> None:
+        state = AgentState(
+            user_request="test", project_root="/root",
+            validation_results=[ValidationResult(passed=False)],
+        )
+        assert route_after_validation_evidence(state) == "reflection"
+
+    def test_benchmark_missing_dependency_stops_local_repair_loop(self) -> None:
+        runtime_output = """collected 0 items / 1 error
+ERROR collecting tests/test_feature.py
+E   ModuleNotFoundError: No module named 'django'
+"""
+        state = AgentState(
+            user_request="test",
+            project_root="/root",
+            benchmark_instance_id="django__django-11179",
+            validation_results=[
+                ValidationResult(passed=True),
+                ValidationResult(passed=True),
+                ValidationResult(
+                    passed=False,
+                    output=runtime_output,
+                    errors=[ValidationError(
+                        file_path="tests/test_feature.py",
+                        message="ModuleNotFoundError: No module named 'django'",
+                    )],
+                ),
+            ],
+        )
+
+        assert route_after_validation(state) == "end"
+        assert route_after_validation_evidence(state) == "end"
+
+    def test_non_benchmark_missing_dependency_still_requests_repair(self) -> None:
+        state = AgentState(
+            user_request="test",
+            project_root="/root",
+            validation_results=[
+                ValidationResult(passed=True),
+                ValidationResult(passed=True),
+                ValidationResult(
+                    passed=False,
+                    output=(
+                        "collected 0 items / 1 error\n"
+                        "ERROR collecting tests/test_feature.py\n"
+                        "ModuleNotFoundError: No module named 'project'"
+                    ),
+                ),
+            ],
+        )
+
+        assert route_after_validation(state) == "execution"
+        assert route_after_validation_evidence(state) == "reflection"
+
+    def test_benchmark_real_test_failure_still_requests_repair(self) -> None:
+        state = AgentState(
+            user_request="test",
+            project_root="/root",
+            benchmark_instance_id="django__django-11179",
+            validation_results=[
+                ValidationResult(passed=True),
+                ValidationResult(passed=True),
+                ValidationResult(
+                    passed=False,
+                    output="1 failed, 40 passed\nAssertionError: expected None",
+                ),
+            ],
+        )
+
+        assert route_after_validation(state) == "execution"
+        assert route_after_validation_evidence(state) == "reflection"
 
     def test_failure_with_retry_returns_execution(self) -> None:
         state = AgentState(

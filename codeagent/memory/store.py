@@ -64,6 +64,7 @@ class MemoryEntry:
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
     last_accessed_at: Optional[datetime] = None
+    expires_at: Optional[datetime] = None
     confidence: float = 1.0
     tags: list[str] = field(default_factory=list)
 
@@ -84,6 +85,8 @@ class MemoryEntry:
             meta["metadata"]["last_accessed_at"] = self._format_dt(
                 self.last_accessed_at
             )
+        if self.expires_at is not None:
+            meta["metadata"]["expires_at"] = self._format_dt(self.expires_at)
 
         post = frontmatter.Post(self.body, **meta)
         result = frontmatter.dumps(post)
@@ -104,6 +107,7 @@ class MemoryEntry:
         created_at = cls._parse_dt(meta.get("created_at")) or datetime.now()
         updated_at = cls._parse_dt(meta.get("updated_at")) or datetime.now()
         last_accessed_at = cls._parse_dt(meta.get("last_accessed_at"))
+        expires_at = cls._parse_dt(meta.get("expires_at"))
         confidence = float(meta.get("confidence", 1.0))
         tags = list(meta.get("tags", []))
 
@@ -115,9 +119,17 @@ class MemoryEntry:
             created_at=created_at,
             updated_at=updated_at,
             last_accessed_at=last_accessed_at,
+            expires_at=expires_at,
             confidence=confidence,
             tags=tags,
         )
+
+    def is_expired(self, now: Optional[datetime] = None) -> bool:
+        """Return whether the entry's explicit TTL has elapsed."""
+        if self.expires_at is None:
+            return False
+        current = now or datetime.now(tz=self.expires_at.tzinfo)
+        return current >= self.expires_at
 
     @staticmethod
     def _format_dt(dt: datetime) -> str:
@@ -201,15 +213,16 @@ class MemoryStore:
         # 项目层优先
         if self._project_root:
             entry = self._load_from_root(self._project_root, name)
-            if entry is not None:
+            if entry is not None and not entry.is_expired():
                 self._touch_last_accessed(self._project_root, entry)
                 return entry
 
         # 全局层
         entry = self._load_from_root(self._global_root, name)
-        if entry is not None:
+        if entry is not None and not entry.is_expired():
             self._touch_last_accessed(self._global_root, entry)
-        return entry
+            return entry
+        return None
 
     def delete(self, name: str) -> bool:
         """删除记忆文件并从 MEMORY.md 移除对应条目。
@@ -291,6 +304,8 @@ class MemoryStore:
                     entry = MemoryEntry.from_frontmatter_str(
                         fpath.read_text(encoding="utf-8")
                     )
+                    if entry.is_expired():
+                        continue
                     lines.append(
                         f"- [{entry.name}]({type_name}/{entry.name}.md)"
                         f" — {entry.description}"
@@ -435,7 +450,8 @@ class MemoryStore:
                     entry = MemoryEntry.from_frontmatter_str(
                         fpath.read_text(encoding="utf-8")
                     )
-                    results.append(entry)
+                    if not entry.is_expired():
+                        results.append(entry)
                 except Exception as exc:
                     logger.warning(
                         "Skipping invalid file %s: %s", fpath, exc

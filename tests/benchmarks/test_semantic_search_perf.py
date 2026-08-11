@@ -96,7 +96,7 @@ class TestSemanticSearchPerformance:
         await engine.index_project(str(benchmark_project))
 
         start = time.perf_counter()
-        results = await engine.search(
+        await engine.search(
             "函数定义和类定义", top_k=5, filter_lang="python",
         )
         elapsed = time.perf_counter() - start

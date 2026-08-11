@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from pathlib import Path
 from typing import Any, Optional
 
 from codeagent import config as codeagent_config
@@ -41,6 +42,11 @@ class RunTerminalTool(BaseTool):
     """
 
     name = "run_terminal"
+    category = "execution"
+    risk_level = "medium"
+    latency_hint = "variable"
+    idempotent = False
+    reversible = False
     description = "在隔离的 Docker 容器中执行终端命令，返回命令输出"
     parameters: dict[str, Any] = {
         "type": "object",
@@ -95,11 +101,23 @@ class RunTerminalTool(BaseTool):
         self._project_root = project_root
         self._executor = executor
 
+    def close(self) -> None:
+        """Destroy Docker resources owned by this task-scoped tool."""
+        if self._sandbox is not None:
+            self._sandbox.cleanup_all()
+            self._sandbox = None
+        if self._executor is not None:
+            self._executor.close()
+
     @property
     def sandbox(self) -> TerminalSandbox:
         """获取或创建 TerminalSandbox 实例。"""
         if self._sandbox is None:
-            self._sandbox = TerminalSandbox()
+            self._sandbox = TerminalSandbox(
+                image=codeagent_config.get_env(
+                    "SANDBOX_IMAGE", "codeagent-sandbox:latest"
+                )
+            )
         return self._sandbox
 
     async def execute(self, **kwargs: Any) -> ToolResult:
@@ -147,11 +165,84 @@ class RunTerminalTool(BaseTool):
                 data={
                     "risk_level": safety_result.risk_level,
                     "matched_patterns": safety_result.matched_patterns,
+                    "retry_guidance": (
+                        "Retry with one direct command using project-relative paths. "
+                        "The tool already runs at the workspace root; do not use cd, "
+                        "command substitution $(), backticks, privileged commands, or "
+                        "destructive filesystem operations."
+                    ),
                 },
                 duration_ms=duration,
             )
 
         # ── Layer 2: DockerExecutor 沙箱模式 ──────────────────
+        # Local development is explicit and remains confined to the selected
+        # workspace. Docker isolation is used only when enabled or injected.
+        if self._sandbox is None and not codeagent_config.get_sandbox_enabled():
+            project_root = Path(self._project_root or ".").resolve()
+            requested_dir = Path(str(work_dir or "."))
+            try:
+                cwd = (project_root / requested_dir).resolve()
+                cwd.relative_to(project_root)
+            except (OSError, RuntimeError, ValueError):
+                duration = (time.monotonic() - start) * 1000
+                return ToolResult(
+                    success=False,
+                    error_message="Working directory must stay inside the project root",
+                    error_code="PATH_TRAVERSAL",
+                    duration_ms=duration,
+                )
+            if not cwd.is_dir():
+                duration = (time.monotonic() - start) * 1000
+                return ToolResult(
+                    success=False,
+                    error_message=f"Working directory does not exist: {work_dir}",
+                    error_code="WORKDIR_NOT_FOUND",
+                    duration_ms=duration,
+                )
+            process = await asyncio.create_subprocess_shell(
+                command,
+                cwd=str(cwd),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                    process.communicate(), timeout=float(timeout)
+                )
+            except asyncio.CancelledError:
+                if process.returncode is None:
+                    process.kill()
+                await process.communicate()
+                raise
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.communicate()
+                duration = (time.monotonic() - start) * 1000
+                return ToolResult(
+                    success=False,
+                    error_message=f"Command timed out after {timeout}s",
+                    error_code="TIMEOUT",
+                    duration_ms=duration,
+                )
+            duration = (time.monotonic() - start) * 1000
+            return ToolResult(
+                success=process.returncode == 0,
+                data={
+                    "stdout": stdout_bytes.decode("utf-8", errors="replace")[-100_000:],
+                    "stderr": stderr_bytes.decode("utf-8", errors="replace")[-100_000:],
+                    "exit_code": process.returncode,
+                    "duration_ms": duration,
+                    "sandboxed": False,
+                },
+                error_message=(
+                    f"Command exited with code {process.returncode}"
+                    if process.returncode != 0 else None
+                ),
+                error_code="NON_ZERO_EXIT" if process.returncode != 0 else None,
+                duration_ms=duration,
+            )
+
         if self._executor and codeagent_config.get_sandbox_enabled():
             try:
                 exec_result = await self._executor.run(
@@ -159,6 +250,13 @@ class RunTerminalTool(BaseTool):
                     workdir=self._project_root or ".",
                 )
                 duration = (time.monotonic() - start) * 1000
+                error_code = None
+                if exec_result.exit_code == -1:
+                    error_code = "DOCKER_TIMEOUT"
+                elif not exec_result.sandboxed:
+                    error_code = "DOCKER_NOT_AVAILABLE"
+                elif exec_result.exit_code != 0:
+                    error_code = "NON_ZERO_EXIT"
                 return ToolResult(
                     success=exec_result.exit_code == 0,
                     data={
@@ -168,6 +266,11 @@ class RunTerminalTool(BaseTool):
                         "duration_ms": duration,
                         "sandboxed": exec_result.sandboxed,
                     },
+                    error_message=(
+                        exec_result.stderr or f"Command exited with code {exec_result.exit_code}"
+                        if error_code else None
+                    ),
+                    error_code=error_code,
                     duration_ms=duration,
                 )
             except Exception as exc:
@@ -186,8 +289,8 @@ class RunTerminalTool(BaseTool):
             volumes: dict = {}
             if self._project_root:
                 volumes[self._project_root] = {
-                    "bind": "/project",
-                    "mode": "ro",
+                    "bind": "/workspace",
+                    "mode": "rw",
                 }
 
             # 获取容器
@@ -196,19 +299,26 @@ class RunTerminalTool(BaseTool):
                 network=network,
             )
 
+            cancelled = False
             try:
-                stdout, stderr, exit_code = self.sandbox.exec_command(
+                stdout, stderr, exit_code = await asyncio.to_thread(
+                    self.sandbox.exec_command,
                     container_id=cid,
                     command=command,
                     timeout=timeout,
                 )
+            except asyncio.CancelledError:
+                cancelled = True
+                await asyncio.to_thread(self.sandbox.cleanup, cid)
+                raise
             finally:
                 # 释放容器回温池（或清理）
-                self.sandbox.release_container(cid)
+                if not cancelled:
+                    self.sandbox.release_container(cid)
 
             duration = (time.monotonic() - start) * 1000
             return ToolResult(
-                success=True,
+                success=exit_code == 0,
                 data={
                     "stdout": stdout,
                     "stderr": stderr,
@@ -216,6 +326,10 @@ class RunTerminalTool(BaseTool):
                     "duration_ms": duration,
                     "sandbox_id": cid,
                 },
+                error_message=(
+                    f"Command exited with code {exit_code}" if exit_code != 0 else None
+                ),
+                error_code="NON_ZERO_EXIT" if exit_code != 0 else None,
                 duration_ms=duration,
             )
 
@@ -229,10 +343,14 @@ class RunTerminalTool(BaseTool):
             )
         except DockerDaemonError as exc:
             duration = (time.monotonic() - start) * 1000
+            error_code = (
+                "DOCKER_TIMEOUT" if "timed out" in str(exc).lower()
+                else "DOCKER_DAEMON_ERROR"
+            )
             return ToolResult(
                 success=False,
                 error_message=str(exc),
-                error_code="DOCKER_DAEMON_ERROR",
+                error_code=error_code,
                 duration_ms=duration,
             )
         except Exception as exc:

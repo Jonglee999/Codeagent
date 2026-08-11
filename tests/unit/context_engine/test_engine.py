@@ -3,17 +3,15 @@
 from __future__ import annotations
 
 import json
-import os
 import tempfile
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
+from unittest.mock import AsyncMock, MagicMock, PropertyMock
 
 import pytest
 
 from codeagent.context_engine.engine import (
     ContextConfig,
     ContextEngine,
-    ContextStats,
 )
 from codeagent.gateway.context_gateway import CodeSnippet, ContextPackage
 
@@ -315,6 +313,35 @@ class TestContextEngineCache:
         assert report["cache_dir"] == ".codeagent/cache"
         assert report["cache_exists"] is True
         assert report["stats"]["total_invocations"] == 1
+
+    @pytest.mark.asyncio
+    async def test_deleted_source_forces_full_rebuild(self, engine_with_cache) -> None:
+        engine, root = engine_with_cache
+        source = Path(root) / "obsolete.py"
+        source.write_text("value = 1\n", encoding="utf-8")
+        await engine.build_context(root, "first")
+
+        source.unlink()
+        engine.code_analyzer.build.reset_mock()
+        engine.semantic_search.index_project.reset_mock()
+        await engine.build_context(root, "second")
+
+        engine.code_analyzer.build.assert_awaited_once()
+        engine.semantic_search.index_project.assert_awaited_once()
+        assert engine._stats.last_build_mode == "full"
+
+    @pytest.mark.asyncio
+    async def test_rapid_same_size_edit_invalidates_cache(self, engine_with_cache) -> None:
+        engine, root = engine_with_cache
+        source = Path(root) / "rapid.py"
+        source.write_text("value = 1\n", encoding="utf-8")
+        await engine.build_context(root, "first")
+
+        source.write_text("value = 2\n", encoding="utf-8")
+        changed, deleted = engine._scan_file_changes()
+
+        assert str(source) in changed
+        assert deleted == []
 
 
 class TestContextEngineStats:
