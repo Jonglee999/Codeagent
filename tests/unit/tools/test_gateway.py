@@ -532,6 +532,28 @@ async def test_task_working_set_reuses_unchanged_file_reads(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_task_working_set_reuses_wider_read_for_subrange(tmp_path) -> None:
+    (tmp_path / "module.py").write_text(
+        "".join(f"line {number}\n" for number in range(1, 21)),
+        encoding="utf-8",
+    )
+    gateway = ToolGateway(project_root=str(tmp_path))
+    await gateway.execute_tool(
+        "read_file", {"file_path": "module.py", "start_line": 1, "end_line": 20}
+    )
+
+    narrowed = await gateway.execute_tool(
+        "read_file", {"file_path": "module.py", "start_line": 5, "end_line": 7}
+    )
+
+    assert narrowed.success
+    assert narrowed.data["content"] == "line 5\nline 6\nline 7\n"
+    assert narrowed.data["read_range"] == {"start": 5, "end": 7}
+    assert narrowed.data["working_set"] == {"cache_hit": True}
+    assert gateway.working_set_status()["cache_hits"] == 1
+
+
+@pytest.mark.asyncio
 async def test_task_working_set_precisely_invalidates_changed_file(tmp_path) -> None:
     (tmp_path / "a.py").write_text("a = 1\n", encoding="utf-8")
     (tmp_path / "b.py").write_text("b = 1\n", encoding="utf-8")

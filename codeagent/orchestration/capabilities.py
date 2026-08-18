@@ -15,6 +15,11 @@ _CORE_EXPLORATION_TOOL_NAMES = {
     "list_files",
     "search_code",
 }
+_NAVIGATION_PATTERN = re.compile(
+    r"定义|引用|调用方|谁调用|跳转|符号|"
+    r"\b(definition|references?|callers?|symbol|go.?to.?definition)\b",
+    re.I,
+)
 _CORE_MUTATION_TOOL_NAMES = {
     "write_file",
     "apply_patch",
@@ -120,6 +125,8 @@ def select_tool_capabilities(
         reason: str | None = None
         if tool.name in _CORE_EXPLORATION_TOOL_NAMES and not command_only:
             reason = "just-in-time code discovery"
+        elif tool.name == "navigate_code" and _NAVIGATION_PATTERN.search(query):
+            reason = "request benefits from exact symbol navigation"
         elif tool.name in _CORE_MUTATION_TOOL_NAMES and (
             mutation_intent or run_profile.workflow == "planned" or run_profile.benchmark
         ):

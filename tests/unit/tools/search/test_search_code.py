@@ -432,3 +432,31 @@ async def test_hybrid_search_fuses_regex_ast_and_semantic(tmp_path) -> None:
 
     assert result.success is True
     assert result.data["results"][0]["sources"] == ["ast", "regex", "semantic"]
+
+
+@pytest.mark.asyncio
+async def test_explore_search_returns_compact_file_digest(tmp_path) -> None:
+    (tmp_path / "auth.py").write_text(
+        "def authentication_handler(request):\n    return request.user\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "routes.py").write_text(
+        "from auth import authentication_handler\n",
+        encoding="utf-8",
+    )
+    tool = SearchCodeTool(tmp_path)
+
+    with patch("asyncio.create_subprocess_exec", side_effect=FileNotFoundError):
+        result = await tool.execute(
+            "authentication handler",
+            search_type="explore",
+            max_results=100,
+        )
+
+    assert result.success is True
+    assert result.data["search_type"] == "explore"
+    assert result.data["raw_results_returned"] is False
+    assert result.data["context_firewall"]["max_files"] == 5
+    assert len(result.data["files"]) <= 5
+    assert result.data["files"][0]["file_path"] in {"auth.py", "routes.py"}
+    assert "authentication_handler" in result.data["files"][0]["excerpt"]

@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 from typing import Any
@@ -14,6 +15,7 @@ from codeagent import config as codeagent_config
 from codeagent.context_engine.context_assembler import ContextAssembler
 from codeagent.extensions import resolve_project_instructions
 from codeagent.gateway.context_gateway import IContextGateway
+from codeagent.gateway.memory_gateway import IMemoryGateway
 from codeagent.orchestration.state import AgentState
 from codeagent.tracing import trace_node
 
@@ -33,6 +35,7 @@ class ContextNode:
         context_gateway: IContextGateway,
         context_assembler: ContextAssembler | None = None,
         progress_callback: Any | None = None,
+        memory_gateway: IMemoryGateway | None = None,
     ) -> None:
         """初始化 ContextNode。
 
@@ -50,6 +53,7 @@ class ContextNode:
             )
         )
         self._progress_callback = progress_callback
+        self._memory_gateway = memory_gateway
 
     async def _emit(self, event: dict[str, Any]) -> None:
         if self._progress_callback is None:
@@ -74,6 +78,7 @@ class ContextNode:
         Returns:
             dict: 更新的状态字段
         """
+        memory_task = asyncio.create_task(self._prefetch_memory(state))
         if state.context_mode == "minimal":
             skills_enabled = codeagent_config.get_skills_enabled()
             resolution = resolve_project_instructions(
@@ -128,6 +133,7 @@ class ContextNode:
                 "summary": "Using project instructions and just-in-time code discovery",
                 "data": context_manifest,
             })
+            memory_update = await memory_task
             return {
                 "context": resolution.instructions,
                 "semantic_context": resolution.instructions or None,
@@ -135,12 +141,16 @@ class ContextNode:
                 "allowed_tools": resolution.allowed_tools,
                 "warnings": [*state.warnings, *resolution.warnings],
                 "context_manifest": context_manifest,
+                **memory_update,
             }
 
         try:
-            package = await self._gateway.build_context(
-                project_root=state.project_root,
-                query=state.user_request,
+            package, memory_update = await asyncio.gather(
+                self._gateway.build_context(
+                    project_root=state.project_root,
+                    query=state.user_request,
+                ),
+                memory_task,
             )
 
             # 格式化为 LLM-ready 字符串（Phase 1a 兼容）
@@ -198,6 +208,12 @@ class ContextNode:
             context_manifest = {
                 "mode": "full",
                 "strategy": "budgeted_repository_context",
+                "preinject": {
+                    "strategy": "parallel_semantic_and_memory",
+                    "max_files": codeagent_config.get_context_preinject_max_files(),
+                    "code_snippets": len(package.related_code),
+                    "memory_items": len(memory_update.get("memory_hits", [])),
+                },
                 "total_budget": budget_report.total_budget if budget_report else 0,
                 "total_used": budget_report.total_used if budget_report else 0,
                 "symbol_count": budget_report.symbol_count if budget_report else 0,
@@ -238,6 +254,7 @@ class ContextNode:
                 "allowed_tools": resolution.allowed_tools,
                 "warnings": [*state.warnings, *resolution.warnings],
                 "context_manifest": context_manifest,
+                **memory_update,
             }
             if not skills_enabled:
                 result["degraded_mode"] = True
@@ -267,7 +284,37 @@ class ContextNode:
                     "degraded": True,
                     "reason": type(exc).__name__,
                 },
+                **(await memory_task if not memory_task.done() else memory_task.result()),
             }
+
+    async def _prefetch_memory(self, state: AgentState) -> dict[str, Any]:
+        """Recall bounded persistent memory before the first reasoning call."""
+        if state.memory_mode == "off" or self._memory_gateway is None:
+            return {}
+        try:
+            token_budget = codeagent_config.get_memory_token_budget()
+            memory_xml = await self._memory_gateway.recall(
+                query=state.user_request,
+                token_budget=token_budget,
+            )
+            if not memory_xml:
+                return {"memory_recalled": True, "memory_context": ""}
+            from codeagent.memory.audit import parse_memory_hits
+
+            hits = parse_memory_hits(memory_xml, token_budget)[:5]
+            await self._emit({
+                "type": "memory_recalled",
+                "summary": f"Pre-injected {len(hits)} relevant memory item(s)",
+                "data": {"hits": hits, "stage": "pre_reasoning"},
+            })
+            return {
+                "memory_recalled": True,
+                "memory_context": f"## Relevant Memories\n\n{memory_xml}",
+                "memory_hits": hits,
+            }
+        except Exception as exc:
+            logger.warning("Memory pre-injection failed (non-blocking): %s", exc)
+            return {}
 
     def _format_related_text(
         self, related_code: list[Any]

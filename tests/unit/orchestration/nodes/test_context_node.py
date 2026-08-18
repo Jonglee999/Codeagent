@@ -318,3 +318,27 @@ class TestContextNodeWithCustomAssembler:
         result = await node(state)
         assert result["context"] == "custom assembled"
         assembler.assemble.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_preinjects_bounded_memory_before_reasoning(
+    mock_gateway: MagicMock, state: AgentState,
+) -> None:
+    memory = MagicMock()
+    memory.recall = AsyncMock(return_value=(
+        '<memories><memory type="project" name="retrieval-policy" '
+        'confidence="0.9">Use bounded search.</memory></memories>'
+    ))
+    node = ContextNode(context_gateway=mock_gateway, memory_gateway=memory)
+
+    result = await node(state)
+
+    memory.recall.assert_awaited_once()
+    assert result["memory_recalled"] is True
+    assert result["memory_hits"][0]["name"] == "retrieval-policy"
+    assert result["context_manifest"]["preinject"] == {
+        "strategy": "parallel_semantic_and_memory",
+        "max_files": 5,
+        "code_snippets": 1,
+        "memory_items": 1,
+    }

@@ -285,18 +285,18 @@ _REPAIR_MODE_PROMPT = """\
 
 # 每个 action 类型的合理工具列表
 _ALLOWED_TOOLS_BY_ACTION: dict[str, set[str]] = {
-    "create": {"write_file", "read_file", "list_files", "search_code", "get_diagnostics"},
-    "modify": {"read_file", "list_files", "write_file", "apply_patch", "search_code", "get_diagnostics"},
-    "delete": {"read_file", "list_files", "search_code", "delete_file"},
-    "read": {"read_file", "list_files", "search_code", "get_diagnostics"},
-    "command": {"run_terminal", "read_file", "list_files", "search_code", "get_diagnostics"},
+    "create": {"write_file", "read_file", "list_files", "search_code", "navigate_code", "get_diagnostics"},
+    "modify": {"read_file", "list_files", "write_file", "apply_patch", "search_code", "navigate_code", "get_diagnostics"},
+    "delete": {"read_file", "list_files", "search_code", "navigate_code", "delete_file"},
+    "read": {"read_file", "list_files", "search_code", "navigate_code", "get_diagnostics"},
+    "command": {"run_terminal", "read_file", "list_files", "search_code", "navigate_code", "get_diagnostics"},
 }
 
 _REQUIRED_EVIDENCE_TOOLS_BY_ACTION: dict[str, set[str]] = {
     "create": {"write_file"},
     "modify": {"write_file", "apply_patch"},
     "delete": {"delete_file"},
-    "read": {"read_file", "list_files", "search_code", "get_diagnostics"},
+    "read": {"read_file", "list_files", "search_code", "navigate_code", "get_diagnostics"},
     "command": {"run_terminal"},
 }
 
@@ -2110,7 +2110,7 @@ class ExecutionNode:
                         next_stage = "hypothesize"
                         stage_reason = "source context inspected"
                     elif tool_name in {
-                        "list_files", "search_code", "get_diagnostics", "run_terminal"
+                        "list_files", "search_code", "navigate_code", "get_diagnostics", "run_terminal"
                     } and tool_result.success:
                         next_stage = "inspect"
                         stage_reason = "repository evidence discovered"
@@ -2124,7 +2124,7 @@ class ExecutionNode:
                         })
 
                     is_discovery = tool_name in {
-                        "read_file", "list_files", "search_code", "get_diagnostics"
+                        "read_file", "list_files", "search_code", "navigate_code", "get_diagnostics"
                     } or (tool_name == "run_terminal" and not terminal_is_test)
                     if is_discovery:
                         benchmark_discovery_calls += 1
@@ -2409,6 +2409,25 @@ class ExecutionNode:
             "",
         ]
 
+        # Keep stable policy/tool text before the dynamic boundary so providers
+        # with prefix prompt caching can reuse it across turns.
+        if tool_definitions:
+            parts.append("## Available Tools")
+            for td in tool_definitions:
+                parts.append(f"- {td.name}: {td.description}")
+            parts.append("")
+        parts.extend([
+            "## Retrieval funnel",
+            "- Discover paths with list_files before opening unknown files",
+            "- Narrow exact text with search_code literal/regex; use hybrid for relevance",
+            "- For broad questions, use search_code search_type=explore so raw candidates stay behind its context firewall",
+            "- Use navigate_code for definitions/references when it is available",
+            "- Read only the relevant line range, expanding when the evidence requires it",
+            "",
+            "SYSTEM_PROMPT_DYNAMIC_BOUNDARY",
+            "",
+        ])
+
         if state.context:
             parts.append(f"## Context\n{state.context}\n")
 
@@ -2428,12 +2447,6 @@ class ExecutionNode:
                 f"PASS_TO_PASS tests:\n{pass_to_pass}\n"
                 "The official SWE-bench harness is the sole source of the final score.\n"
             )
-
-        if tool_definitions:
-            parts.append("## Available Tools")
-            for td in tool_definitions:
-                parts.append(f"- {td.name}: {td.description}")
-            parts.append("")
 
         # Phase 6.5: Memory 层注入
         if memory_section:

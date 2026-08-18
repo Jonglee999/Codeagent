@@ -3242,7 +3242,7 @@ class TestLLMCostControl:
 def _make_multi_tool_gateway() -> AsyncMock:
     """A gateway exposing core write/read/explore tools plus MCP and a shell tool."""
     names = [
-        "read_file", "list_files", "search_code", "get_diagnostics",
+        "read_file", "list_files", "search_code", "navigate_code", "get_diagnostics",
         "write_file", "apply_patch", "delete_file", "run_terminal", "git",
         "mcp__github",  # MCP tool bypasses _check_deviation by name
     ]
@@ -3295,7 +3295,7 @@ class TestActionScopedToolPruning:
         state = AgentState(user_request="t", project_root="/root")
         names = {t.name for t in node._available_tools(state)}
         assert names == {
-            "read_file", "list_files", "search_code", "get_diagnostics",
+            "read_file", "list_files", "search_code", "navigate_code", "get_diagnostics",
             "write_file", "apply_patch", "delete_file", "run_terminal", "git",
             "mcp__github",
         }

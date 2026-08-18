@@ -145,12 +145,18 @@ class GetDiagnosticsTool(BaseTool):
 
         rel_path = str(target.relative_to(self._project_root))
 
+        diagnostic_payloads = []
+        for diagnostic in diagnostics:
+            payload = diagnostic.to_dict()
+            payload["file_path"] = Path(rel_path).as_posix()
+            diagnostic_payloads.append(payload)
+
         return ToolResult(
             success=True,
             data={
                 "file_path": rel_path,
                 "language": language,
-                "diagnostics": [d.to_dict() for d in diagnostics],
+                "diagnostics": diagnostic_payloads,
                 "total": len(diagnostics),
                 "error_count": error_count,
                 "warning_count": warning_count,

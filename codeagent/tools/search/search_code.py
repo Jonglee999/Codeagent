@@ -34,9 +34,12 @@ class SearchCodeTool(BaseTool):
             },
             "search_type": {
                 "type": "string",
-                "enum": ["literal", "regex", "semantic", "hybrid"],
+                "enum": ["literal", "regex", "semantic", "hybrid", "explore"],
                 "default": "regex",
-                "description": "搜索类型：regex（正则匹配）或 semantic（语义搜索）",
+                "description": (
+                    "literal/regex 精确检索，semantic/hybrid 相关性检索；"
+                    "explore 隔离原始候选并仅返回最多 5 个文件摘要"
+                ),
             },
             "file_pattern": {
                 "type": "string",
@@ -56,7 +59,7 @@ class SearchCodeTool(BaseTool):
             "include_globs": {"type": "array", "items": {"type": "string"}},
             "exclude_globs": {"type": "array", "items": {"type": "string"}},
             "paths": {"type": "array", "items": {"type": "string"}},
-            "max_output_bytes": {"type": "integer", "default": 262144},
+            "max_output_bytes": {"type": "integer", "default": 131072},
         },
         "required": ["query"],
     }
@@ -87,7 +90,7 @@ class SearchCodeTool(BaseTool):
         include_globs: list[str] | None = None,
         exclude_globs: list[str] | None = None,
         paths: list[str] | None = None,
-        max_output_bytes: int = 262144,
+        max_output_bytes: int = 131072,
     ) -> ToolResult:
         """执行代码搜索。
 
@@ -112,7 +115,8 @@ class SearchCodeTool(BaseTool):
             )
 
         query = query.strip()
-        max_results = max(1, min(int(max_results), 200))
+        # Hard head limit: broad searches must not flood the model context.
+        max_results = max(1, min(int(max_results), 250))
         context_lines = max(0, min(int(context_lines), 20))
         max_output_bytes = max(4096, min(int(max_output_bytes), 2 * 1024 * 1024))
         if len(query) > 4096:
@@ -148,10 +152,25 @@ class SearchCodeTool(BaseTool):
                 max_output_bytes=max_output_bytes,
                 start_time=start_time,
             )
+        elif search_type == "explore":
+            return await self._execute_explore(
+                query=query,
+                file_pattern=file_pattern,
+                max_results=max_results,
+                case_sensitive=case_sensitive,
+                include_globs=include_globs,
+                exclude_globs=exclude_globs,
+                paths=paths,
+                max_output_bytes=max_output_bytes,
+                start_time=start_time,
+            )
         else:
             return ToolResult(
                 success=False,
-                error_message=f"Invalid search_type '{search_type}'. Use 'regex' or 'semantic'.",
+                error_message=(
+                    f"Invalid search_type '{search_type}'. Use literal, regex, semantic, "
+                    "hybrid, or explore."
+                ),
                 error_code="INVALID_SEARCH_TYPE",
                 duration_ms=(time.monotonic() - start_time) * 1000,
             )
@@ -291,7 +310,9 @@ class SearchCodeTool(BaseTool):
                 "total_results": len(results),
                 "search_type": "regex",
                 "engine": "ripgrep",
-                "truncated": len(stdout) > max_output_bytes,
+                "truncated": (
+                    len(stdout) > max_output_bytes or len(results) >= max_results
+                ),
             },
             duration_ms=(time.monotonic() - start_time) * 1000,
         )
@@ -330,7 +351,7 @@ class SearchCodeTool(BaseTool):
         scanned_files = 0
         max_files = 10_000
         max_file_bytes = 2 * 1024 * 1024
-        result_limit = max(1, min(int(max_results), 200))
+        result_limit = max(1, min(int(max_results), 250))
 
         for path in sorted(self._project_root.rglob("*")):
             try:
@@ -420,7 +441,7 @@ class SearchCodeTool(BaseTool):
         for snippet in snippets:
             first_line = snippet.code.split("\n")[0] if snippet.code else ""
             results.append({
-                "file_path": snippet.file_path.replace("\\", "/"),
+                "file_path": self._relative_path(snippet.file_path),
                 "line": snippet.start_line,
                 "end_line": snippet.end_line,
                 "column": 1,
@@ -493,6 +514,134 @@ class SearchCodeTool(BaseTool):
             duration_ms=(time.monotonic() - start_time) * 1000,
         )
 
+    async def _execute_explore(self, **kwargs: Any) -> ToolResult:
+        """Run broad retrieval behind a compact, deterministic context firewall."""
+        start_time = float(kwargs["start_time"])
+        query = str(kwargs["query"])
+        file_pattern = kwargs.get("file_pattern")
+        file_limit = min(5, int(kwargs.get("max_results", 5)))
+        terms: list[str] = []
+        seen_terms: set[str] = set()
+        for term in re.findall(r"[A-Za-z_$][\w$]{2,}|[\u4e00-\u9fff]{2,}", query):
+            lowered = term.lower()
+            if lowered in seen_terms:
+                continue
+            seen_terms.add(lowered)
+            terms.append(term)
+            if len(terms) >= 6:
+                break
+        if not terms:
+            terms = [query]
+
+        lexical_calls = [
+            self._execute_regex(
+                term,
+                file_pattern,
+                30,
+                0,
+                start_time,
+                literal=True,
+                # Natural-language exploration should not lose definitions only
+                # because their identifiers begin with a capital letter.
+                case_sensitive=False,
+                include_globs=kwargs.get("include_globs"),
+                exclude_globs=kwargs.get("exclude_globs"),
+                paths=kwargs.get("paths"),
+                max_output_bytes=min(int(kwargs.get("max_output_bytes", 262144)), 65536),
+            )
+            for term in terms
+        ]
+        gathered = await asyncio.gather(
+            *lexical_calls,
+            self._execute_semantic(query, 10, start_time),
+            self._execute_structural(query, 10, start_time),
+            return_exceptions=True,
+        )
+
+        candidates: dict[str, dict[str, Any]] = {}
+        raw_candidates = 0
+        for source_index, result in enumerate(gathered):
+            if isinstance(result, BaseException) or not result.success or not result.data:
+                continue
+            source = (
+                f"literal:{terms[source_index]}"
+                if source_index < len(terms)
+                else "semantic"
+                if source_index == len(terms)
+                else "ast"
+            )
+            for rank, result_item in enumerate(result.data.get("results", []), start=1):
+                path = self._relative_path(str(result_item.get("file_path", "")))
+                if not path or path.startswith("../"):
+                    continue
+                raw_candidates += 1
+                entry = candidates.setdefault(path, {
+                    "file_path": path,
+                    "score": 0.0,
+                    "sources": set(),
+                    "matches": [],
+                })
+                entry["score"] += 1.0 / (20 + rank)
+                entry["sources"].add(source)
+                if len(entry["matches"]) < 3:
+                    entry["matches"].append({
+                        "line": int(result_item.get("line", 1) or 1),
+                        "content": str(result_item.get("line_content", ""))[:500],
+                    })
+
+        ordered = sorted(
+            candidates.values(),
+            key=lambda item: (len(item["sources"]), item["score"]),
+            reverse=True,
+        )[:file_limit]
+        files = []
+        for item in ordered:
+            match_lines = sorted({max(1, int(match["line"])) for match in item["matches"]})
+            files.append({
+                "file_path": item["file_path"],
+                "score": round(float(item["score"]), 6),
+                "sources": sorted(item["sources"]),
+                "matched_lines": match_lines,
+                "excerpt": self._bounded_excerpt(item["file_path"], match_lines),
+            })
+
+        return ToolResult(
+            success=True,
+            data={
+                "search_type": "explore",
+                "query_terms": terms,
+                "files": files,
+                "total_files": len(files),
+                "raw_candidates_considered": raw_candidates,
+                "raw_results_returned": False,
+                "truncated": len(candidates) > len(files),
+                "context_firewall": {
+                    "max_files": 5,
+                    "max_excerpt_lines_per_file": 24,
+                },
+            },
+            duration_ms=(time.monotonic() - start_time) * 1000,
+        )
+
+    def _bounded_excerpt(self, file_path: str, match_lines: list[int]) -> str:
+        """Read small windows around matches while keeping raw files tool-local."""
+        try:
+            target = (self._project_root / file_path).resolve()
+            target.relative_to(self._project_root)
+            if not target.is_file() or target.stat().st_size > 2 * 1024 * 1024:
+                return ""
+            lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
+        except (OSError, ValueError):
+            return ""
+        selected: set[int] = set()
+        for line in match_lines[:3]:
+            selected.update(range(max(1, line - 2), min(len(lines), line + 2) + 1))
+            if len(selected) >= 24:
+                break
+        return "\n".join(
+            f"{line}: {lines[line - 1]}" for line in sorted(selected)[:24]
+        )
+
     async def _execute_structural(
         self, query: str, max_results: int, start_time: float,
     ) -> ToolResult:
@@ -509,7 +658,7 @@ class SearchCodeTool(BaseTool):
         results = []
         for snippet in snippets:
             results.append({
-                "file_path": snippet.file_path.replace("\\", "/"),
+                "file_path": self._relative_path(snippet.file_path),
                 "line": snippet.start_line,
                 "end_line": snippet.end_line,
                 "column": 1,
@@ -526,6 +675,15 @@ class SearchCodeTool(BaseTool):
     @staticmethod
     def _normalize_glob(value: str) -> str:
         return value.replace("\\", "/").strip()
+
+    def _relative_path(self, value: str) -> str:
+        """Normalize output paths without repeating the workspace prefix."""
+        raw = Path(value)
+        try:
+            resolved = raw.resolve() if raw.is_absolute() else (self._project_root / raw).resolve()
+            return resolved.relative_to(self._project_root).as_posix()
+        except (OSError, ValueError):
+            return raw.name if raw.is_absolute() else value.replace("\\", "/")
 
     def _resolve_search_paths(self, paths: list[str] | None) -> list[Path] | ToolResult:
         if not paths:

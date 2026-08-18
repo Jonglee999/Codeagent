@@ -169,6 +169,7 @@ class ToolGateway(IToolGateway):
         from codeagent.tools.file.write_file import WriteFileTool
         from codeagent.tools.git.git_tool import GitTool
         from codeagent.tools.lsp.get_diagnostics import GetDiagnosticsTool
+        from codeagent.tools.lsp.navigate_code import NavigateCodeTool
         from codeagent.tools.search.search_code import SearchCodeTool
         from codeagent.tools.terminal.run_terminal import RunTerminalTool
 
@@ -183,6 +184,10 @@ class ToolGateway(IToolGateway):
         ))
         self._registry.register(GitTool(project_root=self._project_root))
         self._registry.register(GetDiagnosticsTool(project_root=self._project_root))
+        self._registry.register(NavigateCodeTool(
+            project_root=self._project_root,
+            context_engine=self._context_engine,
+        ))
         self._registry.register(RunTerminalTool(project_root=self._project_root))
 
     async def initialize_extensions(

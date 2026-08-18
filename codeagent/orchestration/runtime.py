@@ -164,7 +164,7 @@ def _build_benchmark_metrics(
     )
     discovery_calls = sum(
         item.get("tool_name")
-        in {"read_file", "list_files", "search_code", "get_diagnostics"}
+        in {"read_file", "list_files", "search_code", "navigate_code", "get_diagnostics"}
         for item in tool_calls
     )
     mutations = [

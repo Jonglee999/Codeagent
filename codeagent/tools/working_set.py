@@ -75,8 +75,10 @@ class TaskWorkingSet:
             return None
         observation = self._reads.get(key)
         if observation is None:
-            self.cache_misses += 1
-            return None
+            observation = self._find_covering_read(params)
+            if observation is None:
+                self.cache_misses += 1
+                return None
         resolved = self._resolved_file(observation.file_path)
         fingerprint = self._fingerprint(resolved[0]) if resolved else None
         if fingerprint != observation.fingerprint:
@@ -89,6 +91,49 @@ class TaskWorkingSet:
         if isinstance(result.data, dict):
             result.data["working_set"] = {"cache_hit": True}
         return result
+
+    def _find_covering_read(self, params: dict[str, Any]) -> _ReadObservation | None:
+        """Reuse a cached wider range for an explicitly requested subrange."""
+        requested = self._resolved_file(params.get("file_path"))
+        requested_end = params.get("end_line")
+        if requested is None or not isinstance(requested_end, int):
+            return None
+        requested_start = params.get("start_line", 1)
+        if not isinstance(requested_start, int):
+            return None
+        encoding = params.get("encoding", "utf-8")
+        for key, candidate in self._reads.items():
+            if key[0] != requested[1] or key[3] != encoding:
+                continue
+            data = candidate.result.data
+            read_range = data.get("read_range", {}) if isinstance(data, dict) else {}
+            cached_start = read_range.get("start")
+            cached_end = read_range.get("end")
+            if not (
+                isinstance(cached_start, int)
+                and isinstance(cached_end, int)
+                and cached_start <= requested_start <= requested_end <= cached_end
+            ):
+                continue
+            narrowed = deepcopy(candidate)
+            narrowed_data = narrowed.result.data
+            if not isinstance(narrowed_data, dict):
+                continue
+            lines = str(narrowed_data.get("content", "")).splitlines(keepends=True)
+            start_offset = requested_start - cached_start
+            end_offset = requested_end - cached_start + 1
+            narrowed_data["content"] = "".join(lines[start_offset:end_offset])
+            narrowed_data["read_range"] = {
+                "start": requested_start,
+                "end": requested_end,
+            }
+            narrowed_data["warning"] = (
+                f"Partial file read ({requested_start}-{requested_end} of "
+                f"{narrowed_data.get('total_lines', cached_end)} lines)."
+            )
+            narrowed_data["next_start_line"] = requested_end + 1
+            return narrowed
+        return None
 
     def remember_read(self, params: dict[str, Any], result: ToolResult) -> None:
         if not result.success:
