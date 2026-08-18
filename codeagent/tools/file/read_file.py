@@ -273,7 +273,7 @@ class ReadFileTool(BaseTool):
             "content": content,
             "total_lines": total_lines,
             "read_range": {"start": start_line, "end": end_line},
-            "file_path": str(target.relative_to(self._project_root)),
+            "file_path": target.relative_to(self._project_root).as_posix(),
             "language": language,
         }
 

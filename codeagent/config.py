@@ -104,6 +104,11 @@ def get_context_auto_file_limit() -> int:
     return max(1, int(get_env("CONTEXT_AUTO_FILE_LIMIT", "300")))
 
 
+def get_context_preinject_max_files() -> int:
+    """Maximum related snippets pre-injected before model reasoning starts."""
+    return max(1, min(20, int(get_env("CONTEXT_PREINJECT_MAX_FILES", "5"))))
+
+
 def get_model_context_window() -> int:
     """Configured provider context window used for capability reporting."""
     return max(1, int(get_env("LLM_CONTEXT_WINDOW", "128000")))

@@ -57,6 +57,8 @@ class ContextConfig:
     cache_enabled: bool = True
     cache_dir: str = ".codeagent/cache"
     languages: tuple[str, ...] = ("python", "typescript", "javascript")
+    # Direct construction preserves the historical library default. Runtime
+    # construction uses CONTEXT_PREINJECT_MAX_FILES (default: 5).
     search_top_k: int = 10
     use_mock_embeddings: bool = False
     # Large upstream repositories should start quickly and let the agent narrow
@@ -91,6 +93,7 @@ class ContextConfig:
             semantic_mode=semantic_mode,
             index_background=config.get_context_index_background(),
             auto_file_limit=config.get_context_auto_file_limit(),
+            search_top_k=config.get_context_preinject_max_files(),
             min_input_tokens=config.get_context_min_input_tokens(),
             max_input_tokens=config.get_context_max_input_tokens(),
             model_context_window=config.get_model_context_window(),
@@ -256,7 +259,7 @@ class ContextEngine(IContextGateway):
         # ── 4. 组装数据包 ─────────────────────────────────
         related_code = [
             CodeSnippet(
-                file_path=r.file_path,
+                file_path=self._relative_output_path(r.file_path),
                 start_line=r.start_line,
                 end_line=r.end_line,
                 code=r.code_snippet,
@@ -265,7 +268,14 @@ class ContextEngine(IContextGateway):
             for r in search_results
         ]
 
-        symbol_table = self.code_analyzer.symbol_table.to_json() if self.config.analysis_enabled else []
+        symbol_table = (
+            [
+                {**item, "file_path": self._relative_output_path(str(item.get("file_path", "")))}
+                for item in self.code_analyzer.symbol_table.to_json()
+            ]
+            if self.config.analysis_enabled
+            else []
+        )
         dep_info = self._build_dep_info() if self.config.analysis_enabled else {}
 
         package = ContextPackage(
@@ -321,7 +331,7 @@ class ContextEngine(IContextGateway):
         results = await self.semantic_search.search(query, top_k=top_k)
         return [
             CodeSnippet(
-                file_path=r.file_path,
+                file_path=self._relative_output_path(r.file_path),
                 start_line=r.start_line,
                 end_line=r.end_line,
                 code=r.code_snippet,
@@ -329,6 +339,17 @@ class ContextEngine(IContextGateway):
             )
             for r in results
         ]
+
+    def _relative_output_path(self, value: str) -> str:
+        """Keep cached/indexed absolute paths out of model-facing context."""
+        if not self._project_root:
+            return value.replace("\\", "/")
+        raw = Path(value)
+        try:
+            resolved = raw.resolve() if raw.is_absolute() else (Path(self._project_root) / raw).resolve()
+            return resolved.relative_to(Path(self._project_root)).as_posix()
+        except (OSError, ValueError):
+            return raw.name if raw.is_absolute() else value.replace("\\", "/")
 
     async def search_structural(self, query: str, top_k: int = 5) -> list[CodeSnippet]:
         """Search AST symbols and expand direct dependency neighbors."""

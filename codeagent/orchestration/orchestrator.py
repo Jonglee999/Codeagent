@@ -80,6 +80,7 @@ class Orchestrator:
         self._context_node = ContextNode(
             context_gateway,
             progress_callback=progress_callback,
+            memory_gateway=memory_gateway,
         )
         self._memory_gateway = memory_gateway
         self._progress_callback = progress_callback
